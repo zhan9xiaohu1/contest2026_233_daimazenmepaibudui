@@ -1,11 +1,6 @@
 #
-# Contest 2026 team 000 board placeholder
+# Contest 2026 Team 233 - 智爱陪伴 Board Config
 #
-
-if ARCH_BOARD_CONTEST2026_000_BOARD
-
-config ARCH_BOARD_CONTEST2026_000_BOARD_TAG
-	string "Board tag"
-	default "contest2026_000_board"
-
-endif
+# BSP code is provided by the sf32lb52_devkit_lcd board.
+# This Kconfig is a placeholder for the contest board directory.
+#
