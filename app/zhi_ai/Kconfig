@@ -1,0 +1,24 @@
+# 智爱陪伴 - Kconfig
+config LVX_USE_CONTEST2026_233_ZHI_AI
+	bool "智爱陪伴 AI Companion for Elderly"
+	default n
+	---help---
+		Enable the 智爱陪伴 (ZhiAi Companion) application.
+		An AI companion robot for elderly people based on
+		openvela + SF32LB52-DevKit-LCD.
+
+if LVX_USE_CONTEST2026_233_ZHI_AI
+
+config ZHI_AI_PROGNAME
+	string "Program name"
+	default "zhi_ai"
+
+config ZHI_AI_PRIORITY
+	int "Task priority"
+	default 100
+
+config ZHI_AI_STACKSIZE
+	int "Stack size"
+	default 8192
+
+endif
