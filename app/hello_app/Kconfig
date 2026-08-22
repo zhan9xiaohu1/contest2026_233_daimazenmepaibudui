@@ -4,7 +4,56 @@
 #
 
 config LVX_USE_DEMO_CONTEST2026_000_HELLO_APP
-	bool "Contest 2026 team 000 hello app"
+	bool "AI Companion - 智爱陪伴AI老人陪伴守护终端"
 	default n
 	---help---
-		Enable the contest 2026 team 000 hello app demo.
+		Enable the AI companion app for elderly care.
+
+config DEBUG_AI_COMPANION
+	bool "Enable AI Companion debug output"
+	default n
+	depends on LVX_USE_DEMO_CONTEST2026_000_HELLO_APP
+	---help---
+		Enable debug log output for AI companion state machine.
+
+config DEBUG_AI_AUDIO
+	bool "Enable AI Audio debug output"
+	default n
+	depends on LVX_USE_DEMO_CONTEST2026_000_HELLO_APP
+	---help---
+		Enable debug log output for AI audio module.
+
+config DEBUG_AI_LLM
+	bool "Enable AI LLM debug output"
+	default n
+	depends on LVX_USE_DEMO_CONTEST2026_000_HELLO_APP
+	---help---
+		Enable debug log output for AI LLM module.
+
+config AI_LLM_API_KEY
+	string "LLM API Key"
+	default ""
+	depends on LVX_USE_DEMO_CONTEST2026_000_HELLO_APP
+	---help---
+		API key for LLM service.
+
+config AI_LLM_MODEL
+	string "LLM Model Name"
+	default "gpt-3.5-turbo"
+	depends on LVX_USE_DEMO_CONTEST2026_000_HELLO_APP
+	---help---
+		LLM model name to use.
+
+config DEBUG_AI_SOUND_DETECT
+	bool "Enable AI Sound Detection debug output"
+	default n
+	depends on LVX_USE_DEMO_CONTEST2026_000_HELLO_APP
+	---help---
+		Enable debug log output for AI sound detection module.
+
+config DEBUG_AI_CARE
+	bool "Enable AI Care debug output"
+	default n
+	depends on LVX_USE_DEMO_CONTEST2026_000_HELLO_APP
+	---help---
+		Enable debug log output for AI care module.
