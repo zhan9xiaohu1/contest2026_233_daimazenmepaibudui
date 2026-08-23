@@ -1,7 +1,7 @@
-# Contest 2026 team 000 hello app
+# Contest 2026 team 233 - AI companion app
 if(CONFIG_LVX_USE_DEMO_CONTEST2026_000_HELLO_APP)
   nuttx_add_application(
     NAME hello_app
-    SRCS hello_app_main.c
-    STACKSIZE 2048)
+    SRCS ai_companion_main.c ai_state_machine.c ai_audio.c ai_llm.c ai_sound_detect.c ai_care.c
+    STACKSIZE 8192)
 endif()
