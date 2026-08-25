@@ -296,6 +296,49 @@ static void stop_care(void)
 }
 
 /**
+ * @brief  模拟语音唤醒检测
+ * @note   实际实现由成员一提供音频驱动接口
+ */
+
+static void simulate_wakeup_detection(sm_context_t *ctx)
+{
+  /* TODO: 替换为真实的语音唤醒检测 */
+  /* wakeup_listen_start(); */
+  /* if (wakeup_word_detected()) { */
+  /*     sm_handle_event(ctx, SM_EVENT_WAKEUP); */
+  /* } */
+}
+
+/**
+ * @brief  模拟异常声音检测
+ * @note   实际实现由成员二集成声音分类模型
+ */
+
+static void simulate_alarm_detection(sm_context_t *ctx)
+{
+  /* TODO: 替换为真实的声音检测 */
+  /* if (sound_detect_alarm()) { */
+  /*     sm_handle_event(ctx, SM_EVENT_ALARM_DETECTED); */
+  /* } */
+}
+
+/**
+ * @brief  模拟主动关怀定时器
+ * @note   实际实现由成员二设计关怀逻辑
+ */
+
+static void simulate_care_timer(sm_context_t *ctx)
+{
+  /* TODO: 实现定时关怀逻辑 */
+  /* static uint32_t last_care_time = 0; */
+  /* uint32_t now = get_tick_ms(); */
+  /* if (now - last_care_time > CARE_INTERVAL_MS) { */
+  /*     sm_handle_event(ctx, SM_EVENT_CARE_TIMER); */
+  /*     last_care_time = now; */
+  /* } */
+}
+
+/**
  * @brief  播放完成回调
  */
 

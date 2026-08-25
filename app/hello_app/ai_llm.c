@@ -24,8 +24,14 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
-#include <openssl/ssl.h>
-#include <openssl/err.h>
+
+/* TLS相关头文件 (使用mbedtls) */
+
+#include <mbedtls/net_sockets.h>
+#include <mbedtls/ssl.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/error.h>
 
 /****************************************************************************
  * Pre-processor Definitions

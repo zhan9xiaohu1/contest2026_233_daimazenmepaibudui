@@ -25,5 +25,6 @@ CSRCS = ai_state_machine.c \
 # 头文件路径
 
 CFLAGS += -I$(APPDIR)/demos/contest2026_233_hello_app
+CFLAGS += -I$(APPDIR)/app/contest2026_233_hello_app
 
 include $(APPDIR)/Application.mk
