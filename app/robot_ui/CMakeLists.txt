@@ -1,6 +1,6 @@
 # app/robot_ui/CMakeLists.txt
 
-if(CONFIG_LVX_USE_CONTEST2026_233_ZHI_AI)
+if(CONFIG_LVX_USE_CONTEST2026_233_ROBOT_UI)
   nuttx_add_application(
     NAME robot_ui
     SRCS main.c robot_ui.c
