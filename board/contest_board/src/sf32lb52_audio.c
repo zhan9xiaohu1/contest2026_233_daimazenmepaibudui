@@ -105,6 +105,16 @@
  * "正常录音直到下次真的出问题"，远大于它。 */
 #define SF32LB52_AUDIO_RECOVER_STORM_MS 15000
 
+/* 会话切换的宽限期：START 成功不到这么久的会话**绝不**被判为残留强停。
+ *
+ * 误伤窗口永远在会话开头：本板存在"起会话的线程是短命线程"的真实用法（见
+ * struct 里 holder_tid 的说明），那种线程 START 完就走，而真正读数据的线程
+ * 往往还没进第一次 read()（user_tid 还是 -1）。在这条会话刚起来的那一小段
+ * 时间里，两条线程证据都是空的，会话却是活的 —— 光看线程就会把它当残局拆了。
+ * 宽限期把这一段单独掐掉：宁可按"有人在用"回 -EBUSY（交给上层重试），也不去
+ * 拆一条刚开始的会话。 */
+#define SF32LB52_AUDIO_SWITCH_GRACE_MS  3000
+
 /****************************************************************************
  * Private Types
  ****************************************************************************/
@@ -130,16 +140,26 @@ struct sf32lb52_audio_s
    *             audio_record_start() 在调用者线程里 audio_in_start()，真正读数据
    *             的是它随后起的录音线程）。只认 holder_tid 会把"会话明明还有人在
    *             读"误判成残留，那就变成替一个活着的会话拆台了。
-   * holder_pid：起会话的任务组（getpid()），**只进日志**，不当判据 —— 一个 app 的
-   *             播放线程死掉时它的 task group 还活着，拿"组还在"当"持有者还在"
-   *             就永远认不出这种残留（详见 sf32lb52_audio_holder_alive 的注释）。
+   * holder_pid：起会话的任务组（getpid()，NuttX 里组长的 pid 就是任务组）。
+   *             判"残留"时必须**同时**满足它也查不到 TCB —— 那才等价于"整个
+   *             app 没了"。线程死了但组还在时按"有人"处理：本板真有"起会话的
+   *             线程是短命线程"的用法（robot_ui 的 DETACHED 开麦线程、
+   *             ai_audio 在播放线程里恢复录音后播放线程退出），只认线程会在
+   *             "新会话刚 START 成功、读数据的线程还没进第一次 read"的窗口里
+   *             把活会话判成残局强停（详见 sf32lb52_audio_holder_alive 的注释）。
+   *             **这是有意的取舍**：代价是"app 还活着但那条播放线程真死了"这种
+   *             残局会退化成 -EBUSY 等上层重试/由那个 app 自己 close 收尾，
+   *             换来的是绝不误停活会话。
+   * holder_since：这次会话在 hw_start 里提交成功的时刻，判"会话刚开始"用
+   *             （SF32LB52_AUDIO_SWITCH_GRACE_MS，见 sf32lb52_audio_start）。
    *
-   * 三个都只在 running 为真时有意义：hw_start 里记、hw_stop/hw_shutdown 清 running
-   * 时一起清。-1 = 没记过。 */
+   * 四个都只在 running 为真时有意义：前三个在 hw_start 里记、hw_stop/hw_shutdown
+   * 清 running 时一起清。-1 = 没记过。 */
 
   pid_t                   holder_tid;
   pid_t                   holder_pid;
   pid_t                   user_tid;
+  clock_t                 holder_since;
 
   /* 真实通路状态位 —— 这是"硬件到底开着哪几条模拟级"的唯一真相，
    * **不是**方向标签。
@@ -1210,12 +1230,19 @@ static int sf32lb52_audio_hw_start(FAR struct sf32lb52_audio_s *priv,
 
   /* 记下这次会话的持有者（谁把它起起来的），并清掉上一条会话留下的
    * "最近读写的线程" —— 新会话这会儿一个字节都还没读/写。
-   * 这两个 id 就是 sf32lb52_audio_start() 判"方向冲突是别人真在用还是残留"
+   * 这三个 id 就是 sf32lb52_audio_start() 判"方向冲突是别人真在用还是残留"
    * 的全部依据（见 struct 里那段说明与 sf32lb52_audio_holder_alive）。 */
 
   priv->holder_tid = nxsched_gettid();
   priv->holder_pid = getpid();
   priv->user_tid   = (pid_t)-1;
+
+  /* 记下这条会话是"什么时候起的"：会话开头那一小段（真正读/写数据的线程还没进
+   * 第一次调用）是唯一会"两条线程证据都查不到"的窗口，sf32lb52_audio_start()
+   * 靠它判宽限期，绝不在这段时间里把一条刚起来的活会话当残局强停
+   * （见 SF32LB52_AUDIO_SWITCH_GRACE_MS）。 */
+
+  priv->holder_since = clock_systime_ticks();
 
   /* 新会话开始：上一次会话遗留的 read()（如果有）到此作废 —— 它的会话代号
    * 已经对不上，下一次从分片等待里醒来就会退出，不会把新会话的数据接走。 */
@@ -1800,11 +1827,26 @@ static int sf32lb52_audio_shutdown(FAR struct audio_lowerhalf_s *dev)
  *   把"没权限"当成"不存在"就是替一个活着的会话拆台。
  *   查到了必须配对释放（引用计数，见 sched/sched/sched_gettcb.c）。
  *
+ *   还要把"取值失败"和"没记录（-1）"分开：记进来的值有可能是
+ *   nxsched_gettid() 的失败返回值 -ESRCH，那不是"没记录"，见下面的实现。
+ *
  ****************************************************************************/
 
 static bool sf32lb52_audio_tid_alive(pid_t tid)
 {
   FAR struct tcb_s *tcb;
+
+  /* -ESRCH 不是"没记录"，是取值失败：nxsched_gettid() 的 inline 实现只在
+   * 调用者真的处于 RUNNING 态时才回 tid，否则回 -ESRCH
+   * （openvela/nuttx/include/nuttx/sched.h 里那段实现），而 hw_start/read/write
+   * 是把这个返回值**原样**记进 holder_tid/user_tid 的。
+   * 取值失败时我们并没有"这个线程没了"的证据，所以按**活着**处理（保守）：
+   * 和 -1 一起归零就等于拿一个查不到的 id 去判"持有者已死"，替活会话拆台。 */
+
+  if (tid == (pid_t)-ESRCH)
+    {
+      return true;
+    }
 
   if (tid < 0)
     {
@@ -1827,16 +1869,29 @@ static bool sf32lb52_audio_tid_alive(pid_t tid)
  * Description:
  *   当前这次会话（running 为真）还有没有有效持有者。
  *
- *   两条独立证据，任一条成立就算"还活着"：
+ *   三条独立证据，任一条成立就算"还活着"：
  *     1) 把这次会话起起来的线程还在；
- *     2) 最近一次 read()/write() 的线程还在（会话真的有人在用）。
- *   两条都查不到 TCB 才判"没有有效持有者" —— 这时候反方向那条通路已经没人要了，
- *   调用方可以强制收干净再切过去。
+ *     2) 最近一次 read()/write() 的线程还在（会话真的有人在用）；
+ *     3) 起会话的那个任务组还在（app 没退）。
+ *   三条都查不到 TCB 才判"没有有效持有者" —— 这时候反方向那条通路已经没人要了，
+ *   调用方可以强制收干净再切过去（调用方还有一条宽限期，见 sf32lb52_audio_start）。
  *
- *   为什么不用"任务组还在"当证据：一个 app 的播放线程死掉时它的 task group 还活着
- *   （app 没退），可那条播放通路已经没人管了；拿"组还在"当"持有者还在"就等于
- *   放过这种残留，录音端会一直 -EBUSY —— 正是本次要根治的那种"永久聋到重启"。
- *   组号只进日志，方便 ps 里对出是哪个 app。
+ *   第 3 条为什么是"判残留"的**必要条件**（上一轮把它只当日志，代价是一整条误伤
+ *   路径）：本板真有"起会话的线程是短命线程"的用法 —— robot_ui 用
+ *   PTHREAD_CREATE_DETACHED 起的 voice_open_thread 在 audio_in_start() 之后立刻
+ *   return NULL；ai_audio.c 在播放线程里恢复录音、随后播放线程自己退出。
+ *   于是在"新会话刚 START 成功 → 起会话的线程已退出 → 真正读数据的线程还没进
+ *   第一次 read()（user_tid 还是 -1）"这个窗口里，前两条证据**必然**都是空的，
+ *   可会话是**活的**：光看线程就会把这条活会话判成残局强停，后果比原来的 -110
+ *   严重得多（现场把正在录音/正在播报的会话拆掉）。
+ *   NuttX 里 tg_pid == 组长 pid（holder_pid 取的就是 getpid()，nxsched_get_tcb
+ *   按 pidhash 查），所以"holder_pid 也查不到 TCB"**等价于"整个 app 没了"**：
+ *   这时候才真的是"app 死了留下残局、没人会再来收"。这条判据一刀砍掉上面那个
+ *   误伤窗口（那两个场景里 app 都活着），而真正要治的场景仍然覆盖得到。
+ *
+ *   代价是**有意的取舍**：app 还活着、但它那条播放线程真的死了时，这种残留不再
+ *   被认出来，录音端退化成 -EBUSY —— 交给上层重试，或由那个 app 自己手里的 fd
+ *   走 close()/AUDIOIOC_STOP 收尾。相比"误停一条活会话"，这个代价可以接受。
  *
  *   判"活着"时调用方的行为**一个字都不能变**（仍然 -EBUSY）：半双工下录放必须
  *   串行，不能替正在用的人把通路拆了。
@@ -1845,7 +1900,8 @@ static bool sf32lb52_audio_tid_alive(pid_t tid)
 
 static bool sf32lb52_audio_holder_alive(FAR struct sf32lb52_audio_s *priv)
 {
-  /* 一个都没记过（理论上到不了：running 只由 hw_start 置真，那里一定会记）：
+  /* 一个都没记过（理论上到不了：running 只由 hw_start 置真，那里一定会记），
+   * 或者记下的值是 nxsched_gettid() 的失败值 -ESRCH（同样说明不了任何事）：
    * 判不了就按"有人"处理，保持原来的 -EBUSY 行为。 */
 
   if (priv->holder_tid < 0 && priv->user_tid < 0)
@@ -1853,8 +1909,16 @@ static bool sf32lb52_audio_holder_alive(FAR struct sf32lb52_audio_s *priv)
       return true;
     }
 
-  return sf32lb52_audio_tid_alive(priv->holder_tid) ||
-         sf32lb52_audio_tid_alive(priv->user_tid);
+  if (sf32lb52_audio_tid_alive(priv->holder_tid) ||
+      sf32lb52_audio_tid_alive(priv->user_tid))
+    {
+      return true;
+    }
+
+  /* 两条线程证据都没了，还差最后一条：**整个任务组也没了**才叫残留。
+   * 组还在 = app 还活着（上面那两个短命线程的场景都落在这里）→ 按"有人"处理。 */
+
+  return sf32lb52_audio_tid_alive(priv->holder_pid);
 }
 
 /****************************************************************************
@@ -1871,6 +1935,7 @@ static int sf32lb52_audio_start(FAR struct audio_lowerhalf_s *dev)
   bool want;
   bool live;
   bool dir;
+  uint32_t age_ms;
 
   /* 本次要起的方向：取最近一次 CONFIGURE 记下的意图（START 成功才提交成
    * priv->playback）。不加这一步而直接读 priv->playback 的话，这里的"要起的
@@ -1919,9 +1984,11 @@ static int sf32lb52_audio_start(FAR struct audio_lowerhalf_s *dev)
            * 重试），robot_ui 的播报路径报 "audio open failed" 后当次静默走完，
            * 都不会因为这次拒绝崩掉。
            *
-           * 持有者线程已经不存在 → 这是死掉的那个 app（或那条播放线程）留下的
-           * 残局：没人会再来收，这里不收的话反方向的 START 就永远卡在 -EBUSY，
-           * 录音端从此永久聋到重启板子。判定依据见 sf32lb52_audio_holder_alive。 */
+           * 持有者线程已经不存在、并且整个任务组也没了（= 那个 app 真死了）→ 这是
+           * 死掉的那个 app 留下的残局：没人会再来收，这里不收的话反方向的 START 就
+           * 永远卡在 -EBUSY，录音端从此永久聋到重启板子。
+           * 判定依据见 sf32lb52_audio_holder_alive（线程 + 任务组三条证据）以及下面
+           * 的宽限期（会话刚起来的那一小段绝不强停）。 */
 
           if (sf32lb52_audio_holder_alive(priv))
             {
@@ -1938,14 +2005,41 @@ static int sf32lb52_audio_start(FAR struct audio_lowerhalf_s *dev)
               return -EBUSY;
             }
 
+          /* 会话还没过宽限期 → **绝不** force-stop，只照原样返回 -EBUSY。
+           *
+           * 误伤窗口永远在会话开头：刚 START 成功的会话，起会话的线程可能已经退出
+           * （短命线程，见 struct 里 holder_tid 的说明），而真正读数据的线程还没进
+           * 第一次 read()（user_tid 还是 -1）—— 这段时间里线程证据看起来是空的，
+           * 会话却是活的。宽限期把这一段单独掐掉：宁可按'有人在用'回 -EBUSY，也不去
+           * 拆一条刚开始的会话（-EBUSY 对上层是安全值：audio_in_start() 会重试一次，
+           * robot_ui 的播报路径报错后当次静默走完）。 */
+
+          age_ms = (uint32_t)TICK2MSEC(clock_systime_ticks() - priv->holder_since);
+          if (age_ms < SF32LB52_AUDIO_SWITCH_GRACE_MS)
+            {
+              syslog(LOG_WARNING,
+                     "AUDIO: 方向冲突：%s 通路是 %u ms 前刚起的（还不到宽限期 %d ms），"
+                     "按'占用者可能只是还没进第一次读写'处理（持有线程=%d 最近读写=%d "
+                     "组=%d 都查不到，但会话还太新）→ -EBUSY\n",
+                     dir ? "播放" : "录音", (unsigned)age_ms,
+                     (int)SF32LB52_AUDIO_SWITCH_GRACE_MS,
+                     (int)priv->holder_tid, (int)priv->user_tid,
+                     (int)priv->holder_pid);
+              return -EBUSY;
+            }
+
           syslog(LOG_WARNING,
-                 "AUDIO: 方向冲突但持有者已消失（要起 %s，%s 通路残留："
-                 "起会话的线程 %d / 最近读写的线程 %d / 组 %d 都已查不到 TCB），"
+                 "AUDIO: 方向冲突且占用者已无人生还（要起 %s，%s 通路残留："
+                 "起会话的线程 %d / 最近读写的线程 %d 都查不到 TCB，"
+                 "起会话的任务组 %d 也查不到 TCB（= 整个 app 没了），"
+                 "并且这条会话已经起了 %u ms（>= 宽限期 %d ms）），"
                  "判定为残留会话，强制做一次干净 stop 再切到 %s\n",
                  want ? "播放" : "录音",
                  dir ? "播放" : "录音",
                  (int)priv->holder_tid, (int)priv->user_tid,
                  (int)priv->holder_pid,
+                 (unsigned)age_ms,
+                 (int)SF32LB52_AUDIO_SWITCH_GRACE_MS,
                  want ? "播放" : "录音");
         }
       else

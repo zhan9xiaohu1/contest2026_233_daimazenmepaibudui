@@ -260,8 +260,10 @@ static volatile bool g_voice_spoke;
  *   - 主循环 kws_wake_tick() 取这个标志，走和"VAD 检测到有人说话"同一条路。
  *
  * 两个标志都是"一个线程写、另一个线程读"的单个 bool，在 ARM32 上对齐读写
- * 不会读到半截值，所以不加锁（kws_dtw 自己也要求它的接口只被一个线程调 ——
- * 那个线程就是录音线程，kws_init() 在它起来之前调一次）。
+ * 不会读到半截值，所以不加锁。但两个都加了 volatile：不加的话编译器完全
+ * 可以把"读一次就再也不变"当成前提，把循环里每次都该重读的判断变成常量
+ *（kws_dtw 自己也要求它的接口只被一个线程调 —— 那个线程就是录音线程，
+ * kws_init() 在它起来之前调一次）。
  *
  * g_kws_ready 是开机时定下来的模板条数，只用来打日志。
  * g_kws_enabled = 有模板才算"功能开了"：没有模板时 kws_feed 永远返回 0，
@@ -272,7 +274,7 @@ static volatile bool g_voice_spoke;
  ****************************************************************************/
 
 static int           g_kws_ready;      /* 开机时从 /data/kws 载入的模板条数 */
-static bool          g_kws_enabled;    /* 有模板才喂帧、才处理命中（运行中可变） */
+static volatile bool g_kws_enabled;    /* 有模板才喂帧、才处理命中（运行中可变） */
 static volatile bool g_kws_hit;        /* 录音线程置：刚命中唤醒词 */
 
 /****************************************************************************
@@ -561,8 +563,12 @@ static void vad_callback(bool speech_detected, void *user_data)
  *
  * 代价可以忽略：功能已开时只是一次提前返回；没开时是一次 4 个槽的整数比较
  * （kws_ready_count 就是数 g_tpl_len[s] > 0 的个数），远小于一次 kws_feed。
- * 只置真、不清假：g_kws_enabled 一旦为真就再没人能把它改回去，所以
- * "置了 g_kws_hit 就说明喂过帧"这个前提在 kws_wake_tick() 里始终成立。
+ *
+ * 只置真、不清假：写 g_kws_enabled 的只有这里（录音线程）和开机初始化那一步，
+ * 两处都只会置真。注意这跟 kws_wake_tick() 里那句 `if (!g_kws_enabled) return;`
+ * **没有关系** —— 能置上 g_kws_hit 就说明这一轮确实喂过帧（当时 enabled 必为真），
+ * 命中不会因为 enabled 之后取什么值而失效。那句是纯防御：万一以后真加了
+ * "运行中关掉唤醒词"的路径，那里不用再改一遍。现在不动它的行为，也不删它。
  */
 
 static void kws_update_enabled(void)

@@ -197,10 +197,13 @@ static int      kws_process_frame(void);
 static int      kws_dtw_dist(const int16_t *q, int qn, const int16_t *t,
                              int tn);
 static int      kws_tpl_path(char *buf, size_t size, int slot);
-static int      kws_tpl_tmp_path(char *buf, size_t size, int slot);
+static int      kws_tpl_tmp_path(char *buf, size_t size, int slot,
+                                 const char *suffix);
 static int      kws_write_all(int fd, const void *buf, size_t len);
 static int      kws_read_all(int fd, void *buf, size_t len);
 static int      kws_tpl_save(int slot);
+static int      kws_tpl_check(int fd, const char *path, int16_t *dst,
+                             int *frames_out);
 static int      kws_tpl_load(int slot);
 static int      kws_tpl_install(int slot);
 static void     kws_install_templates(void);
@@ -952,13 +955,22 @@ static int kws_tpl_path(char *buf, size_t size, int slot)
   return (snprintf(buf, size, KWS_DATA_DIR "/slot%d.tpl", slot) > 0) ? 0 : -1;
 }
 
-/* 落盘用的临时文件名。临时文件和最终文件必须同一个目录 ——
- * rename 只在同一文件系统内是原子的，跨目录/跨文件系统会退化成"拷贝"。
- * 后缀用 .tmp：目录里看到 slotN.tpl.tmp 就知道是掉电时写了一半的残骸。 */
+/* 落盘用的临时文件名：正式名 + 后缀。临时文件和最终文件必须在**同一个文件
+ * 系统**里 —— NuttX 的 rename 跨挂载点直接失败（fs_rename.c 里
+ * oldinode != newinode 那条返回 -EXDEV，不会替你"拷贝过去再删"），
+ * 同一个目录最省事也最清楚。
+ * 文件名里留得住线索：目录里看到 slotN.tpl.tmp 就是录制路径写了一半的残骸，
+ * slotN.tpl.inst 就是补装路径的。
+ *
+ * 两条路径的临时文件**必须不同名**：都用 .tmp 的话，补装（开机那一下）和
+ * 现场录制撞在一起会互相 O_TRUNC，最坏是补装的 rename 把用户刚录好的模板
+ * 覆盖成出厂模板。 */
 
-static int kws_tpl_tmp_path(char *buf, size_t size, int slot)
+static int kws_tpl_tmp_path(char *buf, size_t size, int slot,
+                            const char *suffix)
 {
-  return (snprintf(buf, size, KWS_DATA_DIR "/slot%d.tpl.tmp", slot) > 0) ? 0 : -1;
+  return (snprintf(buf, size, KWS_DATA_DIR "/slot%d.tpl.%s", slot, suffix) > 0)
+         ? 0 : -1;
 }
 
 static int kws_write_all(int fd, const void *buf, size_t len)
@@ -1014,11 +1026,15 @@ static int kws_tpl_save(int slot)
   int err;
 
   /* 先写临时文件、写完再 rename 改名到正式名字。
-   * 为什么必须这么做：/data 是 tmpfs，掉电/复位随时可能发生，
-   * 而"直接 O_TRUNC 正式文件"会留下一个**长度对、内容半截**的 .tpl ——
-   * 它头里 frames 是新的、校验和是新的，看起来完全合法，只会读出垃圾模板
-   * 当唤醒词用（比读不出来更糟）。rename 是原子的：掉电要么看到旧模板，
-   * 要么看到新模板，不存在中间态。 */
+   * 为什么必须这么做："直接 O_TRUNC 正式文件"会留下一个**长度对、内容半截**
+   * 的 .tpl —— 它头里 frames 是新的、校验和是新的，看起来完全合法，只会读出
+   * 垃圾模板当唤醒词用（比读不出来更糟）。临时文件 + rename 消掉了这个状态。
+   *
+   * ⚠ 但别把 rename 当"原子替换"：目标名字不存在时它是一次原子的公开改名
+   *（同一文件系统内）；**目标已存在（覆盖旧模板）时 NuttX 的 VFS 是先 unlink
+   * 再 rename**，中间有一刻 slotN.tpl 这个名字底下什么都没有。掉电正好落在
+   * 那一瞬间就丢了旧模板 —— 但 /data 是 tmpfs，掉电本来就整片丢，"丢一个槽"
+   * 不是额外损失，所以这里不为那个窗口再做一层（比如先备份旧文件）。 */
 
   for (i = 0; i < cnt; i++)
     {
@@ -1036,7 +1052,7 @@ static int kws_tpl_save(int slot)
   hdr.hop_ms = KWS_FEAT_MS;
 
   if (kws_tpl_path(path, sizeof(path), slot) < 0 ||
-      kws_tpl_tmp_path(tmp_path, sizeof(tmp_path), slot) < 0)
+      kws_tpl_tmp_path(tmp_path, sizeof(tmp_path), slot, "tmp") < 0)
     {
       return -1;
     }
@@ -1103,15 +1119,129 @@ static int kws_tpl_save(int slot)
   return -1;
 }
 
-static int kws_tpl_load(int slot)
+/* 校验一个模板文件的内容。fd 要刚打开、位置在文件开头；dst 非空就顺便把负载
+ * 读进这块内存（载入路径要），为空就只校验、不留数据（补装路径在 rename 之前
+ * 要的正是这个）。成功时把点数写进 *frames_out（可空）。
+ *
+ * 为什么判据只有这一份：补装和载入要是各写一套，就会出现"补装说没问题、
+ * 载入侧却不认"的文件，而那种文件一旦 rename 成了 slotN.tpl，就会被
+ * kws_install_templates() 里"目标已存在就跳过"那道闸永久挡在重装之外。
+ *
+ * 下面逐条查、不用一个大 if：出问题时日志要能直接指出是哪一条对不上。
+ * 魔数/版本不对就**明确拒绝**，绝不"尽力猜着读" ——
+ * 猜错的话读到的是被当成模板用的垃圾特征，比"这个槽没有模板"糟得多
+ * （后者只是不唤醒，前者是乱唤醒）。 */
+
+static int kws_tpl_check(int fd, const char *path, int16_t *dst,
+                         int *frames_out)
 {
   kws_tpl_hdr_t hdr;
-  char path[64];
-  int16_t *p = g_tpl[slot][0];
+  int16_t vals[128];
+  const int chunk_vals = (int)(sizeof(vals) / sizeof(vals[0]));
   uint32_t sum = 0;
   int cnt;
-  int fd;
+  int done = 0;
   int i;
+
+  if (kws_read_all(fd, &hdr, sizeof(hdr)) < 0)
+    {
+      printf("[KWS] %s 读头失败（文件比 %u 字节还短？），忽略\n", path,
+             (unsigned)sizeof(hdr));
+      return -EIO;
+    }
+
+  if (hdr.magic != KWS_TPL_MAGIC)
+    {
+      printf("[KWS] %s 魔数 0x%08x 不对（应为 0x%08x），不是本模块的模板，"
+             "忽略\n", path, (unsigned)hdr.magic, (unsigned)KWS_TPL_MAGIC);
+      return -EINVAL;
+    }
+
+  if (hdr.version != KWS_TPL_VERSION)
+    {
+      printf("[KWS] %s 版本 %u 不认识（本程序只认 %u）：换过特征口径的模板"
+             "必须重录，不能凑合读，忽略\n", path, (unsigned)hdr.version,
+             (unsigned)KWS_TPL_VERSION);
+      return -EINVAL;
+    }
+
+  if (hdr.dim != KWS_NUM_MFCC || hdr.q != KWS_MFCC_Q ||
+      hdr.rate != KWS_SAMPLE_RATE || hdr.hop_ms != KWS_FEAT_MS)
+    {
+      printf("[KWS] %s 特征口径不一致（dim %u/%d，q %u/%d，rate %u/%d，"
+             "hop %ums/%dms），忽略\n", path, (unsigned)hdr.dim, KWS_NUM_MFCC,
+             (unsigned)hdr.q, KWS_MFCC_Q, (unsigned)hdr.rate, KWS_SAMPLE_RATE,
+             (unsigned)hdr.hop_ms, KWS_FEAT_MS);
+      return -EINVAL;
+    }
+
+  /* frames 是文件里的值，用于算读多少字节 —— 越界不查就是栈/静态区溢出 */
+
+  if (hdr.frames == 0 || hdr.frames > KWS_MAX_FEAT)
+    {
+      printf("[KWS] %s 点数 %u 越界（1~%d），忽略\n", path,
+             (unsigned)hdr.frames, KWS_MAX_FEAT);
+      return -EINVAL;
+    }
+
+  cnt = (int)hdr.frames * KWS_NUM_MFCC;
+
+  /* 按 int16 的整数倍一块块读（kws_read_all 会把一块读满），校验和逐块累加，
+   * 一块读完直接扔掉 —— 补装路径不需要把 2600 字节留在内存里。 */
+
+  while (done < cnt)
+    {
+      int vals_n = cnt - done;
+
+      if (vals_n > chunk_vals)
+        {
+          vals_n = chunk_vals;
+        }
+
+      if (kws_read_all(fd, vals, (size_t)vals_n * sizeof(vals[0])) < 0)
+        {
+          printf("[KWS] %s 读不完整（头说 %u 点），忽略\n", path,
+                 (unsigned)hdr.frames);
+          return -EIO;
+        }
+
+      for (i = 0; i < vals_n; i++)
+        {
+          sum += (uint32_t)(uint16_t)vals[i];
+
+          if (dst != NULL)
+            {
+              *dst++ = vals[i];
+            }
+        }
+
+      done += vals_n;
+    }
+
+  /* 校验和 + 头里的点数一起挡"写了一半"的文件（旧格式、host 侧生成的模板
+   * 没有改名保护，只能靠这一关）。 */
+
+  if (sum != hdr.sum)
+    {
+      printf("[KWS] %s 校验和不对（0x%08x/0x%08x，写了一半？），忽略\n", path,
+             (unsigned)sum, (unsigned)hdr.sum);
+      return -EIO;
+    }
+
+  if (frames_out != NULL)
+    {
+      *frames_out = (int)hdr.frames;
+    }
+
+  return 0;
+}
+
+static int kws_tpl_load(int slot)
+{
+  char path[64];
+  int frames = 0;
+  int fd;
+  int rc;
 
   if (kws_tpl_path(path, sizeof(path), slot) < 0)
     {
@@ -1135,85 +1265,18 @@ static int kws_tpl_load(int slot)
       return -ENOENT;
     }
 
-  if (kws_read_all(fd, &hdr, sizeof(hdr)) < 0)
-    {
-      printf("[KWS] %s 读头失败（文件比 24 字节还短？），忽略\n", path);
-      close(fd);
-      return -EIO;
-    }
-
-  /* 下面逐条查、不用一个大 if：出问题时日志要能直接指出是哪一条对不上。
-   * 魔数/版本不对就**明确拒绝**，绝不"尽力猜着读" ——
-   * 猜错的话读到的是被当成模板用的垃圾特征，比"这个槽没有模板"糟得多
-   * （后者只是不唤醒，前者是乱唤醒）。 */
-
-  if (hdr.magic != KWS_TPL_MAGIC)
-    {
-      printf("[KWS] %s 魔数 0x%08x 不对（应为 0x%08x），不是本模块的模板，"
-             "忽略\n", path, (unsigned)hdr.magic, (unsigned)KWS_TPL_MAGIC);
-      close(fd);
-      return -EINVAL;
-    }
-
-  if (hdr.version != KWS_TPL_VERSION)
-    {
-      printf("[KWS] %s 版本 %u 不认识（本程序只认 %u）：换过特征口径的模板"
-             "必须重录，不能凑合读，忽略\n", path, (unsigned)hdr.version,
-             (unsigned)KWS_TPL_VERSION);
-      close(fd);
-      return -EINVAL;
-    }
-
-  if (hdr.dim != KWS_NUM_MFCC || hdr.q != KWS_MFCC_Q ||
-      hdr.rate != KWS_SAMPLE_RATE || hdr.hop_ms != KWS_FEAT_MS)
-    {
-      printf("[KWS] %s 特征口径不一致（dim %u/%d，q %u/%d，rate %u/%d，"
-             "hop %ums/%dms），忽略\n", path, (unsigned)hdr.dim, KWS_NUM_MFCC,
-             (unsigned)hdr.q, KWS_MFCC_Q, (unsigned)hdr.rate, KWS_SAMPLE_RATE,
-             (unsigned)hdr.hop_ms, KWS_FEAT_MS);
-      close(fd);
-      return -EINVAL;
-    }
-
-  /* frames 是文件里的值，用于算读多少字节 —— 越界不查就是栈/静态区溢出 */
-
-  if (hdr.frames == 0 || hdr.frames > KWS_MAX_FEAT)
-    {
-      printf("[KWS] %s 点数 %u 越界（1~%d），忽略\n", path,
-             (unsigned)hdr.frames, KWS_MAX_FEAT);
-      close(fd);
-      return -EINVAL;
-    }
-
-  cnt = (int)hdr.frames * KWS_NUM_MFCC;
-
-  if (kws_read_all(fd, p, (size_t)cnt * sizeof(int16_t)) < 0)
-    {
-      printf("[KWS] %s 读不完整（头说 %u 点），忽略\n", path,
-             (unsigned)hdr.frames);
-      close(fd);
-      return -EIO;
-    }
-
+  rc = kws_tpl_check(fd, path, g_tpl[slot][0], &frames);
   close(fd);
 
-  for (i = 0; i < cnt; i++)
+  /* 校验不过时 g_tpl[slot] 里是垃圾，但长度还是 0，匹配路径永远不会碰它
+   *（g_tpl_len 只在下面赋值）。 */
+
+  if (rc < 0)
     {
-      sum += (uint32_t)(uint16_t)p[i];
+      return rc;
     }
 
-  /* 校验和 + 头里的点数一起挡"掉电写了半截"（新格式落盘是原子的，
-   * 这里是给旧文件/host 侧生成的模板兜底）。注意 g_tpl_len 只在最后赋值：
-   * 校验不过时 g_tpl[slot] 里是垃圾，但长度是 0，匹配路径永远不会碰它。 */
-
-  if (sum != hdr.sum)
-    {
-      printf("[KWS] %s 校验和不对（0x%08x/0x%08x，写了一半？），忽略\n",
-             path, (unsigned)sum, (unsigned)hdr.sum);
-      return -EIO;
-    }
-
-  g_tpl_len[slot] = (int)hdr.frames;
+  g_tpl_len[slot] = frames;
   return 0;
 }
 
@@ -1223,9 +1286,16 @@ static int kws_tpl_load(int slot)
  * 目标已存在时调用方就不会走到这里：现场录的模板（更贴合说话人）优先于
  * 出厂模板，绝不覆盖。
  *
- * 先写 slotN.tpl.tmp 再 rename，和 kws_tpl_save 同一条理由：掉电不会留下
- * "长度对、内容半截"的文件 —— 那种文件校验和不过会被拒绝，而且"目标已存在
- * 就不覆盖"会让它把之后每一次开机重装都挡掉，等于这个槽永久残废。 */
+ * 先写 slotN.tpl.inst 再 rename，和 kws_tpl_save 同一条理由（见它的说明）。
+ * 临时后缀用 .inst 而不是 .tmp：录制路径用的是 .tmp，两边同名的话补装和
+ * 现场录到一起会互相 O_TRUNC，最坏是这边的 rename 把用户刚录好的模板
+ * 覆盖成出厂模板。
+ *
+ * ★ rename 之前必须先用 kws_tpl_check() 验一遍内容，验不过就不改名。
+ *   素材是宿主侧拷来/打包进来的，0 字节、抄了半截、别的模块的文件都可能
+ *   混进来；而一旦坏文件占了 slotN.tpl 这个名字，kws_install_templates()
+ *   里"目标已存在就跳过"那道闸会让它此后每次开机都拦下重装 —— 一个坏素材
+ *   就把这个槽永久占死，现场表现是"喊名字怎么都不醒"。 */
 
 static int kws_tpl_install(int slot)
 {
@@ -1236,24 +1306,42 @@ static int kws_tpl_install(int slot)
   ssize_t total = 0;
   ssize_t nread;
   int srcfd;
+  int chkfd;
   int dstfd;
+  int ok;
 
   if (snprintf(src, sizeof(src), KWS_TPL_ASSETS_DIR "/slot%d.tpl", slot) <= 0 ||
       kws_tpl_path(dst, sizeof(dst), slot) < 0 ||
-      kws_tpl_tmp_path(tmp, sizeof(tmp), slot) < 0)
+      kws_tpl_tmp_path(tmp, sizeof(tmp), slot, "inst") < 0)
     {
+      printf("[KWS] 出厂模板 slot%d：路径拼不出来，跳过\n", slot);
       return -1;
     }
 
   srcfd = open(src, O_RDONLY);
   if (srcfd < 0)
     {
-      return -1;                        /* 素材里没有这一条：最常见的情况 */
+      /* 素材里没有这一条：最常见、也是**正常**情况（仓库不带 .tpl）。
+       * 所以默认不打 —— 每次开机刷 4 行"素材不存在"才是真的刷屏；要看就
+       * 开 KWS_DEBUG_ENABLE。而"文件在、打不开"（权限/FS 出错）是真问题，
+       * 一律打 —— 和 kws_tpl_load 对 ENOENT 的处理保持一致。 */
+
+      if (errno != ENOENT)
+        {
+          printf("[KWS] 出厂模板 %s 打不开：%d，跳过\n", src, errno);
+        }
+      else
+        {
+          KWS_LOG("slot%d 素材里没有 %s，跳过（正常情况）", slot, src);
+        }
+
+      return -1;
     }
 
   dstfd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
   if (dstfd < 0)
     {
+      printf("[KWS] 建临时文件 %s 失败：%d，slot%d 不装\n", tmp, errno, slot);
       close(srcfd);
       return -1;
     }
@@ -1263,7 +1351,7 @@ static int kws_tpl_install(int slot)
       nread = read(srcfd, buf, sizeof(buf));
       if (nread <= 0)
         {
-          break;
+          break;                        /* 0 = 读完（EOF）；负数下面按失败处理 */
         }
 
       if (kws_write_all(dstfd, buf, (size_t)nread) < 0)
@@ -1278,13 +1366,59 @@ static int kws_tpl_install(int slot)
   close(dstfd);
   close(srcfd);
 
-  if (nread < 0 || rename(tmp, dst) < 0)
+  ok = 1;
+
+  if (nread < 0)
     {
-      unlink(tmp);
-      return -1;
+      printf("[KWS] 抄 %s 出错：%d，slot%d 不装\n", src, errno, slot);
+      ok = 0;
     }
 
-  return (int)total;
+  /* 抄完了先验内容再改名。验的是临时文件 —— 那才是将来真正生效的字节；
+   * 日志里报的是 src，因为要修的是素材那个文件。 */
+
+  if (ok)
+    {
+      chkfd = open(tmp, O_RDONLY);
+      if (chkfd < 0)
+        {
+          printf("[KWS] 临时文件 %s 复查时打不开：%d，slot%d 不装\n", tmp, errno,
+                 slot);
+          ok = 0;
+        }
+      else
+        {
+          if (kws_tpl_check(chkfd, src, NULL, NULL) < 0)
+            {
+              printf("[KWS] 出厂模板 %s 内容不合法（原因见上一行），不装："
+                     "装了它就会占死 slot%d，之后每次开机都不再重装\n", src,
+                     slot);
+              ok = 0;
+            }
+
+          close(chkfd);
+        }
+    }
+
+  if (ok)
+    {
+      if (rename(tmp, dst) == 0)
+        {
+          return (int)total;
+        }
+
+      printf("[KWS] %s 改名成 %s 失败：%d，slot%d 不装\n", tmp, dst, errno, slot);
+    }
+
+  /* 上面任何一步没成：临时文件留着没意义（下次开机还会重写），清掉。
+   * 清不掉要说一声 —— 目录里躺个 .inst 残骸会让人以为有半截文件。 */
+
+  if (unlink(tmp) < 0)
+    {
+      printf("[KWS] 临时文件 %s 删不掉：%d，不影响启动\n", tmp, errno);
+    }
+
+  return -1;
 }
 
 /* 开机时把 ROMFS 里的出厂模板补进 /data/kws（/data 是 tmpfs，重启就空，
@@ -1298,10 +1432,12 @@ static void kws_install_templates(void)
   int s;
 
   /* /data 还没挂上（或压根没有）时建目录会失败：直接整段跳过，
-   * 后面的载入会把"没有模板"当成正常情况。 */
+   * 后面的载入会把"没有模板"当成正常情况。但"目录建不出来"和"素材里没有
+   * 模板"在日志上必须分得开，所以这里要留一行（不是每次开机都无脑刷）。 */
 
   if (mkdir(KWS_DATA_DIR, 0777) < 0 && errno != EEXIST)
     {
+      printf("[KWS] 出厂模板补装跳过：建目录 %s 失败：%d\n", KWS_DATA_DIR, errno);
       return;
     }
 

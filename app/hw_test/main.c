@@ -30,13 +30,14 @@
  *                            —— 单独运行
  *   hw_test kws selftest     唤醒词模块自检（合成 1kHz 查 FFT/Mel 表、
  *                            模板自比对和互距离、实测 MFCC/DTW 耗时），
- *                            并打印算出来的**推荐阈值** —— 单独运行
- *                            （不开麦克风，但要先停 ai_companion：它和这里
- *                             共享 kws_dtw 的全局状态）
- *   hw_test kws threshold <值>  当场改判定阈值（默认 1800，单位见
- *                            kws_dtw.h），打印新旧值 —— 只对本次运行有效，
- *                            重启回到默认；只写一个全局变量、不开麦克风，
- *                            可以趁着 ai_companion 在跑直接改 —— 单独运行
+ *                            并打印算出来的**推荐阈值** —— 单独运行，
+ *                            且**必须先停掉 ai_companion**（它和正在跑的
+ *                            唤醒词共享 kws_dtw 的全局状态）
+ *   hw_test kws threshold <值|default>  当场改判定阈值（默认 1800，单位见
+ *                            kws_dtw.h），打印新旧值；`default` = 恢复 1800 ——
+ *                            只对本次运行有效，重启回到默认；只写一个全局
+ *                            变量、不开麦克风，可以趁着 ai_companion 在跑
+ *                            直接改 —— 单独运行
  *   hw_test kws live [秒]    实时听唤醒词，命中就打一行（默认 10 秒）
  *                            —— 单独运行，且必须先停掉 ai_companion
  *
@@ -51,7 +52,12 @@
  *   - kws 各子命令都会碰 kws_dtw 的全局状态（模块没有锁），enroll / live 还
  *     要**独占麦克风**：本板半双工，且整机是单一大镜像（ai_companion 开机
  *     自启后会一直持有麦克风、在自己的线程里喂 kws_feed），所以跑之前必须
- *     先停掉 ai_companion，否则 audio_in_start() 直接 -EBUSY
+ *     先停掉 ai_companion，否则 audio_in_start() 直接 -EBUSY。
+ *     enroll / live / selftest 都**先把麦克风拿到手**，拿不到就整条子命令
+ *     FAIL、一个 kws_dtw 接口都不碰（kws_init/kws_enroll/kws_selftest 会清或
+ *     改那些全局状态，先动它会把正在跑的唤醒词链路悄悄搞坏，而 -EBUSY 要到
+ *     数完倒计时才发现）。selftest 不录音，拿麦只是确认"没有别的会话在跑"，
+ *     确认完立刻还回去
  *     例外是 `kws threshold`：它只写模块里那个阈值全局变量，不碰流式状态、
  *     也不开麦克风，**可以趁着 ai_companion 在跑**直接改 —— 同一镜像里共享
  *     那个变量，改完立刻对正在跑的唤醒词生效（现场标定最常用的就是它）
@@ -245,6 +251,9 @@
  * ⚠ 半双工 + 单一大镜像：ai_companion 开机自启后会一直持有麦克风（听唤醒词）
  *   并在自己的线程里喂 kws_feed，所以跑 kws 子命令之前必须先把它停掉，
  *   否则 audio_in_start() 直接 -EBUSY。
+ *   enroll / live / selftest 都**先确认麦克风拿到手**（kws_mic_acquire），
+ *   拿不到立刻 FAIL、一个 kws_dtw 接口都不碰 —— 否则 kws_init/kws_enroll/
+ *   kws_selftest 会先清掉/改掉 ai_companion 录音线程正在用的那些全局状态。
  *   **例外是 `kws threshold`**：它只写 kws_dtw 的阈值全局变量、不初始化模块
  *   也不开麦克风，可以趁 ai_companion 在跑时直接改（同一镜像共享那个变量，
  *   改完立刻对正在跑的唤醒词生效）—— 现场标定就该这么用。 */
@@ -263,6 +272,15 @@
 
 #define KWS_READ_CHUNK_BYTES   (AUDIO_SAMPLE_RATE * 2 / 10)
 #define KWS_READ_TASK_STACK    4096   /* 同 AUDIO_READ_TASK_STACK */
+
+/* 阈值的"再往上就没意义了"那条线，等于 kws_dtw.c 里的 KWS_DP_CAP_DIST_MIN。
+ * 那个宏在 .c 里（没导出到 .h），这里照抄一份常量：
+ * 距离被 DTW 的 DP 上限钉住，qn+tn=200 时最大也就 9690 —— 阈值设过它，
+ * "最不像的东西"也会被判命中，唤醒词等于变成「随便什么都唤醒」。
+ * kws_dtw.c 那边只警告不拒绝（标定的人可能故意），但这里是给人手敲的入口，
+ * 多打一个 0（1800 → 18000）就会静默废掉判别力，所以本子命令直接拒绝设置。 */
+
+#define KWS_TH_MAX_SAFE        9690
 
 /* kws 子命令的动作（main 解析参数时用；0 = 没选 kws）。
  * 阈值标定占两个：selftest 算推荐值，threshold 当场改（见 step_kws_*）。 */
@@ -437,17 +455,24 @@ static void usage(void)
   printf("  hw_test kws selftest 唤醒词模块自检（合成 1kHz 查 FFT/Mel 表、"
          "模板自比对/互距离、\n"
          "                       实测 MFCC/DTW 耗时）并打印推荐阈值"
-         "（单独运行，不开麦克风）\n");
-  printf("  hw_test kws threshold <值>  当场改判定阈值，打印新旧值；"
+         "（单独运行）\n"
+         "                       **必须先停 ai_companion**：它和正在跑的"
+         "唤醒词共享 kws_dtw\n"
+         "                       的全局状态（没模板时不报 PASS，会提示先 enroll）\n");
+  printf("  hw_test kws threshold <值|default>  当场改判定阈值，打印新旧值；"
          "默认 1800，只对本次运行有效、\n"
          "                       重启回默认（可以趁 ai_companion 在跑时改，"
-         "改完立刻生效）（单独运行）\n");
+         "改完立刻生效）（单独运行）\n"
+         "                       大于 9690 会让任何输入都判命中，直接拒绝；"
+         "`threshold default` 恢复 1800\n");
   printf("  hw_test kws live [秒]  实时听唤醒词，命中就打一行，默认 10 秒"
          "（单独运行）\n");
-  printf("      注意：kws 各子命令都碰 kws_dtw 的全局状态，enroll/live 还要"
-         "独占麦克风 —— ai_companion\n"
-         "            开机自启后会一直持有它（半双工），跑之前必须先停掉"
-         " ai_companion，否则 audio_in_start 直接 -EBUSY\n"
+  printf("      注意：kws 各子命令都碰 kws_dtw 的全局状态，enroll/live/selftest"
+         " 还会先开一下麦克风确认它\n"
+         "            空闲（拿不到就整条命令 FAIL，一个 kws 接口都不动）——"
+         " ai_companion 开机自启后会\n"
+         "            一直持有它（半双工），跑之前必须先停掉 ai_companion，"
+         "否则 audio_in_start 直接 -EBUSY\n"
          "            （例外：threshold 只写一个全局变量，不用停 ai_companion）\n");
 }
 
@@ -2013,6 +2038,51 @@ static FAR const char *kws_slot_word(int slot)
 }
 
 /****************************************************************************
+ * Name: kws_mic_acquire
+ *
+ * Description:
+ *   把麦克风拿到手：audio_in_start()，成功返回 OK 并**保持持有**，调用方
+ *   负责在收尾前 audio_in_stop()（幂等）。
+ *
+ *   为什么要单独一步、而且要排在所有 kws_dtw 调用之前：
+ *   kws_dtw 的全局状态（预滚环 / 待判句子 / 自适应本底 / 冷却、模板、以及
+ *   selftest 和判定共用的 DTW 暂存）正是 ai_companion 录音线程在用的，而
+ *   kws_init() 一进去就 kws_reset() + 重载模板、kws_enroll() 还会再 reset。
+ *   以前是"先动 kws 再去开麦"，所以 ai_companion 还跑着时敲一嗓子
+ *   enroll/selftest，会把正在跑的唤醒词链路先搞坏，最后才拿到 -EBUSY。
+ *   反过来先开麦就干净：驱动只放行"持有者已消失的残留会话"，能开成 = 现在
+ *   确实没有别的会话在用麦克风；开不成 = 整个子命令 FAIL，一个 kws_dtw
+ *   接口都不碰，正在跑的唤醒词链路一个字节都不会被动到。
+ *
+ *   ⚠ 拿不到时 audio_in_start() **不会**发 AUDIOIOC_STOP（板级封装的约定：
+ *     对面还活着就不打断），所以这条路径也不会踩别人正在录/正在放的通路。
+ *
+ * Returned Value:
+ *   OK = 麦克风已持有（调用方必须 audio_in_stop）；-1 = 拿不到（原因已打印）。
+ *
+ ****************************************************************************/
+
+static int kws_mic_acquire(void)
+{
+  int ret;
+
+  ret = audio_in_start(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_BITS);
+
+  if (ret < 0)
+    {
+      printf("      audio_in_start(%d, %d, %d) 失败: %d\n",
+             AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_BITS, ret);
+      printf("      （-EBUSY = 麦克风被别人占着：ai_companion 开机自启后会一直"
+             "持有它；\n");
+      printf("        跑 kws 子命令前先停掉它 —— 这里到这一步就收手，"
+             "不会去碰 kws_dtw）\n");
+      return -1;
+    }
+
+  return OK;
+}
+
+/****************************************************************************
  * Name: kws_reader_task
  *
  * Description:
@@ -2092,7 +2162,11 @@ static int kws_reader_task(int argc, FAR char *argv)
  *   read 没在预期时间内返回就 audio_in_stop()（它会唤醒阻塞在 read 里的任务），
  *   读任务真卡死时**故意不释放缓冲**（免得它醒来写已释放内存）。
  *
- *   ⚠ 麦克风是单一大镜像里共享的一份全局：**只要 start 成功过，本函数每个
+ *   mic_held != 0：麦克风已经由 kws_mic_acquire() 拿到手了，本函数**不再
+ *   audio_in_start()**（同线程重入会被板级封装判成 -EBUSY），直接开始读。
+ *   这样调用方就能把"确认拿到麦克风"这一步提到所有 kws_dtw 调用之前。
+ *
+ *   ⚠ 麦克风是单一大镜像里共享的一份全局：**只要麦克风是我们的，本函数每个
  *     return 之前都调了 audio_in_stop()**（幂等），一次泄漏就会把后面所有
  *     录音都锁死。反过来，start 本身失败的路径**故意不调 stop** —— 那意味着
  *     这次会话不是我们的，stop 会把别人（比如 ai_companion）正在录的会话
@@ -2104,7 +2178,8 @@ static int kws_reader_task(int argc, FAR char *argv)
  *
  ****************************************************************************/
 
-static int kws_record(int seconds, int live, FAR int16_t **pcm_out)
+static int kws_record(int seconds, int live, int mic_held,
+                      FAR int16_t **pcm_out)
 {
   int nsamples = AUDIO_SAMPLE_RATE * seconds;
   FAR int16_t *buf = NULL;
@@ -2121,19 +2196,31 @@ static int kws_record(int seconds, int live, FAR int16_t **pcm_out)
         {
           printf("      malloc %d 字节失败（把录音秒数调小一点再试）\n",
                  nsamples * 2);
+
+          /* 这条路径在 start 之前，但 mic_held 模式下设备是调用方交到我们
+           * 手上的 —— 必须在这儿还回去，漏一次后面所有录音就都别想开了 */
+
+          if (mic_held)
+            {
+              audio_in_stop();
+            }
+
           return -1;
         }
     }
 
-  ret = audio_in_start(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_BITS);
-  if (ret < 0)
+  if (!mic_held)
     {
-      printf("      audio_in_start(%d, %d, %d) 失败: %d\n",
-             AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_BITS, ret);
-      printf("      （-EBUSY = 麦克风被别人占着：ai_companion 开机自启后会一直"
-             "持有它，跑 kws 子命令前先停掉它）\n");
-      free(buf);
-      return -1;
+      ret = audio_in_start(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_BITS);
+      if (ret < 0)
+        {
+          printf("      audio_in_start(%d, %d, %d) 失败: %d\n",
+                 AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_BITS, ret);
+          printf("      （-EBUSY = 麦克风被别人占着：ai_companion 开机自启后会一直"
+                 "持有它，跑 kws 子命令前先停掉它）\n");
+          free(buf);
+          return -1;
+        }
     }
 
   /* 到这里麦克风才是我们的：下面每个 return 之前都必须 audio_in_stop() */
@@ -2228,9 +2315,14 @@ static int kws_record(int seconds, int live, FAR int16_t **pcm_out)
  *     秒数   可选，默认 KWS_ENROLL_DEFAULT_SEC，钳到
  *            [KWS_ENROLL_MIN_SEC, KWS_ENROLL_MAX_SEC]。
  *
+ *   顺序**必须是**：参数检查 → kws_mic_acquire() → kws_init() → 倒计时 →
+ *   录音（kws_record，麦已在手）→ kws_enroll()。麦克风拿到之前不碰任何
+ *   kws_dtw 接口，拿不到就整条 FAIL（理由见 kws_mic_acquire）。
+ *   录音期间设备一直握在手里，kws_record 返回时已经 audio_in_stop() 还回去了。
+ *
  * Returned Value:
  *   OK = 模板已经在 RAM 里（落盘成功与否见打印）；
- *   -1 = 参数非法 / 初始化失败 / 录音失败 / kws_enroll 失败。
+ *   -1 = 参数非法 / 拿不到麦克风 / 初始化失败 / 录音失败 / kws_enroll 失败。
  *
  ****************************************************************************/
 
@@ -2288,9 +2380,20 @@ static int step_kws_enroll(int slot, int seconds)
   printf("      前提：麦克风必须空闲 —— ai_companion 开机自启后会一直占着它\n");
   printf("            （半双工 + 单一大镜像），跑之前先停掉 ai_companion\n");
 
+  /* 先把麦克风拿到手，再碰 kws_dtw：kws_init() 会 kws_reset()，kws_enroll()
+   * 还会再 reset 一次，而 ai_companion 的录音线程正在用那些全局状态。
+   * 拿不到就在这里收手（一个 kws 接口都不调），而不是数完 3 秒才发现 -EBUSY。 */
+
+  if (kws_mic_acquire() < 0)
+    {
+      report("KWS 麦克风", 0, "拿不到麦克风（先停 ai_companion）");
+      return -1;
+    }
+
   ret = kws_init();
   if (ret < 0)
     {
+      audio_in_stop();
       printf("      kws_init() 失败: %d（内部表建不起来，属异常）\n", ret);
       report("KWS 模块初始化", 0, "kws_init 失败");
       return -1;
@@ -2313,7 +2416,7 @@ static int step_kws_enroll(int slot, int seconds)
 
   printf("      >>> 开始录音，请说：「%s」 <<<\n", kws_slot_word(slot));
 
-  ret = kws_record(seconds, 0, &pcm);
+  ret = kws_record(seconds, 0, 1, &pcm);    /* mic_held=1：麦已经在手里 */
   if (ret < 0)
     {
       report("KWS 录音", 0, "录音失败（原因见上面）");
@@ -2467,6 +2570,9 @@ static int step_kws_test(void)
  *
  *   ⚠ 只能在 ai_companion 没跑的时候用：它开机自启时会独占麦克风（半双工），
  *     而且和这里共享 KWS 的全局状态。使用提示里也打了这句话。
+ *   和 enroll 一样先 kws_mic_acquire()：拿不到麦克风就整条 FAIL，
+ *   kws_init()/kws_reset() 一个都不调（否则先把正在跑的唤醒词链路清掉了，
+ *   最后才拿到 -EBUSY）。
  *
  ****************************************************************************/
 
@@ -2493,9 +2599,18 @@ static int step_kws_live(int seconds)
   printf("            否则 audio_in_start() 直接失败 -EBUSY。\n");
   printf("      命中延迟：说完最后一个字后还要等 ~300ms 的尾静音才判（正常）\n");
 
+  /* 先拿麦克风：拿不到就一个 kws_dtw 接口都不碰（见 kws_mic_acquire） */
+
+  if (kws_mic_acquire() < 0)
+    {
+      report("KWS 麦克风", 0, "拿不到麦克风（先停 ai_companion）");
+      return -1;
+    }
+
   ret = kws_init();
   if (ret < 0)
     {
+      audio_in_stop();
       printf("      kws_init() 失败: %d（内部表建不起来，属异常）\n", ret);
       report("KWS 模块初始化", 0, "kws_init 失败");
       return -1;
@@ -2505,6 +2620,7 @@ static int step_kws_live(int seconds)
 
   if (kws_ready_count() <= 0)
     {
+      audio_in_stop();
       printf("      还没有模板（kws_feed 永远不会返回 1）—— 先跑 "
              "hw_test kws enroll 0 4\n");
       report("唤醒词实时听音", 0, "还没有模板（先 kws enroll）");
@@ -2515,7 +2631,7 @@ static int step_kws_live(int seconds)
 
   kws_reset();
 
-  ret = kws_record(seconds, 1, &pcm);
+  ret = kws_record(seconds, 1, 1, &pcm);    /* mic_held=1：麦已经在手里 */
   hits = (int)g_krec_hits;
 
   if (ret < 0)
@@ -2550,65 +2666,106 @@ static int step_kws_live(int seconds)
  *   假句子算 DTW 距离，最后打印**推荐阈值**（推荐值 = 同句侧上限和结构打乱侧
  *   下限的中点，有第二条模板再往"不同词"那侧拉一半）。
  *
- *   自检本身只吃合成数据 + /data 里的模板，不开麦克风；但模块没初始化时它
- *   直接返回 KWS_ERR_STATE，所以这里先 kws_init()（它顺便把模板读进来 ——
- *   没有模板时自检会跳过第 2/3 项、也就没有推荐值）。
+ *   自检本身只吃合成数据 + /data 里的模板，不录音；但模块没初始化时它直接
+ *   返回 KWS_ERR_STATE，所以这里要 kws_init()（它顺便把模板读进来）。
  *
  *   ⚠ 会 kws_reset()（kws_init 内部）—— 会和正在听的 ai_companion 抢模块的
- *     流式状态，所以使用说明里要求先停它。
+ *     流式状态，所以这里**先** kws_mic_acquire() 确认麦克风没人用：拿不到就
+ *     整条 FAIL、一个 kws_dtw 接口都不碰。确认到了立刻 audio_in_stop() 还回去
+ *     （本子命令不录音，开机只为拿到"没有别的会话在跑"这个证据）。
  *
  *   返回 OK / -1：每个失败项的原因由 kws_selftest() 自己 printf，这里只把它
- *   折成 PASS/FAIL 记进总账。
+ *   折成 PASS/FAIL 记进总账。**没有模板时不报 PASS**：那种情况下自检会跳过
+ *   第 2/3 项、没有推荐阈值，标定根本做不下去 —— 报 PASS 会误导现场。
  *
  ****************************************************************************/
 
 static int step_kws_selftest(void)
 {
   char detail[96];
+  int ready;
   int ret;
+
+  /* 先确认麦克风没人用，再碰 kws_dtw（见 kws_mic_acquire） */
+
+  if (kws_mic_acquire() < 0)
+    {
+      report("KWS 麦克风", 0, "拿不到麦克风（先停 ai_companion）");
+      return -1;
+    }
 
   ret = kws_init();
   if (ret < 0)
     {
+      audio_in_stop();
       printf("      kws_init() 失败: %d（内部表建不起来，属异常）\n", ret);
       report("KWS 模块初始化", 0, "kws_init 失败");
       return -1;
     }
 
-  ret = kws_selftest();
+  /* 麦只是拿来当"没有别的会话"的证据，后面的自检全是纯计算，早点还回去 */
 
-  if (kws_ready_count() == 0)
+  audio_in_stop();
+
+  ret   = kws_selftest();
+  ready = kws_ready_count();            /* kws_dtw.h 的现成接口：可用模板条数 */
+
+  if (ret != 0)
     {
-      printf("      提示：没有模板就没有推荐阈值 —— 先录一条：\n");
+      printf("      自检有失败项（原因见上面的 [KWS] 行）\n");
+      snprintf(detail, sizeof(detail), "有失败项（当前阈值 %d）",
+               kws_get_threshold());
+      report("唤醒词自检", 0, detail);
+      return -1;
+    }
+
+  if (ready == 0)
+    {
+      /* 没有模板时 kws_selftest() 跳过第 2/3 项、fails 仍是 0 → 返回 0。
+       * 那个 0 只说明"能查的几项没查出问题"，不代表唤醒词能用：没有模板就
+       * 没有推荐阈值，标定无从谈起（kws_feed 也永远不会返回 1）。 */
+
+      printf("      无法自检：一条模板都没有 —— 自检会跳过「模板自比对」和"
+             "「互距离」两项，\n");
+      printf("      也就算不出推荐阈值，标定做不下去。先录一条：\n");
       printf("            hw_test kws enroll 0 4   （念「你好，openvela」）\n");
-    }
-  else
-    {
-      printf("      提示：推荐阈值在上面的 [KWS] 推荐阈值 那一行，"
-             "当场改就 `hw_test kws threshold <值>`\n");
+      snprintf(detail, sizeof(detail), "没有模板，无法自检（先 kws enroll 0）");
+      report("唤醒词自检", 0, detail);
+      return -1;
     }
 
-  snprintf(detail, sizeof(detail), "自检%s（当前阈值 %d）",
-           (ret == 0) ? "全通过" : "有失败项", kws_get_threshold());
-  report("唤醒词自检", ret == 0, detail);
+  printf("      提示：推荐阈值在上面的 [KWS] 推荐阈值 那一行，"
+         "当场改就 `hw_test kws threshold <值>`\n");
 
-  return (ret == 0) ? OK : -1;
+  snprintf(detail, sizeof(detail), "自检全通过（当前阈值 %d）",
+           kws_get_threshold());
+  report("唤醒词自检", 1, detail);
+
+  return OK;
 }
 
 /****************************************************************************
  * Name: step_kws_threshold
  *
  * Description:
- *   `hw_test kws threshold <值>`：当场改判定阈值（现场标定的入口）。
- *   单位是"每维每帧 RMS 距离 ×1000"，默认 KWS_THRESHOLD_MILLI = 1800。
+ *   `hw_test kws threshold <值|default>`：当场改判定阈值（现场标定的入口）。
+ *   单位是"每维每帧 RMS 距离 ×1000"，默认 KWS_THRESHOLD_MILLI = 1800；
+ *   参数写 `default`（大小写敏感，和子命令同一个小写风格）就是恢复 1800 ——
+ *   免去为了回默认重启一次（重启还会把刚标定的一起清掉）。
  *
  *   这里**故意不调 kws_init()**：阈值就是 kws_dtw.c 里那个全局变量，同一
  *   镜像里 ai_companion 和这里共享它 —— 不初始化就等于不碰流式状态，所以
  *   可以在 ai_companion 正常跑着（正在听唤醒词）的时候改，改完下一次判定
- *   就用新值。标定时本来就该这么用：一边 live 试唤醒，一边调阈值。
+ *   就用新值。标定时本来就该这么用：一边试唤醒，一边调阈值。
  *
  *   值合法不合法交给 kws_set_threshold() 自己判（它会 printf 原因，
  *   非法的直接忽略），这里只按"读回来的值是不是我要的那个数"判断有没有生效。
+ *
+ *   额外多一道闸：**大于 KWS_TH_MAX_SAFE（9690）时本子命令直接拒绝设置**，
+ *   报 FAIL 并说清"这个值会让任何输入都判命中"，阈值保持原来的不动。
+ *   理由：kws_dtw.c 那边只警告不拒绝（标定的人可能故意），但这里是给人手敲
+ *   的入口，`1800` 多打一个 0 就静默把唤醒词变成"随便什么都唤醒" —— 现场
+ *   演示时这种"改完还报 PASS"的事故代价太大。真想试饱和区，得走模块接口。
  *
  *   ⚠ 只改 RAM：kws_dtw.c 不落盘，重启回默认 —— 打印里明确说了这句。
  *
@@ -2621,6 +2778,21 @@ static int step_kws_threshold(int th)
   int now;
 
   old = kws_get_threshold();
+
+  if (th > KWS_TH_MAX_SAFE)
+    {
+      printf("      拒绝设置：%d 大于 %d（DTW 饱和距离的下限）——\n",
+             th, KWS_TH_MAX_SAFE);
+      printf("      那个区间里距离被 DTW 的上限钉住，**任何输入都会被判命中**，\n");
+      printf("      也就是唤醒词变成「随便什么都唤醒」（阈值实际失效）。\n");
+      printf("      阈值保持 %d 不变；要回默认值用："
+             "hw_test kws threshold default\n", old);
+      snprintf(detail, sizeof(detail), "%d 会让任何输入都命中，已拒绝（仍是 %d）",
+               th, old);
+      report("唤醒词阈值", 0, detail);
+      return -1;
+    }
+
   kws_set_threshold(th);
   now = kws_get_threshold();
 
@@ -2636,8 +2808,11 @@ static int step_kws_threshold(int th)
   printf("      阈值 %d -> %d（每维每帧 RMS 距离 ×1000）\n", old, now);
   printf("      注意：只对本次运行有效 —— kws_dtw 不落盘，重启回到默认 %d，"
          "要长期生效得把 %d 写进代码/开机脚本\n", KWS_THRESHOLD_MILLI, now);
-  printf("      提示：越高越容易命中、也越容易误唤醒；改完用"
-         " `hw_test kws live 10` 念几句当场看效果\n");
+  printf("      提示：越高越容易命中、也越容易误唤醒；当场看效果就读"
+         " ai_companion 打的\n");
+  printf("            `[KWS] 命中唤醒词` 那行日志；要单独听唤醒词"
+         "（kws live）得先停掉\n");
+  printf("            ai_companion，否则 audio_in_start 直接 -EBUSY\n");
 
   snprintf(detail, sizeof(detail), "%d -> %d（重启回 %d）", old, now,
            KWS_THRESHOLD_MILLI);
@@ -3484,13 +3659,14 @@ int main(int argc, FAR char *argv[])
            * 同一个理由：`hw_test kws enroll abc` 要报"缺 slot"，
            * 不能把 atoi("abc") = 0 当成 slot0 照录。
            * threshold 是反过来的：值**必须**给，缺了/不是数字直接报错退出
-           * （照 asr 缺文件路径那套写法），不能拿 atoi("abc") = 0 去设阈值。 */
+           * （照 asr 缺文件路径那套写法），不能拿 atoi("abc") = 0 去设阈值。
+           * 只多认一个字面量 `default`（换成默认阈值），别的一律走数字那条。 */
 
           if (i + 1 >= argc)
             {
               printf("hw_test kws: 缺子命令"
                      "（enroll <slot> [秒] / test / selftest / "
-                     "threshold <值> / live [秒]）\n");
+                     "threshold <值|default> / live [秒]）\n");
               usage();
               return EXIT_FAILURE;
             }
@@ -3521,17 +3697,27 @@ int main(int argc, FAR char *argv[])
             }
           else if (strcmp(argv[i], "threshold") == 0)
             {
-              if (i + 1 >= argc || !arg_is_number(argv[i + 1]))
+              /* `default` = 一键恢复默认阈值（现场标定完想回默认，不用重启） */
+
+              if (i + 1 < argc && strcmp(argv[i + 1], "default") == 0)
                 {
-                  printf("hw_test kws: threshold 要一个数字参数。用法 "
-                         "hw_test kws threshold <值>（默认值见 hw_test kws "
-                         "test 打出的那行）\n");
+                  i++;
+                  kws_th = KWS_THRESHOLD_MILLI;
+                }
+              else if (i + 1 < argc && arg_is_number(argv[i + 1]))
+                {
+                  kws_th = atoi(argv[++i]);
+                }
+              else
+                {
+                  printf("hw_test kws: threshold 要一个数字或 default。用法 "
+                         "hw_test kws threshold <值|default>"
+                         "（default = 恢复 %d）\n", KWS_THRESHOLD_MILLI);
                   usage();
                   return EXIT_FAILURE;
                 }
 
               do_kws = KWS_CMD_THRESHOLD;
-              kws_th = atoi(argv[++i]);
             }
           else if (strcmp(argv[i], "live") == 0)
             {
@@ -3547,7 +3733,7 @@ int main(int argc, FAR char *argv[])
             {
               printf("hw_test kws: 未知子命令 '%s'"
                      "（enroll <slot> [秒] / test / selftest / "
-                     "threshold <值> / live [秒]）\n", argv[i]);
+                     "threshold <值|default> / live [秒]）\n", argv[i]);
               usage();
               return EXIT_FAILURE;
             }
