@@ -818,7 +818,22 @@ static int sf32lb52_audio_recover_rx(FAR struct sf32lb52_audio_s *priv)
 {
   FAR DMA_HandleTypeDef *hdma = priv->aprc.hdma[SF32LB52_AUDIO_PRC_RX_CH];
 
-  HAL_AUDPRC_DMAStop(&priv->aprc, SF32LB52_AUDIO_PRC_RX_CH);
+  /* ⚠️ **只在它还武装着的时候才 abort**。
+   *
+   * 调用方 read() 在进恢复之前已经 `HAL_AUDPRC_DMAStop(RX)` 过一次，而厂商的
+   * `HAL_DMA_Abort()`（DMAStop 内部）**没有状态判断**：无条件关中断、关通道、
+   * 清该通道的全部标志、再 `DMA_FreeChannel()`。通道池那一侧有 owner 检查
+   * （只释放自己的槽），但**寄存器写没有** —— 重复 abort 会再写一遍该物理通道的
+   * CCR/IFCR，而这几毫秒里那个通道可能已经被另一个 DMA 用户重新分配走了，
+   * 结果是把别人的通道**静默关掉**（不崩，但极难查）。
+   *
+   * 判据用 `hdma->State`：`HAL_DMA_Abort()` 自己会把它置成 READY，
+   * 所以 READY 就说明已经收过尾，不必再来一次。 */
+
+  if (hdma == NULL || hdma->State != HAL_DMA_STATE_READY)
+    {
+      HAL_AUDPRC_DMAStop(&priv->aprc, SF32LB52_AUDIO_PRC_RX_CH);
+    }
 
   if (hdma != NULL)
     {

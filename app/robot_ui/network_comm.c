@@ -640,7 +640,6 @@ int mqtt_publish_queued(const char *topic, const char *payload, int qos, bool re
     const char *p = (payload != NULL) ? payload : "";
     size_t tlen;
     size_t plen;
-    bool cut = false;
 
     if (t[0] == '\0') {
         printf("[MQTTQ] 拒绝入队：topic 为空\n");
@@ -650,20 +649,27 @@ int mqtt_publish_queued(const char *topic, const char *payload, int qos, bool re
     tlen = strlen(t);
     plen = strlen(p);
 
-    /* 超长就截断，但**必须**说出来：静默丢内容在现场是查不出来的
-     * （这条纪律和 mqtt_send_publish 里那道长度检查是同一个理由）。 */
-    if (tlen > MQTT_QUEUE_TOPIC_MAX - 1) {
-        tlen = MQTT_QUEUE_TOPIC_MAX - 1;
-        cut = true;
-    }
-    if (plen > MQTT_QUEUE_PAYLOAD_MAX - 1) {
-        plen = MQTT_QUEUE_PAYLOAD_MAX - 1;
-        cut = true;
-    }
-    if (cut) {
-        printf("[MQTTQ] 载荷超长已截断: topic %u->%u 字节, payload %u->%u 字节\n",
-               (unsigned)strlen(t), (unsigned)tlen,
-               (unsigned)strlen(p), (unsigned)plen);
+    /* 超长**直接拒发**，绝不截断后照发。
+     *
+     * 队列里发的全是 JSON：截断必然产出**非法 JSON**，对端 `cJSON_Parse` 失败 =
+     * 静默丢消息，比"没发"更难查（而且 topic 被截还会发到错误的话题上）。
+     * 当前工程里最长载荷约 576 字节、余量只有 64 字节 —— 将来谁把
+     * `AI_CMD_PARAM_MAX` 调大一点就会踩上，所以这里不给自己留"看起来能跑"的假象。
+     * 日志做节流（这条不是热路径错误，但也不能刷屏）。 */
+    if (tlen > MQTT_QUEUE_TOPIC_MAX - 1 || plen > MQTT_QUEUE_PAYLOAD_MAX - 1) {
+        static unsigned long oversize_log_ms = 0;
+        unsigned long now_ms = (unsigned long)(time(NULL) * 1000);
+
+        if (now_ms - oversize_log_ms >= 1000) {
+            oversize_log_ms = now_ms;
+            printf("[MQTTQ] 载荷超长**拒发**（不截断，截断会产出非法 JSON）: "
+                   "topic %u/%d 字节, payload %u/%d 字节\n",
+                   (unsigned)strlen(t), MQTT_QUEUE_TOPIC_MAX - 1,
+                   (unsigned)strlen(p), MQTT_QUEUE_PAYLOAD_MAX - 1);
+        }
+
+        pthread_mutex_unlock(&g_mqtt_queue_lock);
+        return -EMSGSIZE;
     }
 
     pthread_mutex_lock(&g_mqtt_queue_lock);
