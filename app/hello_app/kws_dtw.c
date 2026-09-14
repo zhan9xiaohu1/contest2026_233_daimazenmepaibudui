@@ -69,6 +69,14 @@
 #define KWS_TPL_MAGIC       0x5453574Bu     /* 'K''W''S''T' 小端 */
 #define KWS_TPL_VERSION     1u
 
+/* 出厂模板在只读 ROMFS 里的位置（对应仓库的
+ * board/contest_board/src/etc/assets/kws/，上板后挂在 /etc 下）。
+ * 为什么需要它：/data 是 tmpfs，重启就把 /data/kws 清空 —— 没有这一步，
+ * 唤醒词每次重启都静默失效，只剩 VAD 触发。仓库里不放 .tpl 是**正常情况**
+ * （麦克风录的模板因人而异），所以缺失时安静跳过，不是错误。 */
+
+#define KWS_TPL_ASSETS_DIR  "/etc/assets/kws"
+
 /* 刚 reset 之后先稳一会儿再判端点：自适应本底还没收敛、
  * 开机/切回麦克风的第一帧常有直流冲击。
  * （和 robot_ui/ambient_listen.c 的 AMBIENT_RESUME_GUARD_MS 一个道理） */
@@ -194,6 +202,8 @@ static int      kws_write_all(int fd, const void *buf, size_t len);
 static int      kws_read_all(int fd, void *buf, size_t len);
 static int      kws_tpl_save(int slot);
 static int      kws_tpl_load(int slot);
+static int      kws_tpl_install(int slot);
+static void     kws_install_templates(void);
 static int      kws_us_diff(const struct timespec *a, const struct timespec *b);
 
 /****************************************************************************
@@ -1207,6 +1217,119 @@ static int kws_tpl_load(int slot)
   return 0;
 }
 
+/* 把只读素材里的 slotN.tpl 补一份到 /data/kws（同板级
+ * sf32lb52_install_agent_config() 的套路）。返回写入的字节数，负值 = 没装。
+ *
+ * 目标已存在时调用方就不会走到这里：现场录的模板（更贴合说话人）优先于
+ * 出厂模板，绝不覆盖。
+ *
+ * 先写 slotN.tpl.tmp 再 rename，和 kws_tpl_save 同一条理由：掉电不会留下
+ * "长度对、内容半截"的文件 —— 那种文件校验和不过会被拒绝，而且"目标已存在
+ * 就不覆盖"会让它把之后每一次开机重装都挡掉，等于这个槽永久残废。 */
+
+static int kws_tpl_install(int slot)
+{
+  char src[64];
+  char dst[64];
+  char tmp[64];
+  char buf[256];
+  ssize_t total = 0;
+  ssize_t nread;
+  int srcfd;
+  int dstfd;
+
+  if (snprintf(src, sizeof(src), KWS_TPL_ASSETS_DIR "/slot%d.tpl", slot) <= 0 ||
+      kws_tpl_path(dst, sizeof(dst), slot) < 0 ||
+      kws_tpl_tmp_path(tmp, sizeof(tmp), slot) < 0)
+    {
+      return -1;
+    }
+
+  srcfd = open(src, O_RDONLY);
+  if (srcfd < 0)
+    {
+      return -1;                        /* 素材里没有这一条：最常见的情况 */
+    }
+
+  dstfd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  if (dstfd < 0)
+    {
+      close(srcfd);
+      return -1;
+    }
+
+  for (;;)
+    {
+      nread = read(srcfd, buf, sizeof(buf));
+      if (nread <= 0)
+        {
+          break;
+        }
+
+      if (kws_write_all(dstfd, buf, (size_t)nread) < 0)
+        {
+          nread = -1;                   /* 写失败和读失败走同一段清理 */
+          break;
+        }
+
+      total += nread;
+    }
+
+  close(dstfd);
+  close(srcfd);
+
+  if (nread < 0 || rename(tmp, dst) < 0)
+    {
+      unlink(tmp);
+      return -1;
+    }
+
+  return (int)total;
+}
+
+/* 开机时把 ROMFS 里的出厂模板补进 /data/kws（/data 是 tmpfs，重启就空，
+ * 不补的话唤醒词功能每次重启都静默失效）。目录里没有素材时安静跳过 ——
+ * 仓库不带 .tpl 是常态，这一步**不能**报错、也不能拖住启动。 */
+
+static void kws_install_templates(void)
+{
+  int installed = 0;
+  int bytes = 0;
+  int s;
+
+  /* /data 还没挂上（或压根没有）时建目录会失败：直接整段跳过，
+   * 后面的载入会把"没有模板"当成正常情况。 */
+
+  if (mkdir(KWS_DATA_DIR, 0777) < 0 && errno != EEXIST)
+    {
+      return;
+    }
+
+  for (s = 0; s < KWS_MAX_TEMPLATES; s++)
+    {
+      char dst[64];
+      int n;
+
+      if (kws_tpl_path(dst, sizeof(dst), s) < 0 || access(dst, F_OK) == 0)
+        {
+          continue;                     /* 已经有模板（现场录的优先），不覆盖 */
+        }
+
+      n = kws_tpl_install(s);
+      if (n > 0)
+        {
+          installed++;
+          bytes += n;
+        }
+    }
+
+  if (installed > 0)
+    {
+      printf("[KWS] 出厂模板补装到 %s：%d 字节（%d 条）\n", KWS_DATA_DIR, bytes,
+             installed);
+    }
+}
+
 static int kws_us_diff(const struct timespec *a, const struct timespec *b)
 {
   return (int)((b->tv_sec - a->tv_sec) * 1000000 +
@@ -1227,6 +1350,12 @@ int kws_init(void)
       g_ready = true;
     }
 
+  /* 先把只读素材里的出厂模板补进 /data（/data 是 tmpfs，重启就空），
+   * 再统一走载入路径 —— 补装出来的文件和现场录的模板是同一种文件，
+   * 后面不需要区分。 */
+
+  kws_install_templates();
+
   loaded = kws_template_load_all();
 
   kws_reset();
@@ -1237,7 +1366,9 @@ int kws_init(void)
   if (loaded == 0)
     {
       printf("[KWS] 提示：还没有模板，kws_feed 永远不会返回 1；"
-             "先用 kws_enroll 录「你好，openvela」和「Hello，openvela」\n");
+             "先用 kws_enroll 录「你好，openvela」和「Hello，openvela」，"
+             "或把录好的 slotN.tpl 放进固件里的 " KWS_TPL_ASSETS_DIR
+             "/ 随固件一起打包\n");
     }
 
   return 0;

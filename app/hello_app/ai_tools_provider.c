@@ -357,16 +357,25 @@ static int ai_tools_provider_execute(const char *name, const char *input_json,
 
   if (ret < 0)
     {
+      /* 负值 = 命令**没进发送队列**（-ENOTCONN 网络没连上、-ENOSPC 队列满、
+       * -EMSGSIZE 载荷超长、-EINVAL 参数被拒），设备那边一点动静都没有。 */
+
       snprintf(output, output_size,
-               "没执行：命令没能发到设备（返回 %d，一般是 MQTT 没连上）。", ret);
-      ai_tools_info("set_light: device_cmd %s=%s 发送失败(%d)", device, command,
-                    ret);
+               "没执行：命令没能交给网络层（返回 %d，网络没连上、发送队列满或者"
+               "载荷超长），这条命令不会发出去。", ret);
+      ai_tools_info("set_light: device_cmd %s=%s 没交给网络层(%d)", device,
+                    command, ret);
       return OK;
     }
 
-  snprintf(output, output_size, "已下发：%s 的灯 %s。", device,
-           (strcmp(command, "on") == 0) ? "已打开" : "已关闭");
-  ai_tools_info("set_light: device_cmd %s=%s 已发出", device, command);
+  /* 走到这里只说明消息**进了发送队列**，真正发出去是 network_task 那条
+   * socket 干的；设备收没收到、执行没执行都没有回执。所以不能回"已下发" ——
+   * 模型会照着这句话跟老人说，而灯可能压根没动。 */
+
+  snprintf(output, output_size,
+           "已交给网络层发送：发给 %s 的灯控命令 %s。发出去而已，设备有没有"
+           "执行这边看不到回执，别对老人说已经生效。", device, command);
+  ai_tools_info("set_light: device_cmd %s=%s 已交给网络层", device, command);
   return OK;
 }
 

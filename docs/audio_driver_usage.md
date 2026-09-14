@@ -222,16 +222,41 @@ free(buf);
 
 ## 6. 落地方式（队友如何获取）
 
-驱动不在 upstream `vendor/sifli` 里，需要打补丁（仓库 `patches/`）：
+**板级驱动就在本比赛仓库里，不需要打任何板级补丁。**
+
+| 内容 | 位置 |
+|------|------|
+| 播放 + 录音驱动 | `board/contest_board/src/sf32lb52_audio.{c,h}` |
+| 录音封装（上层直接用这个） | `board/contest_board/src/sf32lb52_audio_in.{c,h}` |
+| bringup（注册设备、RNDIS、挂载、按键…） | `board/contest_board/src/sifli_ap.c` |
+| 板级 defconfig | `board/contest_board/configs/sf32lb52_ai/defconfig` |
+
+openvela 工作区里的 `vendor/sifli/boards/sf32lb52/sf32lb52_devkit_lcd/`（整目录，含 `src/`）
+是**指向 `board/contest_board` 的软链接**（固件按
+`CONFIG_ARCH_BOARD_CUSTOM_DIR=.../sf32lb52_devkit_lcd` 取板级源码），两边本来
+就是同一份文件 —— 改仓库文件就等于改构建源，**不要为板级生成补丁、也不要 `git apply` 板级补丁**。
+
+早先的 `patches/vendor_sifli-audio-driver.patch` 已经**删除**（它是一份严重脱节的旧驱动快照）：
+
+- 在现在的工作区里它一个字也打不进去 —— 目标路径穿过软链接，`git apply` 直接拒绝：
+  `error: affected file '.../src/sifli_ap.c' is beyond a symbolic link`；
+- 在干净的上游树上它**反而**能打进去，代价是把 `sf32lb52_audio.c` 与 `sifli_ap.c`
+  退回旧版本，**覆盖掉当前固件里的全部音频修复**（半双工串行化、`audio_in` 的接入、
+  DMAStop 复核……），而这一轮新增的板级源文件（`sf32lb52_audio_in.c`、
+  `sf32lb52_backlight.c` 等）根本不在那份补丁里。
+
+原因与量级对比见 `patches/README.md` 的「板级改动不走补丁了」一节。
+
+vendor 公共树（`chips/`）确实要打一条补丁 —— 它和音频无关，但不打就编不过/起不来：
 
 ```bash
 cd <openvela 工作区>/vendor/sifli
 git apply <本仓库>/patches/vendor_sifli-boot-fixes.patch    # 上游编译/启动修复（chips/）
-git apply <本仓库>/patches/vendor_sifli-audio-driver.patch   # 音频驱动（boards/）
 ```
 
-注意：`vendor_sifli-audio-driver.patch` 里的 `sifli_ap.c` 还带有**实验性的 USB RNDIS 初始化钩子**
-（与音频无关，如不需要可自行删掉那几行 include 与调用）。
+> USB RNDIS 的 bring-up（`#ifdef CONFIG_RNDIS` 那段 `usbdev_rndis_initialize()`，MAC
+> `00:e0:4c:53:42:31`）也**不在任何补丁里**，它就在 `board/contest_board/src/sifli_ap.c:694`
+> （调用在 `:711`）。
 
 板级 defconfig 需要：`CONFIG_AUDIO=y`、`CONFIG_EXAMPLES_AUDIO_TEST=y`（见本仓库 `board/.../defconfig`）。
 

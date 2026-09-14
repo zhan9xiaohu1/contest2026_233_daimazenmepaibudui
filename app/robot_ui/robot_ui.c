@@ -746,7 +746,12 @@ void robot_ui_show_alarm(const char *content)
     {
         int rret = report_alarm_queued("ui", "用户按下报警按钮");
         if (rret < 0) {
-            printf("robot_ui: report_alarm failed: %d（MQTT 没连上？）\n", rret);
+            /* 排队口的负值只表示**这条没进队列**：-EINVAL topic 空、
+             * -ENOSPC 队列满、-EMSGSIZE 载荷超长（语义见
+             * mqtt_publish_queued()）。跟 MQTT 连没连上无关 —— 连接由
+             * network_task 自己维持，连不上是它那边重连的事。 */
+            printf("robot_ui: report_alarm_queued 没入队: %d"
+                   "（队列满或载荷超长，这条不会发出去）\n", rret);
         }
     }
 }

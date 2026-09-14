@@ -267,10 +267,12 @@ static volatile bool g_voice_spoke;
  * g_kws_enabled = 有模板才算"功能开了"：没有模板时 kws_feed 永远返回 0，
  *   喂不喂结果一样，跳过只是为了省掉 MFCC 那 2~3% 的 CPU。也正因为跳过，
  *   现场没录模板时，整条链路的行为和接这个模块之前**完全一样**（只有 VAD 触发）。
+ *   ⚠ 它**不是**开机时定死的：每次喂帧前 kws_update_enabled() 会重问一遍
+ *   （模板可能是这次开机之后才录进 /data/kws 的），只置真、不清假。
  ****************************************************************************/
 
 static int           g_kws_ready;      /* 开机时从 /data/kws 载入的模板条数 */
-static bool          g_kws_enabled;    /* 有模板才喂帧、才处理命中 */
+static bool          g_kws_enabled;    /* 有模板才喂帧、才处理命中（运行中可变） */
 static volatile bool g_kws_hit;        /* 录音线程置：刚命中唤醒词 */
 
 /****************************************************************************
@@ -549,6 +551,40 @@ static void vad_callback(bool speech_detected, void *user_data)
     }
 }
 
+/**
+ * @brief  重新评估「唤醒词功能开了没」（只在录音线程里调）
+ *
+ * g_kws_enabled 原来是开机时算一次就定死的，而模板**可以在运行中出现**：
+ * NSH 里 `hw_test kws enroll <slot>` 现录一条，或者别的路径往 /data/kws 拷了
+ * 文件再调 kws_template_load_all()。只在开机判一次，这些模板就要等到下次重启
+ * 才生效 —— 而重启又把 /data 清空，等于永远用不上。所以每次喂帧前重问一遍。
+ *
+ * 代价可以忽略：功能已开时只是一次提前返回；没开时是一次 4 个槽的整数比较
+ * （kws_ready_count 就是数 g_tpl_len[s] > 0 的个数），远小于一次 kws_feed。
+ * 只置真、不清假：g_kws_enabled 一旦为真就再没人能把它改回去，所以
+ * "置了 g_kws_hit 就说明喂过帧"这个前提在 kws_wake_tick() 里始终成立。
+ */
+
+static void kws_update_enabled(void)
+{
+  int ready;
+
+  if (g_kws_enabled)
+    {
+      return;
+    }
+
+  ready = kws_ready_count();
+  if (ready <= 0)
+    {
+      return;
+    }
+
+  g_kws_enabled = true;
+  printf("[KWS] 运行中出现 %d 条模板 → 唤醒词功能启用"
+         "（词：你好，openvela / Hello，openvela）\n", ready);
+}
+
 static void audio_data_callback(const int16_t *data, size_t frames,
                                 void *user_data)
 {
@@ -612,7 +648,12 @@ static void audio_data_callback(const int16_t *data, size_t frames,
    *
    * 命中时只置标志：流程交给主循环的 kws_wake_tick()。这里绝不能做
    * 耗时/阻塞的事 —— 上一次命中时它会连着跑 1~4 次 DTW（合计毫秒级突发），
-   * 再叠上 TTS/网络/LVGL 就会把这个 20ms 一次的录音回调拖垮。 */
+   * 再叠上 TTS/网络/LVGL 就会把这个 20ms 一次的录音回调拖垮。
+   *
+   * 先重问一次"现在有没有模板"：模板可能是这次开机之后才录进 /data/kws 的
+   * （见 kws_update_enabled），只在开机判一次的话那些模板永远用不上。 */
+
+  kws_update_enabled();
 
   if (g_kws_enabled && kws_feed(data, frames) == 1)
     {
@@ -4191,14 +4232,17 @@ int main(int argc, char *argv[])
    * 而 kws_dtw 要求它的接口只被一个线程调（喂帧的那个），所以建表、
    * 读模板都得在录音线程存在之前做完。
    *
-   * kws_init() 自己会去 /data/kws/ 把 slotN.tpl 读回来（文件名是模块里
-   * 定死的 KWS_DATA_DIR + "slot%d.tpl"，路径不用我们拼），
-   * 并且它是幂等的：建表只做一次，重复调用只是重新读一遍模板文件。
+   * kws_init() 自己会先去 ROMFS 的 /etc/assets/kws/ 把出厂模板补进 /data/kws，
+   * 再把 /data/kws/slotN.tpl 读回来（文件名是模块里定死的 KWS_DATA_DIR +
+   * "slot%d.tpl"，路径不用我们拼）；它是幂等的：建表只做一次，
+   * 重复调用只是重新装/读一遍模板文件。
    *
    * ⚠ /data 在本板是 tmpfs，重启就空 —— 没有模板的情况下 kws_feed
    *   永远返回 0，我们把 g_kws_enabled 置 false 后**连喂都不喂**，
    *   整条链路就退回"只靠 VAD 触发"，和接线之前一模一样。
-   *   模板怎么录：kws_dtw.h 的 kws_enroll()（现场跑一次，或以后从别处灌）。 */
+   *   模板怎么来：① 固件里带（把 slotN.tpl 放进 etc/assets/kws/ 一起打包，
+   *   开机自动装，这是"重启后还有"的唯一途径）；② 现场录（kws_dtw.h 的
+   *   kws_enroll()，只在本次开机有效，见 kws_update_enabled）。 */
 
   printf("[初始化] 正在初始化唤醒词模块...\n");
   ret = kws_init();
@@ -4219,7 +4263,9 @@ int main(int argc, char *argv[])
   else
     {
       printf("[KWS] 没有模板（%s 是空的，/data 是 tmpfs 重启就丢）→ "
-             "唤醒词功能未启用，只靠 VAD 触发，行为与以前一致\n",
+             "唤醒词功能未启用，只靠 VAD 触发，行为与以前一致"
+             "（运行中录到模板会自动启用；想开机即用就把 slotN.tpl 放进固件里"
+             "的 /etc/assets/kws/）\n",
              KWS_DATA_DIR);
     }
 
@@ -4255,11 +4301,11 @@ int main(int argc, char *argv[])
    * RNDIS/DNS 常常还没就绪（真机日志：`MQTT DNS 解析失败` -> `Error 101` ->
    * 这里打"网络初始化失败"），于是 g_net_started 一直是 false、界面整场不动。
    *
-   * 不用 ai_network_init()：network_comm.c 在一个固件里只有一份实例，
-   * 界面（robot_ui）的 network_task 已经拥有那条 MQTT socket，
-   * ai_network_init() 会把它的全局状态 memset 掉、还会把 MQTT 收包回调抢过来，
-   * 结果是界面再也收不到 ai_reply。ai_network_start_shared() 只复用那条连接
-   * （没人连的时候才兜底连一次），理由写在 ai_network.c 里。 */
+   * 不走 ai_network_init()：那个入口已经删掉了（它会另起一份 network_comm 状态，
+   * 还会把唯一的 MQTT 收包回调槽抢过来，界面从此收不到 ai_reply）。
+   * network_comm.c 在一个固件里只有一份实例，界面（robot_ui）的 network_task
+   * 已经拥有那条 MQTT socket，hello_app 只能借：ai_network_start_shared() 只
+   * 复用那条连接（没人连的时候才兜底连一次），理由写在 ai_network.c 里。 */
 
   printf("[初始化] 正在初始化网络模块...\n");
 

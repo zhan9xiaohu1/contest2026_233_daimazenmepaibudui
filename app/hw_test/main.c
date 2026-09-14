@@ -28,6 +28,15 @@
  *                            —— 单独运行，且必须先停掉 ai_companion
  *   hw_test kws test         打印唤醒词模板数 / 阈值 / 每个槽位是否可用
  *                            —— 单独运行
+ *   hw_test kws selftest     唤醒词模块自检（合成 1kHz 查 FFT/Mel 表、
+ *                            模板自比对和互距离、实测 MFCC/DTW 耗时），
+ *                            并打印算出来的**推荐阈值** —— 单独运行
+ *                            （不开麦克风，但要先停 ai_companion：它和这里
+ *                             共享 kws_dtw 的全局状态）
+ *   hw_test kws threshold <值>  当场改判定阈值（默认 1800，单位见
+ *                            kws_dtw.h），打印新旧值 —— 只对本次运行有效，
+ *                            重启回到默认；只写一个全局变量、不开麦克风，
+ *                            可以趁着 ai_companion 在跑直接改 —— 单独运行
  *   hw_test kws live [秒]    实时听唤醒词，命中就打一行（默认 10 秒）
  *                            —— 单独运行，且必须先停掉 ai_companion
  *
@@ -39,9 +48,13 @@
  *     设 alarm、开麦克风、响喇叭、等按键），所以放在子命令里；而且它们
  *     **不跑**上面那套 5 步自检，只跑自己，免得每次验 IMU 还要先等
  *     10 秒触摸 + 5 秒按键
- *   - kws 三条子命令都要**独占麦克风**：本板半双工，且整机是单一大镜像
- *     （ai_companion 开机自启后会一直持有麦克风），所以跑之前必须先停掉
- *     ai_companion，否则 audio_in_start() 直接 -EBUSY
+ *   - kws 各子命令都会碰 kws_dtw 的全局状态（模块没有锁），enroll / live 还
+ *     要**独占麦克风**：本板半双工，且整机是单一大镜像（ai_companion 开机
+ *     自启后会一直持有麦克风、在自己的线程里喂 kws_feed），所以跑之前必须
+ *     先停掉 ai_companion，否则 audio_in_start() 直接 -EBUSY
+ *     例外是 `kws threshold`：它只写模块里那个阈值全局变量，不碰流式状态、
+ *     也不开麦克风，**可以趁着 ai_companion 在跑**直接改 —— 同一镜像里共享
+ *     那个变量，改完立刻对正在跑的唤醒词生效（现场标定最常用的就是它）
  *   - 默认自检里的按键步骤是"非交互"的（没人按也算 PASS，只证明能读）；
  *     要真的验证按键，跑 `hw_test button`，它超时会 FAIL
  *   - **按键一律走板级 GPIO 模块 `sf32lb52_boardbtn`，不碰 /dev/buttons**：
@@ -229,8 +242,12 @@
  * 其中 slot0 =「你好，openvela」、slot1 =「Hello，openvela」。
  * ⚠ 本板 /data 是 tmpfs —— 重启就丢，要长期保留得靠别的手段搬走/重录。
  *
- * ⚠ 半双工 + 单一大镜像：ai_companion 开机自启后会一直持有麦克风（听唤醒词），
- *   所以跑 kws 子命令之前必须先把它停掉，否则 audio_in_start() 直接 -EBUSY。 */
+ * ⚠ 半双工 + 单一大镜像：ai_companion 开机自启后会一直持有麦克风（听唤醒词）
+ *   并在自己的线程里喂 kws_feed，所以跑 kws 子命令之前必须先把它停掉，
+ *   否则 audio_in_start() 直接 -EBUSY。
+ *   **例外是 `kws threshold`**：它只写 kws_dtw 的阈值全局变量、不初始化模块
+ *   也不开麦克风，可以趁 ai_companion 在跑时直接改（同一镜像共享那个变量，
+ *   改完立刻对正在跑的唤醒词生效）—— 现场标定就该这么用。 */
 
 #define KWS_ENROLL_DEFAULT_SEC 4    /* 录模板默认时长；1~2 秒的短语 + 尾静音够用 */
 #define KWS_ENROLL_MIN_SEC     2    /* 再短就可能把短语截掉，录出个残模板 */
@@ -247,12 +264,15 @@
 #define KWS_READ_CHUNK_BYTES   (AUDIO_SAMPLE_RATE * 2 / 10)
 #define KWS_READ_TASK_STACK    4096   /* 同 AUDIO_READ_TASK_STACK */
 
-/* kws 子命令的三种动作（main 解析参数时用；0 = 没选 kws） */
+/* kws 子命令的动作（main 解析参数时用；0 = 没选 kws）。
+ * 阈值标定占两个：selftest 算推荐值，threshold 当场改（见 step_kws_*）。 */
 
-#define KWS_CMD_NONE   0
-#define KWS_CMD_ENROLL 1
-#define KWS_CMD_TEST   2
-#define KWS_CMD_LIVE   3
+#define KWS_CMD_NONE      0
+#define KWS_CMD_ENROLL    1
+#define KWS_CMD_TEST      2
+#define KWS_CMD_LIVE      3
+#define KWS_CMD_SELFTEST  4
+#define KWS_CMD_THRESHOLD 5
 
 /****************************************************************************
  * Private Types
@@ -414,11 +434,21 @@ static void usage(void)
          "存到 /data/kws/slotN.tpl（单独运行）\n");
   printf("  hw_test kws test     打印唤醒词模板数/阈值/每个槽位是否可用"
          "（单独运行）\n");
+  printf("  hw_test kws selftest 唤醒词模块自检（合成 1kHz 查 FFT/Mel 表、"
+         "模板自比对/互距离、\n"
+         "                       实测 MFCC/DTW 耗时）并打印推荐阈值"
+         "（单独运行，不开麦克风）\n");
+  printf("  hw_test kws threshold <值>  当场改判定阈值，打印新旧值；"
+         "默认 1800，只对本次运行有效、\n"
+         "                       重启回默认（可以趁 ai_companion 在跑时改，"
+         "改完立刻生效）（单独运行）\n");
   printf("  hw_test kws live [秒]  实时听唤醒词，命中就打一行，默认 10 秒"
          "（单独运行）\n");
-  printf("      注意：kws 三条都要独占麦克风 —— ai_companion 开机自启后会一直"
-         "持有它（半双工），\n"
-         "            跑之前必须先停掉 ai_companion，否则 audio_in_start 直接 -EBUSY\n");
+  printf("      注意：kws 各子命令都碰 kws_dtw 的全局状态，enroll/live 还要"
+         "独占麦克风 —— ai_companion\n"
+         "            开机自启后会一直持有它（半双工），跑之前必须先停掉"
+         " ai_companion，否则 audio_in_start 直接 -EBUSY\n"
+         "            （例外：threshold 只写一个全局变量，不用停 ai_companion）\n");
 }
 
 /****************************************************************************
@@ -2512,15 +2542,120 @@ static int step_kws_live(int seconds)
 }
 
 /****************************************************************************
+ * Name: step_kws_selftest
+ *
+ * Description:
+ *   `hw_test kws selftest`：跑 kws_dtw.c 的自检 —— 它拿合成 1kHz 查 FFT/Mel
+ *   表，再拿模板 0 自己跟自己、跟"时间拉伸 1.25 倍"的副本、跟"帧序打乱"的
+ *   假句子算 DTW 距离，最后打印**推荐阈值**（推荐值 = 同句侧上限和结构打乱侧
+ *   下限的中点，有第二条模板再往"不同词"那侧拉一半）。
+ *
+ *   自检本身只吃合成数据 + /data 里的模板，不开麦克风；但模块没初始化时它
+ *   直接返回 KWS_ERR_STATE，所以这里先 kws_init()（它顺便把模板读进来 ——
+ *   没有模板时自检会跳过第 2/3 项、也就没有推荐值）。
+ *
+ *   ⚠ 会 kws_reset()（kws_init 内部）—— 会和正在听的 ai_companion 抢模块的
+ *     流式状态，所以使用说明里要求先停它。
+ *
+ *   返回 OK / -1：每个失败项的原因由 kws_selftest() 自己 printf，这里只把它
+ *   折成 PASS/FAIL 记进总账。
+ *
+ ****************************************************************************/
+
+static int step_kws_selftest(void)
+{
+  char detail[96];
+  int ret;
+
+  ret = kws_init();
+  if (ret < 0)
+    {
+      printf("      kws_init() 失败: %d（内部表建不起来，属异常）\n", ret);
+      report("KWS 模块初始化", 0, "kws_init 失败");
+      return -1;
+    }
+
+  ret = kws_selftest();
+
+  if (kws_ready_count() == 0)
+    {
+      printf("      提示：没有模板就没有推荐阈值 —— 先录一条：\n");
+      printf("            hw_test kws enroll 0 4   （念「你好，openvela」）\n");
+    }
+  else
+    {
+      printf("      提示：推荐阈值在上面的 [KWS] 推荐阈值 那一行，"
+             "当场改就 `hw_test kws threshold <值>`\n");
+    }
+
+  snprintf(detail, sizeof(detail), "自检%s（当前阈值 %d）",
+           (ret == 0) ? "全通过" : "有失败项", kws_get_threshold());
+  report("唤醒词自检", ret == 0, detail);
+
+  return (ret == 0) ? OK : -1;
+}
+
+/****************************************************************************
+ * Name: step_kws_threshold
+ *
+ * Description:
+ *   `hw_test kws threshold <值>`：当场改判定阈值（现场标定的入口）。
+ *   单位是"每维每帧 RMS 距离 ×1000"，默认 KWS_THRESHOLD_MILLI = 1800。
+ *
+ *   这里**故意不调 kws_init()**：阈值就是 kws_dtw.c 里那个全局变量，同一
+ *   镜像里 ai_companion 和这里共享它 —— 不初始化就等于不碰流式状态，所以
+ *   可以在 ai_companion 正常跑着（正在听唤醒词）的时候改，改完下一次判定
+ *   就用新值。标定时本来就该这么用：一边 live 试唤醒，一边调阈值。
+ *
+ *   值合法不合法交给 kws_set_threshold() 自己判（它会 printf 原因，
+ *   非法的直接忽略），这里只按"读回来的值是不是我要的那个数"判断有没有生效。
+ *
+ *   ⚠ 只改 RAM：kws_dtw.c 不落盘，重启回默认 —— 打印里明确说了这句。
+ *
+ ****************************************************************************/
+
+static int step_kws_threshold(int th)
+{
+  char detail[96];
+  int old;
+  int now;
+
+  old = kws_get_threshold();
+  kws_set_threshold(th);
+  now = kws_get_threshold();
+
+  if (now != th)
+    {
+      printf("      设置失败：阈值还是 %d（模块拒了这个值，"
+             "原因见上面 [KWS] 那行）\n", now);
+      snprintf(detail, sizeof(detail), "%d 被拒绝（仍是 %d）", th, now);
+      report("唤醒词阈值", 0, detail);
+      return -1;
+    }
+
+  printf("      阈值 %d -> %d（每维每帧 RMS 距离 ×1000）\n", old, now);
+  printf("      注意：只对本次运行有效 —— kws_dtw 不落盘，重启回到默认 %d，"
+         "要长期生效得把 %d 写进代码/开机脚本\n", KWS_THRESHOLD_MILLI, now);
+  printf("      提示：越高越容易命中、也越容易误唤醒；改完用"
+         " `hw_test kws live 10` 念几句当场看效果\n");
+
+  snprintf(detail, sizeof(detail), "%d -> %d（重启回 %d）", old, now,
+           KWS_THRESHOLD_MILLI);
+  report("唤醒词阈值", 1, detail);
+
+  return OK;
+}
+
+/****************************************************************************
  * Name: step_kws
  *
  * Description:
- *   kws 子命令的入口（main 里只认 cmd/slot/seconds 三个数）。
+ *   kws 子命令的入口（main 里只认 cmd/slot/seconds/threshold 四个数）。
  *   没编 hello_app 的配置下只打印一句"本配置不支持"。
  *
  ****************************************************************************/
 
-static int step_kws(int cmd, int slot, int seconds)
+static int step_kws(int cmd, int slot, int seconds, int threshold)
 {
   switch (cmd)
     {
@@ -2533,6 +2668,12 @@ static int step_kws(int cmd, int slot, int seconds)
       case KWS_CMD_LIVE:
         return step_kws_live(seconds);
 
+      case KWS_CMD_SELFTEST:
+        return step_kws_selftest();
+
+      case KWS_CMD_THRESHOLD:
+        return step_kws_threshold(threshold);
+
       default:
         return -1;
     }
@@ -2540,11 +2681,12 @@ static int step_kws(int cmd, int slot, int seconds)
 
 #else  /* !HW_TEST_HAS_KWS */
 
-static int step_kws(int cmd, int slot, int seconds)
+static int step_kws(int cmd, int slot, int seconds, int threshold)
 {
   (void)cmd;
   (void)slot;
   (void)seconds;
+  (void)threshold;
 
   printf("[KWS] 本配置没有启用 hello_app"
          "（CONFIG_LVX_USE_CONTEST2026_233_HELLO_APP），"
@@ -3230,6 +3372,8 @@ int main(int argc, FAR char *argv[])
   FAR const char *asr_path = NULL;
   int kws_slot      = -1;             /* -1 = 没给（enroll 必给，缺了要 FAIL） */
   int kws_sec       = KWS_ENROLL_DEFAULT_SEC;
+  int kws_th        = 0;              /* threshold 子命令要在解析时就给全，
+                                       * 0 不是合法阈值，漏掉一眼能看出来 */
   int i;
 
   g_pass  = 0;
@@ -3335,15 +3479,18 @@ int main(int argc, FAR char *argv[])
         }
       else if (strcmp(argv[i], "kws") == 0)
         {
-          /* `hw_test kws <enroll|test|live> [...]`。
+          /* `hw_test kws <enroll|test|live|selftest|threshold> [...]`。
            * slot / 秒数都只在"下一个参数是数字"时才吃掉 —— 和 lcd 子命令
            * 同一个理由：`hw_test kws enroll abc` 要报"缺 slot"，
-           * 不能把 atoi("abc") = 0 当成 slot0 照录。 */
+           * 不能把 atoi("abc") = 0 当成 slot0 照录。
+           * threshold 是反过来的：值**必须**给，缺了/不是数字直接报错退出
+           * （照 asr 缺文件路径那套写法），不能拿 atoi("abc") = 0 去设阈值。 */
 
           if (i + 1 >= argc)
             {
               printf("hw_test kws: 缺子命令"
-                     "（enroll <slot> [秒] / test / live [秒]）\n");
+                     "（enroll <slot> [秒] / test / selftest / "
+                     "threshold <值> / live [秒]）\n");
               usage();
               return EXIT_FAILURE;
             }
@@ -3368,6 +3515,24 @@ int main(int argc, FAR char *argv[])
             {
               do_kws = KWS_CMD_TEST;
             }
+          else if (strcmp(argv[i], "selftest") == 0)
+            {
+              do_kws = KWS_CMD_SELFTEST;
+            }
+          else if (strcmp(argv[i], "threshold") == 0)
+            {
+              if (i + 1 >= argc || !arg_is_number(argv[i + 1]))
+                {
+                  printf("hw_test kws: threshold 要一个数字参数。用法 "
+                         "hw_test kws threshold <值>（默认值见 hw_test kws "
+                         "test 打出的那行）\n");
+                  usage();
+                  return EXIT_FAILURE;
+                }
+
+              do_kws = KWS_CMD_THRESHOLD;
+              kws_th = atoi(argv[++i]);
+            }
           else if (strcmp(argv[i], "live") == 0)
             {
               do_kws = KWS_CMD_LIVE;
@@ -3381,7 +3546,8 @@ int main(int argc, FAR char *argv[])
           else
             {
               printf("hw_test kws: 未知子命令 '%s'"
-                     "（enroll <slot> [秒] / test / live [秒]）\n", argv[i]);
+                     "（enroll <slot> [秒] / test / selftest / "
+                     "threshold <值> / live [秒]）\n", argv[i]);
               usage();
               return EXIT_FAILURE;
             }
@@ -3488,7 +3654,7 @@ int main(int argc, FAR char *argv[])
 
       if (do_kws != KWS_CMD_NONE)
         {
-          step_kws(do_kws, kws_slot, kws_sec);
+          step_kws(do_kws, kws_slot, kws_sec, kws_th);
           printf("\n");
         }
     }

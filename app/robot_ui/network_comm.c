@@ -89,6 +89,36 @@ static int mqtt_socket = -1;
 static int g_mqtt_fails = 0;
 static int g_mqtt_broker_switches = 0;
 
+/* ---- MQTT 收包重组缓冲（跨 recv 的半包）----
+ *
+ * 一次 recv() 的字节边界可能落在任意一包中间（NuttX 会把 readahead 灌满缓冲才
+ * 返回，broker 合并下发时很常见），所以没解析完的尾巴必须留到下次 recv 前面
+ * 拼起来。它要活过单次 recv()，只能是静态的 —— 顺带把原来 mqtt_parse_packet()
+ * 栈上那个 buffer[1024] 省掉了（network_task 只有 12KB 栈）。
+ *
+ * 容量关系（改数字要一起看）：缓冲固定 2048 字节，
+ *   头部 g_mqtt_rx_len 字节 = 上次留下的半包，
+ *   剩下的 (2048 - g_mqtt_rx_len) 字节才是这次 recv() 的接收窗口。
+ * 所以"残留 + 本次 recv"恒等于 ≤2048，不会越界；也意味着任何 ≤2KB 的 MQTT 包
+ * 都能被完整重组。更大的包走 g_mqtt_rx_skip 整包丢弃（见 mqtt_parse_packet）。
+ *
+ * 只有 network_task 读写（mqtt_parse_packet 只被它调用），不需要锁；
+ * mqtt_disconnect() 里复位一次，免得上一条连接的残字节混进新连接的报文。 */
+#define MQTT_RX_BUF_SIZE 2048
+
+static uint8_t g_mqtt_rx_buf[MQTT_RX_BUF_SIZE];
+static int g_mqtt_rx_len = 0;    /* 缓冲头部有效字节数：上次没解析完的半包 */
+static int g_mqtt_rx_skip = 0;   /* 已在丢弃的超大包还剩多少字节要丢 */
+
+/* PUBACK 发送失败次数。只为限频打印用（见 mqtt_parse_packet 的 QoS1 分支）。 */
+static int g_mqtt_puback_fails = 0;
+
+static void mqtt_rx_reset(void)
+{
+    g_mqtt_rx_len = 0;
+    g_mqtt_rx_skip = 0;
+}
+
 /* robot_ui 本地状态的提供者（main.c 启动时注册，见 network_set_local_state_provider）。
  * NULL = 没注册，诊断/心跳里那几个字段一律报 -1（"取不到"），不编造。 */
 static local_state_provider_t g_local_state_provider = NULL;
@@ -379,6 +409,27 @@ int wifi_get_rssi(void)
 int mqtt_connect(const char *broker, uint16_t port,
                 const char *client_id, const char *username, const char *password)
 {
+    /* 已经连着的时候**绝不开第二条**。
+     *
+     * 这个入口有两个调用者：唯一持有 socket 的 network_task（robot_ui），
+     * 以及 hello_app 的 ai_network_start_shared() 兜底路径（跑在 hello_app 的
+     * 任务组里）。后者在"开机时界面的 MQTT 还没连上"那一小段窗口里会走到这里
+     * （它先等几秒，等不到就自己连一次），而这里是**同一个 client_id**：
+     *   - broker 按 MQTT 3.1.1 会把先来的那条连接踢掉，而 CONNECT 里带的是
+     *     clean session —— **先来那条连接的订阅（zhi_ai/<client_id>/command）
+     *     跟着一起没**，外面发什么都进不来；
+     *   - 新 socket 建在调用者的任务组里，却写进全局 mqtt_socket，于是
+     *     network_task 的 recv/send 打在"只有别的组才有效"的 fd 上；
+     *   - 旧 socket 的 fd 直接被覆盖，再也没人关得上。
+     * 现场表现就是最难查的那种"看着连着、心跳看得见，命令/诊断永远不回"。
+     * 所以这里只复用、不新建：真断了的时候 connected 会是 false，那条重连
+     * 路径照旧（network_task 自己会重连并重新订阅）。 */
+    if (mqtt_socket >= 0 && mqtt_config.connected) {
+        printf("[MQTT] 连接已存在（%s:%u），复用不新建第二条（请求方 client_id=%s）\n",
+               mqtt_config.broker, (unsigned)mqtt_config.port, client_id);
+        return 0;
+    }
+
     printf("MQTT connecting: %s:%d\n", broker, port);
 
     /* 保存配置 */
@@ -453,6 +504,10 @@ int mqtt_disconnect(void)
         close(mqtt_socket);
         mqtt_socket = -1;
     }
+
+    /* 半包重组缓冲跟着连接一起作废：里面残留的是上一条连接的字节，粘到新连接
+     * 的报文前面会被解析成假报文（甚至假 PUBLISH -> 假 PUBACK）。 */
+    mqtt_rx_reset();
 
     mqtt_config.connected = false;
     board_status_set_mqtt(false);  /* 喂给统一状态查询 */
@@ -640,7 +695,12 @@ int mqtt_publish_queued(const char *topic, const char *payload, int qos, bool re
     const char *p = (payload != NULL) ? payload : "";
     size_t tlen;
     size_t plen;
+    int ret = OK;
 
+    /* 下面两个拒绝都在**拿锁之前**判定：它们既不读也不改队列里的字节，
+     * 所以一律直接 return —— 此时**没持锁，也就绝不能有 unlock**
+     * （这里曾经抄进来过一句多余的 unlock，对着没锁的互斥量解锁）。
+     * 拿锁之后的出口只剩函数末尾那一处（见 out:）。 */
     if (t[0] == '\0') {
         printf("[MQTTQ] 拒绝入队：topic 为空\n");
         return -EINVAL;
@@ -668,8 +728,7 @@ int mqtt_publish_queued(const char *topic, const char *payload, int qos, bool re
                    (unsigned)strlen(p), MQTT_QUEUE_PAYLOAD_MAX - 1);
         }
 
-        pthread_mutex_unlock(&g_mqtt_queue_lock);
-        return -EMSGSIZE;
+        return -EMSGSIZE;    /* 未持锁 */
     }
 
     pthread_mutex_lock(&g_mqtt_queue_lock);
@@ -689,8 +748,8 @@ int mqtt_publish_queued(const char *topic, const char *payload, int qos, bool re
                    MQTT_QUEUE_SLOTS, t, g_mqtt_queue_drop_full);
         }
 
-        pthread_mutex_unlock(&g_mqtt_queue_lock);
-        return -ENOSPC;
+        ret = -ENOSPC;
+        goto out;
     }
 
     {
@@ -707,12 +766,15 @@ int mqtt_publish_queued(const char *topic, const char *payload, int qos, bool re
         g_mqtt_queue_count++;
     }
 
+out:
     pthread_mutex_unlock(&g_mqtt_queue_lock);
 
-    /* 出锁之后再唤醒：signalling 跟队列本身没有关系，也没必要占着锁。 */
-    sem_post(&g_mqtt_queue_sem);
+    if (ret == OK) {
+        /* 出锁之后再唤醒：signalling 跟队列本身没有关系，也没必要占着锁。 */
+        sem_post(&g_mqtt_queue_sem);
+    }
 
-    return OK;
+    return ret;
 }
 
 /* 取一条出来（0 = 取到，-1 = 队列空）。
@@ -1128,7 +1190,11 @@ int report_diag(void)
 
     ret = mqtt_publish(topic, json, 0, false);
 
-    printf("[Diag] 诊断已发布 topic=%s len=%u hello_len=%d ret=%d\n",
+    /* 这一行和 mqtt_parse_packet() 里那句 "[DIAG] rx action=..." 配成一对：
+     * 两条都在 = 请求进来、回执发出去了，剩下的就是主机侧的事；只有 rx = 回执
+     * 没能发出去（看 ret）；两条都没有 = 请求根本没到板子（订阅没了 / 发在了
+     * 别的 broker）。 */
+    printf("[DIAG] tx topic=%s len=%u hello_len=%d ret=%d\n",
            topic, (unsigned)strlen(json), hlen, ret);
 
     free(json);
@@ -1860,73 +1926,6 @@ bool push_is_enabled(void)
     return push_config.enabled;
 }
 
-/* ==================== AI 语音交互接口 ==================== */
-
-int ai_send_voice_data(const uint8_t *audio_data, int len,
-                       ai_reply_callback_t callback)
-{
-    if (!mqtt_config.connected) {
-        printf("MQTT not connected, cannot send voice\n");
-        return -1;
-    }
-
-    char topic[128];
-    snprintf(topic, sizeof(topic), "zhi_ai/%s/voice", mqtt_config.client_id);
-
-    /* 构建语音数据 JSON（实际项目中应使用二进制传输） */
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "type", "voice");
-    cJSON_AddNumberToObject(root, "length", len);
-    cJSON_AddNumberToObject(root, "timestamp", (double)time(NULL));
-
-    /* 简化：实际应将 audio_data 编码为 base64 */
-    cJSON_AddStringToObject(root, "data", "binary_audio_data");
-
-    char *json = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-
-    if (!json) {
-        return -1;
-    }
-
-    int ret = mqtt_publish(topic, json, 1, false);
-    free(json);
-
-    /* TODO: 实际项目中需要等待云端回复并调用 callback */
-
-    return ret;
-}
-
-int ai_send_text(const char *text, ai_reply_callback_t callback)
-{
-    if (!mqtt_config.connected) {
-        printf("MQTT not connected, cannot send text\n");
-        return -1;
-    }
-
-    char topic[128];
-    snprintf(topic, sizeof(topic), "zhi_ai/%s/chat", mqtt_config.client_id);
-
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "type", "chat");
-    cJSON_AddStringToObject(root, "text", text);
-    cJSON_AddNumberToObject(root, "timestamp", (double)time(NULL));
-
-    char *json = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-
-    if (!json) {
-        return -1;
-    }
-
-    int ret = mqtt_publish(topic, json, 1, false);
-    free(json);
-
-    /* TODO: 实际项目中需要等待云端回复并调用 callback */
-
-    return ret;
-}
-
 /* ==================== 异常声音检测接口 ==================== */
 
 /* queued 的语义同 alarm_publish()（见上面那段说明）：
@@ -2373,107 +2372,364 @@ static int mqtt_send_puback(uint16_t packet_id)
     return send(mqtt_socket, packet, sizeof(packet), 0);
 }
 
-/* 解析 MQTT 数据包 */
+/* 从入站载荷里抠出 "action":"xxx" 的值（没有就把 dst 置空）。
+ *
+ * 只为一行日志服务：这条路上跑的是 {"action":"diag"} 这种小对象，不值当再引
+ * 一次 cJSON_Parse（紧接着的回调里本来就会真解析一遍）。 */
+static void diag_peek_action(const char *payload, char *dst, size_t dstlen)
+{
+    const char *p;
+    size_t n = 0;
+
+    if (dst == NULL || dstlen == 0) {
+        return;
+    }
+
+    dst[0] = '\0';
+
+    p = strstr(payload, "\"action\"");
+    if (p == NULL) {
+        return;
+    }
+
+    p = strchr(p + 8, ':');
+    if (p == NULL) {
+        return;
+    }
+
+    p = strchr(p + 1, '"');
+    if (p == NULL) {
+        return;
+    }
+
+    for (p++; *p != '\0' && *p != '"' && n + 1 < dstlen; p++) {
+        dst[n++] = *p;
+    }
+
+    dst[n] = '\0';
+}
+
+/* 解析 MQTT 数据包
+ *
+ * 一次 recv() 拿到的是**一段字节流**，里面可能挤着不止一包（broker 合并发送
+ * 很常见：SUBACK 紧跟 PUBLISH、连着几条 PUBLISH 一起发）。所以这里按报文自带
+ * 的剩余长度一包一包往前走，走到头为止。
+ *
+ * 原来只解析第一包、后面的字节随着这次 recv 一起丢掉，而且一声不响 —— 这种
+ * 静默丢弃正是"收发都正常、命令就是不进来"里最难查的一环。
+ *
+ * 跨 recv 的半包重组：解析循环走到末尾还剩不足一包时，把残字节留在
+ * g_mqtt_rx_buf 头部，下次 recv 拼在前面再解析（缓冲大小关系见那个变量的注释）。
+ * 原来这里是把半包丢掉 —— 丢掉的包尾巴会在下一次 recv 里被当成新报文解析，
+ * 而 '0'-'9' 的高半字节正好是 3 = PUBLISH，于是解出假主题、还可能回一个假
+ * PUBACK 出去。丢弃一定有日志，绝不静默。
+ */
 static int mqtt_parse_packet(void)
 {
-    uint8_t buffer[1024];
-    int len = recv(mqtt_socket, buffer, sizeof(buffer), 0);
-    if (len <= 0) {
+    uint8_t *buffer = g_mqtt_rx_buf;
+    int len;
+    int pos;
+    int total_len;
+
+    /* 防御：残留长度只可能落在 [0, 2048)，越界说明状态被写坏了。真发生了也只
+     * 是把这一轮的字节丢掉，不会越界读。 */
+    if (g_mqtt_rx_len < 0 || g_mqtt_rx_len >= MQTT_RX_BUF_SIZE) {
+        printf("[MQTT] 重组缓冲残留长度异常(%d)，复位\n", g_mqtt_rx_len);
+        mqtt_rx_reset();
+    }
+
+    /* 上次的半包留在缓冲头部，本次只往**剩下的空间**里收：
+     * 布局 = [g_mqtt_rx_len 字节残留][最多 2048-g_mqtt_rx_len 字节新数据] */
+    len = recv(mqtt_socket, &g_mqtt_rx_buf[g_mqtt_rx_len],
+               MQTT_RX_BUF_SIZE - g_mqtt_rx_len, 0);
+
+    if (len == 0) {
+        /* recv 返回 0 = 对端关了连接：broker 限流、被**同 client_id 的另一条
+         * 连接顶掉**、或者网络掉了。
+         *
+         * 这里只置标志，一个字节的 socket 操作都不做：关连接和重连都归
+         * network_task（它是 mqtt_socket 的属主，见 mqtt_publish 上面那段
+         * "跨任务 close 会把整机打复位"）。
+         *
+         * 不置这个标志的后果是"假装连着"：订阅是跟着连接走的（CONNECT 带的
+         * 是 clean session），连接一没，zhi_ai/<client_id>/command 上就没有
+         * 订阅者了，而板子要等到下一次心跳 publish 失败才发现（最长 30 秒）。
+         * 那段时间窗口里外面发什么都进不来 —— 现场看到的就是"心跳看得见、
+         * 命令/诊断永远不回"。 */
+        printf("[MQTT] 对端关闭连接（recv=0），标记未连接，交由 network_task "
+               "重连（重连时会重新订阅）\n");
+        mqtt_rx_reset();
+        mqtt_config.connected = false;
+        board_status_set_mqtt(false);
         return -1;
     }
 
-    uint8_t type = (buffer[0] >> 4) & 0x0F;
+    if (len < 0) {
+        /* 非阻塞 socket 上"暂时没数据"确实是负返回值，但**不是所有负返回值都是
+         * 没数据**：broker 被 RST、TCP 重传超时、RNDIS 掉线在 NuttX 上是
+         * -ENOTCONN。原来一律当"没数据"直接 return，于是掉线一行日志都没有，
+         * 板子还能显示"已连接"最长 30 秒（要等下一次心跳 publish 失败才发现）。
+         * 只有 EAGAIN/EWOULDBLOCK 才是"没数据"。
+         *
+         * EAGAIN 这条路上**故意保留**半包残留：那包数据只是还没到齐，没坏。
+         * （socket 收尾仍然只置标志，不在这个任务之外碰 fd。） */
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return -1;
+        }
 
-    switch (type) {
-        case 0x0D:  // PINGRESP
-            printf("Received PINGRESP\n");
+        printf("[MQTT] recv 失败（errno=%d），标记未连接，交由 network_task 重连\n",
+               errno);
+        mqtt_rx_reset();
+        mqtt_config.connected = false;
+        board_status_set_mqtt(false);
+        return -1;
+    }
+
+    total_len = g_mqtt_rx_len + len;
+
+    /* 从这里起"残留"由本函数重新决定：只有真的又留下半包才会重新写它。 */
+    g_mqtt_rx_len = 0;
+
+    for (pos = 0; pos < total_len; ) {
+        uint8_t type;
+        int remaining;
+        int multiplier;
+        int hdr_end;
+        int total;
+        bool rl_ok;
+
+        /* 上轮判定"这包太大、重组不了"时留下的待丢字节数：按字节数跳过去，
+         * 别让超大包的中段被当成新报文解析（'0'-'9' 的高半字节正好是 3 =
+         * PUBLISH，会解出假主题并回假 PUBACK）。 */
+        if (g_mqtt_rx_skip > 0) {
+            int avail = total_len - pos;
+
+            if (avail < g_mqtt_rx_skip) {
+                g_mqtt_rx_skip -= avail;
+                break;
+            }
+
+            pos += g_mqtt_rx_skip;
+            g_mqtt_rx_skip = 0;
+            continue;
+        }
+
+        type = (buffer[pos] >> 4) & 0x0F;
+        remaining = 0;
+        multiplier = 1;
+        rl_ok = false;
+
+        /* 剩余长度：变长编码，最多 4 字节（再多就是非法报文） */
+        hdr_end = pos + 1;
+        while (hdr_end < total_len) {
+            uint8_t byte = buffer[hdr_end];
+
+            remaining += (byte & 0x7F) * multiplier;
+            hdr_end++;
+            if ((byte & 0x80) == 0) {
+                rl_ok = true;
+                break;
+            }
+            multiplier *= 128;
+            if (multiplier > 128 * 128 * 128) {
+                break;
+            }
+        }
+
+        total = hdr_end + remaining;
+
+        if (!rl_ok) {
+            /* 剩余长度用了超过 4 字节还没结束 = 报文本身不合法，字节流已经没
+             * 法重新对齐，只能整段丢掉（MUST NOT 死循环：pos 直接推到末尾）。 */
+            printf("[MQTT] 剩余长度非法（type=%u），丢弃剩余 %d 字节\n",
+                   (unsigned)type, total_len - pos);
             break;
+        }
 
-        case 0x03:  // PUBLISH
-            /* 解析主题和载荷 */
-            {
-                int pos = 1;
-                int hdr_end;
-                int avail;
+        /* total 是**绝对**下标（本包最后一个字节的下一位），total_len 是缓冲里
+         * 已有的字节总数，所以直接比就行，别拿 total 和"剩余长度"比。 */
+        if (total > total_len) {
+            int plen = total - pos;              /* 这一包总共多少字节 */
+            int partial = total_len - pos;       /* 已经到手多少字节 */
 
-                /* 跳过剩余长度编码 */
-                int remaining = 0;
-                int multiplier = 1;
-                do {
-                    remaining += (buffer[pos] & 0x7F) * multiplier;
-                    multiplier *= 128;
-                    pos++;
-                } while (buffer[pos - 1] & 0x80);
+            /* 半包：本次 recv 只拿到报文的一部分。
+             *
+             * 能装下就留到下次 recv 拼起来再解析 —— 这是本次加固的正题：丢掉
+             * 它，它的尾巴就会在下次 recv 里被当成新报文（错位解析）。
+             * 只留 partial（不是 plen）：缓冲头部的这段就是下次要拼的内容。 */
+            if (plen <= MQTT_RX_BUF_SIZE) {
+                memmove(buffer, &buffer[pos], (size_t)partial);
+                g_mqtt_rx_len = partial;
+                printf("[MQTT] 半包（type=%u 共 %d 字节，已收 %d），"
+                       "留待下次 recv 重组\n", (unsigned)type, plen, partial);
+                break;
+            }
 
-                /* 剩余长度字段结束的位置：下面算载荷长度要用它做基准 */
-                hdr_end = pos;
+            /* 这包比重组缓冲还大（>2KB）：等不到了，改成记下"还要丢多少字节"，
+             * 把这一包剩下的整段丢掉。丢弃策略是**有界**的：只丢这一包，
+             * 丢完就从下一个包边界继续，缓冲永远不增长、不会死循环。 */
+            g_mqtt_rx_skip = plen - partial;
+            printf("[MQTT] 报文过大（type=%u 共 %d 字节 > 重组上限 %d），"
+                   "整包丢弃并跳过其后 %d 字节\n",
+                   (unsigned)type, plen, MQTT_RX_BUF_SIZE, g_mqtt_rx_skip);
+            break;
+        }
 
-                /* QoS 在固定头的低 4 位里：bit0=retain，bit2:1=QoS */
-                int qos = (buffer[0] >> 1) & 0x03;
-
-                /* 解析主题 */
-                int topic_len = (buffer[pos] << 8) | buffer[pos + 1];
-                pos += 2;
-
-                char topic[128];
-                int copy_len = topic_len < (int)(sizeof(topic) - 1) ? topic_len : (int)(sizeof(topic) - 1);
-                memcpy(topic, &buffer[pos], copy_len);
-                topic[copy_len] = '\0';
-                pos += topic_len;
-
-                /* MQTT 3.1.1 的 PUBLISH 可变头里，主题名之后**只有 QoS>0** 才跟
-                 * 2 字节 Packet Identifier。
-                 *
-                 * 原来这里漏了这一步，把主题之后的全部字节都当载荷，于是入站
-                 * QoS1 的报文（payload 头上多出 2 字节包 ID，高字节通常是 0x00）
-                 * 一律解析失败——队友的智能灯/设备状态都是 QoS1 发布，命令和
-                 * 状态全丢，串口上只能看到 JSON parse failed。
-                 * 现在按 QoS 位跳过这 2 字节，载荷长度也随之减掉。
+        switch (type) {
+            case 0x02:  // CONNACK
+                /* broker 对 CONNECT 的回执。**回执码非 0 = 这次连接被拒了**
+                 * （0x01 协议版本 / 0x02 client_id 被拒 / 0x04 用户名密码 /
+                 * 0x05 没授权）。原来这里落进 default 打成"Unknown packet
+                 * type"，被拒也照样显示"已连接" —— 这种板子最会骗人。
                  */
-                if (qos > 0 && pos + 2 <= len) {
-                    uint16_t packet_id = (uint16_t)((buffer[pos] << 8) | buffer[pos + 1]);
+                printf("[MQTT] CONNACK session_present=%d rc=%d\n",
+                       (remaining >= 1) ? buffer[hdr_end] : -1,
+                       (remaining >= 2) ? buffer[hdr_end + 1] : -1);
 
-                    pos += 2;
+                if (remaining < 2 || buffer[hdr_end + 1] != 0) {
+                    printf("[MQTT] 连接被 broker 拒绝（rc=%d），标记未连接等待重连\n",
+                           (remaining >= 2) ? buffer[hdr_end + 1] : -1);
+                    mqtt_config.connected = false;
+                    board_status_set_mqtt(false);
+                }
+                break;
 
-                    /* QoS1 必须回 PUBACK，否则 broker 会重投、命令被重复执行。
-                     * QoS2 该回的是 PUBREC，这里不动（目前没有对端用 QoS2）。 */
-                    if (qos == 1) {
-                        mqtt_send_puback(packet_id);
+            case 0x09:  // SUBACK
+                /* "订阅到底建起来没有"唯一的一手证据。返回码 0x80 = 失败，
+                 * 那种情况下命令主题上根本没有订阅者。 */
+                {
+                    int i;
+
+                    for (i = 2; i < remaining; i++) {
+                        printf("[MQTT] SUBACK pid=%d rc=0x%02X%s\n",
+                               (remaining >= 2)
+                                   ? ((buffer[hdr_end] << 8) | buffer[hdr_end + 1])
+                                   : -1,
+                               buffer[hdr_end + i],
+                               (buffer[hdr_end + i] == 0x80)
+                                   ? "（订阅被拒！命令收不到）" : "");
                     }
                 }
+                break;
 
-                /* 解析载荷 */
-                char payload[1024];
-                int payload_len = len - pos;
-                if (payload_len < 0) {
-                    payload_len = 0;
-                }
-                /* 一次 recv 里可能挤着不止一包（broker 合并发送、SUBACK 紧跟
-                 * PUBLISH），用报文自带的剩余长度截断，别把下一包的字节也算进
-                 * 这条的载荷。 */
-                avail = remaining - (pos - hdr_end);
-                if (avail >= 0 && payload_len > avail) {
-                    payload_len = avail;
-                }
-                if (payload_len > (int)(sizeof(payload) - 1)) {
-                    payload_len = (int)(sizeof(payload) - 1);
-                }
-                memcpy(payload, &buffer[pos], payload_len);
-                payload[payload_len] = '\0';
+            case 0x04:  // PUBACK
+                /* 我们自己发出去的 QoS1 PUBLISH 的回执（心跳/告警/诊断都是
+                 * QoS1）。收到就说明 broker 收下了，本地没有要维护的状态。
+                 * 空分支是**故意**的：不写它就会落进 default 打出
+                 * "Unknown packet type: 4" —— 每发一条 QoS1 刷一行，看起来
+                 * 像出了错，实际是正常协议交互。 */
+                break;
 
-                printf("Received: topic=%s qos=%d, payload=%s\n",
-                       topic, qos, payload);
+            case 0x0D:  // PINGRESP
+                printf("Received PINGRESP\n");
+                break;
 
-                /* 调用回调 */
-                if (mqtt_callback) {
-                    mqtt_callback(topic, payload);
+            case 0x03:  // PUBLISH
+                {
+                    int cur = hdr_end;
+                    int qos = (buffer[pos] >> 1) & 0x03;   /* bit0=retain，bit2:1=QoS */
+                    int topic_len;
+                    int copy_len;
+                    int payload_len;
+                    char topic[128];
+                    char payload[1024];
+
+                    /* 主题名：2 字节长度 + 内容。长度是网络上来的，先确认它
+                     * 落在这一包之内再动指针。 */
+                    if (cur + 2 > total) {
+                        printf("[MQTT] PUBLISH 主题长度不完整，丢弃这一包\n");
+                        break;
+                    }
+
+                    topic_len = (buffer[cur] << 8) | buffer[cur + 1];
+                    cur += 2;
+
+                    if (cur + topic_len > total) {
+                        printf("[MQTT] PUBLISH 主题名越界（声明 %d 字节，本包只剩 %d），"
+                               "丢弃这一包\n", topic_len, total - cur);
+                        break;
+                    }
+
+                    copy_len = (topic_len < (int)(sizeof(topic) - 1))
+                                   ? topic_len : (int)(sizeof(topic) - 1);
+                    memcpy(topic, &buffer[cur], copy_len);
+                    topic[copy_len] = '\0';
+                    cur += topic_len;
+
+                    /* MQTT 3.1.1 的 PUBLISH 可变头里，主题名之后**只有 QoS>0**
+                     * 才跟 2 字节 Packet Identifier。
+                     *
+                     * 原来这里漏了这一步，把主题之后的全部字节都当载荷，于是入站
+                     * QoS1 的报文（payload 头上多出 2 字节包 ID，高字节通常是 0x00）
+                     * 一律解析失败——队友的智能灯/设备状态都是 QoS1 发布，命令和
+                     * 状态全丢，串口上只能看到 JSON parse failed。
+                     */
+                    if (qos > 0 && cur + 2 <= total) {
+                        uint16_t packet_id = (uint16_t)((buffer[cur] << 8) | buffer[cur + 1]);
+
+                        cur += 2;
+
+                        /* QoS1 必须回 PUBACK，否则 broker 会重投、命令被重复执行。
+                         * QoS2 该回的是 PUBREC，这里不动（目前没有对端用 QoS2）。
+                         *
+                         * 返回值必须看：socket 是非阻塞的，发送缓冲满时 send()
+                         * 返回 -EAGAIN，PUBACK 就这么没了 —— broker 以为我们没
+                         * 收到，会重投同一条命令，于是命令被执行两遍（灯被闪两次、
+                         * 继电器被点两次）。这里不重试（重试要写发送队列，是另一
+                         * 件事），至少要留下痕迹；第一次和每 10 次各打一行，别刷屏。 */
+                        if (qos == 1) {
+                            int ack_ret = mqtt_send_puback(packet_id);
+
+                            if (ack_ret < 0) {
+                                g_mqtt_puback_fails++;
+                                if (g_mqtt_puback_fails == 1 ||
+                                    (g_mqtt_puback_fails % 10) == 0) {
+                                    printf("[MQTT] PUBACK 发送失败（errno=%d，累计 %d 次），"
+                                           "broker 可能重投 pid=%u，注意该命令会被执行两次\n",
+                                           errno, g_mqtt_puback_fails,
+                                           (unsigned)packet_id);
+                                }
+                            }
+                        }
+                    }
+
+                    payload_len = total - cur;
+                    if (payload_len < 0) {
+                        payload_len = 0;
+                    }
+                    if (payload_len > (int)(sizeof(payload) - 1)) {
+                        payload_len = (int)(sizeof(payload) - 1);
+                    }
+                    memcpy(payload, &buffer[cur], payload_len);
+                    payload[payload_len] = '\0';
+
+                    printf("Received: topic=%s qos=%d, payload=%s\n",
+                           topic, qos, payload);
+
+                    /* 命令/诊断进来时的第一条线索，和 report_diag() 的
+                     * "[DIAG] tx ..." 配成一对：
+                     *   只有 rx 没有 tx —— 收到了，但分发那边没认（或响应发不出去）；
+                     *   连 rx 都没有   —— 请求根本没到板子（订阅没了 / 发在别的 broker）。 */
+                    if (strstr(payload, "\"action\"") != NULL) {
+                        char action[32];
+
+                        diag_peek_action(payload, action, sizeof(action));
+                        printf("[DIAG] rx action=%s topic=%s\n", action, topic);
+                    }
+
+                    /* 调用回调 */
+                    if (mqtt_callback) {
+                        mqtt_callback(topic, payload);
+                    }
                 }
-            }
-            break;
+                break;
 
-        default:
-            printf("Unknown packet type: %d\n", type);
-            break;
+            default:
+                printf("Unknown packet type: %d\n", type);
+                break;
+        }
+
+        pos = total;
     }
 
     return 0;

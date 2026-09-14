@@ -187,7 +187,9 @@
 
 #define AMBIENT_IDLE_POLL_US      (50 * 1000)
 
-/* 打不开麦克风时的退避（-EBUSY = 别人正占着，等一等再来；别刷日志） */
+/* 设备这一轮用不成时的退避：open 失败（-EBUSY = 别人正占着），或者刚开起来
+ * 就读不出一整帧。两种情况都别刷日志、等一等再来；读失败那条如果不等，
+ * 下一轮马上又 open + read，read 立刻报错时就是忙循环。 */
 
 #define AMBIENT_RETRY_POLL_US     (200 * 1000)
 
@@ -572,13 +574,26 @@ static void *ambient_thread(void *arg)
          * 绝不能当成"这次没数据、再读一次就有"（那样是死循环）。 */
         if (nbytes != (ssize_t)AMBIENT_FRAME_BYTES)
           {
+            bool quit;
+
             pthread_mutex_lock(&g_lock);
             if (g_mic_open)
               {
                 audio_in_stop();
                 g_mic_open = false;
               }
+            quit = g_quit;
             pthread_mutex_unlock(&g_lock);
+
+            /* 刚 open 出来就读不出一整帧，多半是设备/下层有毛病（不是被
+             * 让路那种正常情况）。重开之前先退避：read 如果是一直"立刻
+             * 报错"，不等就是每轮白跑一次 open/stop 的忙循环。
+             * 只有真出过异常才走这里，正常一帧一帧读的时候一次都不睡。
+             * 已经收到停止请求就别再等这 200 ms 了，直接回顶部退出。 */
+            if (!quit)
+              {
+                usleep(AMBIENT_RETRY_POLL_US);
+              }
             continue;
           }
       }

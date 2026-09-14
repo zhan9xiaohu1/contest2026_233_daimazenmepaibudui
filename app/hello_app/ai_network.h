@@ -47,12 +47,6 @@
  * 免得两边各开一条同 client_id 的连接。详见 ai_network_start_shared()。 */
 #define AI_MQTT_SHARED_WAIT_MS     3000
 
-/* 心跳间隔(毫秒) */
-#define AI_HEARTBEAT_INTERVAL_MS   30000
-
-/* 网络重连间隔(毫秒) */
-#define AI_RECONNECT_INTERVAL_MS   5000
-
 /****************************************************************************
  * Public Types
  ****************************************************************************/
@@ -108,22 +102,11 @@ typedef struct
 
   /* 内部状态 */
   bool initialized;                   /* 初始化标志 */
-  uint32_t last_heartbeat_time;       /* 上次心跳时间 */
-  uint32_t last_reconnect_time;       /* 上次重连时间 */
 } ai_network_context_t;
 
 /****************************************************************************
  * Public Function Prototypes
  ****************************************************************************/
-
-/**
- * @brief  初始化网络模块
- * @param  ctx      网络上下文
- * @param  config   网络配置
- * @return 0 成功, 负值失败
- */
-
-int ai_network_init(ai_network_context_t *ctx, const ai_network_config_t *config);
 
 /**
  * @brief  反初始化网络模块
@@ -168,39 +151,6 @@ int ai_network_connect_mqtt(ai_network_context_t *ctx);
 int ai_network_disconnect_mqtt(ai_network_context_t *ctx);
 
 /**
- * @brief  发送语音数据到云端
- * @param  ctx         网络上下文
- * @param  audio_data  音频数据
- * @param  len         数据长度
- * @return 0 成功, 负值失败
- */
-
-int ai_network_send_voice(ai_network_context_t *ctx,
-                          const uint8_t *audio_data, int len);
-
-/**
- * @brief  发送文本到云端获取 AI 回复
- * @param  ctx      网络上下文
- * @param  text     输入文本
- * @return 0 成功, 负值失败
- */
-
-int ai_network_send_text(ai_network_context_t *ctx, const char *text);
-
-/**
- * @brief  上报设备状态
- * @param  ctx           网络上下文
- * @param  temperature   温度
- * @param  humidity      湿度
- * @param  battery_level 电量
- * @return 0 成功, 负值失败
- */
-
-int ai_network_report_status(ai_network_context_t *ctx,
-                             float temperature, float humidity,
-                             int battery_level);
-
-/**
  * @brief  上报异常声音检测结果
  * @param  ctx          网络上下文
  * @param  sound_type   声音类型
@@ -210,43 +160,6 @@ int ai_network_report_status(ai_network_context_t *ctx,
 
 int ai_network_report_sound_alarm(ai_network_context_t *ctx,
                                   const char *sound_type, int confidence);
-
-/**
- * @brief  发送主动关怀提醒
- * @param  ctx       网络上下文
- * @param  title     提醒标题
- * @param  content   提醒内容
- * @return 0 成功, 负值失败
- */
-
-int ai_network_send_reminder(ai_network_context_t *ctx,
-                             const char *title, const char *content);
-
-/**
- * @brief  上报健康数据
- * @param  ctx          网络上下文
- * @param  heart_rate   心率
- * @param  blood_oxy    血氧
- * @return 0 成功, 负值失败
- */
-
-int ai_network_report_health(ai_network_context_t *ctx,
-                             int heart_rate, int blood_oxy);
-
-/**
- * @brief  发送心跳包
- * @param  ctx  网络上下文
- * @return 0 成功, 负值失败
- */
-
-int ai_network_send_heartbeat(ai_network_context_t *ctx);
-
-/**
- * @brief  网络后台任务
- * @param  arg  网络上下文指针
- */
-
-void ai_network_task(void *arg);
 
 /**
  * @brief  注册状态变化回调
@@ -345,7 +258,7 @@ int ai_network_send_device_command(ai_network_context_t *ctx,
 /**
  * @brief  接上网络并把 AI 的结果回传给界面
  *
- * 和 ai_network_init() 的区别：network_comm.c 在一个固件里只有一份实例，
+ * 为什么不用 network_comm_init()：network_comm.c 在一个固件里只有一份实例，
  * 界面（robot_ui）的 network_task 已经拥有那条 MQTT socket。
  * 所以这里**不重跑 network_comm_init()、不抢回调、不重复订阅**，
  * 只在没人连的时候兜底连一次，之后所有 publish 都走那条共用连接。

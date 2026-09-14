@@ -23,6 +23,7 @@
 
 #include <sys/types.h>
 #include <sys/ioctl.h>
+#include <unistd.h>              /* getpid()：记会话持有者的任务组 */
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -35,6 +36,7 @@
 
 #include <nuttx/kmalloc.h>
 #include <nuttx/audio/audio.h>
+#include <nuttx/sched.h>        /* nxsched_gettid()/nxsched_get_tcb()：查持有者线程还在不在 */
 #include <nuttx/semaphore.h>
 #include <nuttx/clock.h>
 #include <nuttx/irq.h>
@@ -92,6 +94,17 @@
 #define SF32LB52_AUDIO_VOL_MUTE      SF32LB52_AUDIO_VOL_MIN
 #define SF32LB52_AUDIO_SETTLE_MS     30
 
+/* RX 自愈日志的限频窗口。触发一次完整恢复的前提是"整整 5 秒零完成中断"，
+ * 真出复位风暴时就是每 5 秒一条 —— 不限频会把串口刷满、把现场其它线索冲掉，
+ * 所以窗口内只累计次数，出窗口时把被吞掉的次数一起报出来。 */
+#define SF32LB52_AUDIO_RECOVER_LOG_MS   30000
+
+/* "复位风暴"的判据：两次自愈的间隔 <= 这个值。
+ * 一次自愈本身就要等满 5 秒，所以间隔短于它等于"复位之后连几个 5 秒窗口都没
+ * 撑过" —— 那是复位只压住了症状、根因还在；干净的一次自愈之后，间隔必然是
+ * "正常录音直到下次真的出问题"，远大于它。 */
+#define SF32LB52_AUDIO_RECOVER_STORM_MS 15000
+
 /****************************************************************************
  * Private Types
  ****************************************************************************/
@@ -105,6 +118,28 @@ struct sf32lb52_audio_s
   bool                    playback;     /* 已提交方向：true=播放 false=录音（只在 running 为真时有意义） */
   bool                    pending_playback; /* 最近一次 CONFIGURE 记下的方向意图，START 成功才提交 */
   int                     playback_db; /* 当前播放音量(dB)，标准接口可改 */
+
+  /* 会话持有者身份 —— 用来区分"反方向那条通路是真的被别人占着"和"上一个
+   * 持有者早就死了、只剩一堆没人清的状态"。
+   *
+   * holder_tid：hw_start 里记下的、把这次会话起起来的线程。AUDIOIOC_START 走的是
+   *             调用者的上下文（nuttx/audio/audio.c 的 audio_start 直接调
+   *             lower->ops->start），所以它就是调 start 的那个线程。
+   * user_tid  ：最近一次 read()/write() 的线程。为什么要多这一条：起会话的线程
+   *             可能是短命的工作线程 —— 本板真的有这种用法（hello_app 的
+   *             audio_record_start() 在调用者线程里 audio_in_start()，真正读数据
+   *             的是它随后起的录音线程）。只认 holder_tid 会把"会话明明还有人在
+   *             读"误判成残留，那就变成替一个活着的会话拆台了。
+   * holder_pid：起会话的任务组（getpid()），**只进日志**，不当判据 —— 一个 app 的
+   *             播放线程死掉时它的 task group 还活着，拿"组还在"当"持有者还在"
+   *             就永远认不出这种残留（详见 sf32lb52_audio_holder_alive 的注释）。
+   *
+   * 三个都只在 running 为真时有意义：hw_start 里记、hw_stop/hw_shutdown 清 running
+   * 时一起清。-1 = 没记过。 */
+
+  pid_t                   holder_tid;
+  pid_t                   holder_pid;
+  pid_t                   user_tid;
 
   /* 真实通路状态位 —— 这是"硬件到底开着哪几条模拟级"的唯一真相，
    * **不是**方向标签。
@@ -131,6 +166,19 @@ struct sf32lb52_audio_s
   sem_t                   rx_sem;       /* read() 同步信号量 */
   bool                    rx_busy;      /* read() DMA 进行中 */
   bool                    rx_aborted;   /* stop() 打断了正在等待的 read() */
+
+  /* DMA 传输错误（TE）打断了正在等待的 read()。
+   *
+   * 为什么要单独立这一面旗：TE 发生时 HAL 在中断里就把通道
+   * `DMA_FreeChannel()` + `State = READY` 做完了（bf0_hal_dma.c:1228-1235），
+   * 于是"整段 0 完成中断 + 停机前句柄仍 BUSY"这条自愈判据两条都不成立
+   * （句柄已经是 READY），这一类**永远不会自愈**，只能每次空转满 5 秒。
+   * 错误回调在中断上下文里只做三件轻活：计数、立旗、post 信号量；
+   * **不在中断里打日志** —— 串口那一侧会抢控制台锁把整机挂住，本文件在
+   * 播放完成（TX 中断）回调里就为此删过一次 printf，那次实测是"整机卡死"。
+   * 日志和恢复都在 read() 的收尾分支里补。 */
+
+  bool                    rx_dma_err;
 
   /* 会话代号：每一次让"录音这次会话"作废的事件都会 +1 —— hw_start（新会话开始）、
    * hw_stop（上层 STOP）、hw_shutdown（最后一个 fd 被 close）。
@@ -164,14 +212,47 @@ struct sf32lb52_audio_s
    * 另外新增 recov 计数：read 判定"RX 真死了"（整段 5 秒 0 完成中断 + 停机前
    * 句柄仍 BUSY）之后做的完整恢复次数。它一涨就说明冻死那次又出现了、并且被
    * 自愈流程接住了。
+   *
+   * 本次再补两个心跳与一个错误计数器（对应三种故障的分诊）：
+   *   half 在涨                     → 数据真的在流（RxHalfCplt 每 10ms 一次，
+   *                                   20ms 一帧的半满）；irq 冻结而 half 还在涨
+   *                                   说明"数据是通的、只有 TC 那一路丢了"，
+   *                                   和"数据源头压根没动"是两种病；
+   *   dma_err 在涨 + irq_delta==0   → DMA 传输错误(TE)：HAL 已经 FreeChannel +
+   *                                   State=READY，所以 hdma[RX].State=0x1 而
+   *                                   irq 不动，**这一组合就是 TE 的指纹**
+   *                                   （自愈走 read 里新增的 TE 分支，不再要求
+   *                                   句柄停在 BUSY）。
    */
 
   uint32_t                rx_irq_count;       /* RxCplt 中断次数（无条件自增） */
+  uint32_t                rx_half_irq_count;  /* RxHalfCplt 中断次数（第二个心跳） */
   uint32_t                rx_read_count;      /* read() 进入次数 */
   uint32_t                rx_timeout_count;   /* read() 等待超时次数 */
   uint32_t                rx_dma_busy_fail;   /* 起 DMA 返回非 HAL_OK 的次数 */
   uint32_t                rx_dma_not_armed;   /* 声称起好了但句柄没进 BUSY 的次数 */
+  uint32_t                rx_dma_err_count;   /* DMA 传输错误(TE) 中断次数 */
   uint32_t                rx_recover_count;   /* 确认 RX 死掉之后做完整恢复的次数 */
+
+  /* 自愈日志的分诊信息。光有 rx_recover_count 分不出"一次干净自愈"和
+   * "复位风暴"（后者每 5 秒自愈一次，只是把症状压回去）—— 下面这几个字段让
+   * 上板日志自己就能回答这个问题：
+   *   rx_recover_first == 0                 → 还从没自愈过；
+   *   有 first、之后 count 一直不再涨        → 一次干净自愈；
+   *   last 与 first 只差几十秒而 count 在涨  → 复位风暴。 */
+
+  clock_t                 rx_recover_first;    /* 首次自愈的时刻（0 = 没有过） */
+  clock_t                 rx_recover_last;     /* 上一次自愈的时刻 */
+  clock_t                 rx_recover_log_next; /* 下一次允许打日志的时刻（限频） */
+  uint32_t                rx_recover_silenced; /* 限频窗口内被吞掉的自愈次数 */
+
+  /* TE 那条日志同样要限频，但理由和自愈日志不同：超时一次要等满 5 秒，
+   * 天然每秒最多一条；而 TE 会让 read **立刻**返回，一个持续性的 TE 就是
+   * "上层每次重试一条"，不加窗口能把串口刷满、把别的线索冲掉。
+   * 所以复用同一个 30 秒窗口长度，用自己的一对字段。 */
+
+  clock_t                 rx_dma_err_log_next; /* 下一次允许打 TE 日志的时刻 */
+  uint32_t                rx_dma_err_silenced; /* 限频窗口内被吞掉的 TE 日志条数 */
 };
 
 /****************************************************************************
@@ -209,6 +290,8 @@ static int  sf32lb52_audio_hw_start(FAR struct sf32lb52_audio_s *priv,
 static int  sf32lb52_audio_hw_stop(FAR struct sf32lb52_audio_s *priv);
 static int  sf32lb52_audio_hw_shutdown(FAR struct sf32lb52_audio_s *priv);
 static void sf32lb52_audio_pa_enable(bool enable);
+static bool sf32lb52_audio_tid_alive(pid_t tid);
+static bool sf32lb52_audio_holder_alive(FAR struct sf32lb52_audio_s *priv);
 static void sf32lb52_audio_path_bit(FAR bool *bit, bool on,
                                     FAR const char *name,
                                     FAR const char *why);
@@ -217,8 +300,10 @@ static void sf32lb52_audio_tx_complete(FAR struct sf32lb52_audio_s *priv);
 static void sf32lb52_audio_rx_complete(FAR struct sf32lb52_audio_s *priv);
 static int  sf32lb52_audio_dma1_irq(int irq, FAR void *context,
                                     FAR void *arg);
+static bool sf32lb52_audio_aprc_has_config(FAR struct sf32lb52_audio_s *priv);
 static void sf32lb52_audio_aprc_soft_reset(FAR struct sf32lb52_audio_s *priv);
 static void sf32lb52_audio_aprc_restore_adc(FAR struct sf32lb52_audio_s *priv);
+static void sf32lb52_audio_recover_log(FAR struct sf32lb52_audio_s *priv);
 static int  sf32lb52_audio_recover_rx(FAR struct sf32lb52_audio_s *priv);
 
 /****************************************************************************
@@ -697,6 +782,36 @@ static int sf32lb52_audio_hw_configure(FAR struct sf32lb52_audio_s *priv,
 }
 
 /****************************************************************************
+ * Name: sf32lb52_audio_aprc_has_config
+ *
+ * Description:
+ *   本驱动是否已经往 AUDPRC 数字侧写过一套会话配置（也就是 CONFIGURE 跑过）。
+ *
+ *   为什么要单独拎出这个判据：软复位（sf32lb52_audio_aprc_soft_reset）是
+ *   **破坏性**的 —— 它清掉 CFG.AUDCLK_DIV / STB 里的 adc·dac 分频 /
+ *   ADC_PATH_CFG0 / RX_CH0_CFG，而这些值只在 hw_configure() 写过一次、靠
+ *   sf32lb52_audio_aprc_restore_adc() 重写回来。破坏和重建必须用**同一个**
+ *   判据，否则会留下"复位做了、重建没做"的半截状态：块被清空、配置未知，而
+ *   hw_start() 接下来照样无条件 __HAL_AUDPRC_ENABLE() 把它开起来 ——
+ *   一个"开着但配置是空的"数字块比"没复位过的旧块"难查得多
+ *   （DMA 完成中断照来、数据全是 0，看起来一切正常）。
+ *
+ *   反过来（判据不成立就不复位）是安全的：samplerate == 0 说明本驱动从没写过
+ *   这套配置，没有属于我们的历史状态需要清；HAL_AUDPRC_Init() 写进去的那套
+ *   默认值会被下一次 CONFIGURE 整块重写。
+ *
+ *   现在这条路径还不可达（CONFIGURE 总在 START 之前，而 samplerate 一旦非 0
+ *   就再没被清回去过），所以本判据对现场行为零影响 —— 它挡的是将来某条
+ *   "没 CONFIGURE 就跑到收尾 / 先 START 后 CONFIGURE"的路径，把那种情况下
+ *   的破坏性动作变回无害。
+ ****************************************************************************/
+
+static bool sf32lb52_audio_aprc_has_config(FAR struct sf32lb52_audio_s *priv)
+{
+  return priv->samplerate != 0;
+}
+
+/****************************************************************************
  * Name: sf32lb52_audio_aprc_soft_reset
  *
  * Description:
@@ -787,6 +902,73 @@ static void sf32lb52_audio_aprc_restore_adc(FAR struct sf32lb52_audio_s *priv)
 }
 
 /****************************************************************************
+ * Name: sf32lb52_audio_recover_log
+ *
+ * Description:
+ *   自愈日志 —— "一次干净自愈"和"复位风暴"必须能一眼分开，否则"做过恢复"
+ *   这句话本身什么也说明不了（两种情况下它都成立）。
+ *
+ *   首次自愈无条件打一条、带醒目标记；之后再自愈限频到
+ *   SF32LB52_AUDIO_RECOVER_LOG_MS 一条，出窗口时把间隔和窗口内被吞掉的次数
+ *   一起打出来。判读方式（rx_recover_count 也会跟着超时日志里的 recov= 一起涨）：
+ *     只有"首次自愈"这一条、之后 count 一直不变
+ *       → 一次干净自愈：复位治住了；
+ *     "首次自愈"之后又出现"第 N 次自愈"、且 距上次 只有几秒（< STORM_MS）
+ *       → 复位风暴：每 5 秒又死一次，复位只是把症状压回去，根因还在，
+ *         要照 599263b 那条"按帧停/起 DMA"的根治方向继续查，不是继续复位。
+ *
+ *   调用方（read() 的超时分支）已经先把 rx_recover_count 加过 1，所以这里读到
+ *   的就是本次自愈的序号。本函数只在任务上下文（read 超时分支）被调用。
+ ****************************************************************************/
+
+static void sf32lb52_audio_recover_log(FAR struct sf32lb52_audio_s *priv)
+{
+  clock_t  now = clock_systime_ticks();
+  uint32_t gap_ms;
+
+  if (priv->rx_recover_first == 0)
+    {
+      /* 首次自愈：这一条必须留下、而且只留一次 —— 上板先看到它，之后再也
+       * 没有第二条同类日志，就是"一次干净自愈"的凭据。 */
+
+      priv->rx_recover_first    = now;
+      priv->rx_recover_last     = now;
+      priv->rx_recover_log_next = now + MSEC2TICK(SF32LB52_AUDIO_RECOVER_LOG_MS);
+
+      syslog(LOG_WARNING,
+             "AUDIO: RX 首次自愈（第 %u 次）：DMAStop + SRESET + 重建 ADC/RX 配置"
+             " + ENABLE；此后不再出现第二条同类日志 = 一次干净自愈\n",
+             (unsigned)priv->rx_recover_count);
+      return;
+    }
+
+  gap_ms = (uint32_t)TICK2MSEC(now - priv->rx_recover_last);
+  priv->rx_recover_last = now;
+
+  /* 距上次打日志还不到窗口：只累计，不打日志（窗口内每秒一条会把串口刷满，
+   * 反而把有用的上下文冲掉）。比较用有符号差值，tick 回绕时也成立。 */
+
+  if ((int32_t)(now - priv->rx_recover_log_next) < 0)
+    {
+      priv->rx_recover_silenced++;
+      return;
+    }
+
+  syslog(LOG_WARNING,
+         "AUDIO: RX 第 %u 次自愈（距首次 %u ms、距上次 %u ms）—— %s；"
+         "窗口内另有 %u 次未打日志\n",
+         (unsigned)priv->rx_recover_count,
+         (unsigned)TICK2MSEC(now - priv->rx_recover_first),
+         (unsigned)gap_ms,
+         (gap_ms < SF32LB52_AUDIO_RECOVER_STORM_MS)
+           ? "复位风暴：复位只压住症状、根因还在" : "间隔够长，更像偶发",
+         (unsigned)priv->rx_recover_silenced);
+
+  priv->rx_recover_silenced = 0;
+  priv->rx_recover_log_next = now + MSEC2TICK(SF32LB52_AUDIO_RECOVER_LOG_MS);
+}
+
+/****************************************************************************
  * Name: sf32lb52_audio_recover_rx
  *
  * Description:
@@ -842,17 +1024,18 @@ static int sf32lb52_audio_recover_rx(FAR struct sf32lb52_audio_s *priv)
 
   priv->aprc.State[SF32LB52_AUDIO_PRC_RX_CH] = HAL_AUDPRC_STATE_READY;
 
-  sf32lb52_audio_aprc_soft_reset(priv);
+  /* 复位与重建写成一对、共用同一个判据：要么都做，要么都不做
+   * （理由见 sf32lb52_audio_aprc_has_config 的注释）。 */
 
-  if (priv->samplerate != 0)
+  if (sf32lb52_audio_aprc_has_config(priv))
     {
+      sf32lb52_audio_aprc_soft_reset(priv);
       sf32lb52_audio_aprc_restore_adc(priv);
     }
 
   __HAL_AUDPRC_ENABLE(&priv->aprc);
 
-  audwarn("AUDIO: RX 通路已做完一次完整恢复"
-          "（DMAStop + SRESET + 重建 ADC/RX 配置 + ENABLE）\n");
+  sf32lb52_audio_recover_log(priv);
   return OK;
 }
 
@@ -913,11 +1096,13 @@ static int sf32lb52_audio_hw_start(FAR struct sf32lb52_audio_s *priv,
    * "stop + start"、中间**没有** CONFIGURE 的（见 sf32lb52_audio_start），
    * 不重写就会用一套空配置录音（DMA 正常起、数据全 0）。
    *
-   * CONFIGURE 从没跑过时（samplerate 还是 0）跳过，保持原来的行为。
+   * CONFIGURE 从没跑过时（samplerate 还是 0）跳过 —— 和 hw_stop()/hw_shutdown()
+   * 里那记软复位**共用同一个判据**，两边的开关永远是同向的（见
+   * sf32lb52_audio_aprc_has_config 的注释）。
    * 这几行都是普通寄存器写 —— RX_CH0_CFG 那条没有 HAL_AUDPRC_Config_DACPath
    * 里那种"等 SRC_CH_CLR_DONE"的忙等，不会在这里卡住。 */
 
-  if (priv->samplerate != 0)
+  if (sf32lb52_audio_aprc_has_config(priv))
     {
       sf32lb52_audio_aprc_restore_adc(priv);
     }
@@ -1023,6 +1208,15 @@ static int sf32lb52_audio_hw_start(FAR struct sf32lb52_audio_s *priv,
   priv->playback = playback;
   priv->running  = true;
 
+  /* 记下这次会话的持有者（谁把它起起来的），并清掉上一条会话留下的
+   * "最近读写的线程" —— 新会话这会儿一个字节都还没读/写。
+   * 这两个 id 就是 sf32lb52_audio_start() 判"方向冲突是别人真在用还是残留"
+   * 的全部依据（见 struct 里那段说明与 sf32lb52_audio_holder_alive）。 */
+
+  priv->holder_tid = nxsched_gettid();
+  priv->holder_pid = getpid();
+  priv->user_tid   = (pid_t)-1;
+
   /* 新会话开始：上一次会话遗留的 read()（如果有）到此作废 —— 它的会话代号
    * 已经对不上，下一次从分片等待里醒来就会退出，不会把新会话的数据接走。 */
 
@@ -1082,8 +1276,34 @@ static int sf32lb52_audio_hw_stop(FAR struct sf32lb52_audio_s *priv)
       return OK;
     }
 
-  HAL_AUDPRC_DMAStop(&priv->aprc, HAL_AUDPRC_TX_CH0);
-  HAL_AUDPRC_DMAStop(&priv->aprc, HAL_AUDPRC_RX_CH0);
+  /* 收尾的两条 DMAStop 都要**先看句柄状态**：厂商的 `HAL_DMA_Abort()`
+   * （DMAStop 内部）不看 State，无条件关中断 / 关通道 / 清该通道全部标志
+   * （bf0_hal_dma.c:938-963），而对一个已经收好尾的句柄再 abort 一次，写的是
+   * 那个**物理通道**的寄存器 —— 它可能已经被别的 DMA 用户重新分配走了
+   * （本构建开了动态通道分配，见 recover_rx 里那段说明），等于把别人的通道
+   * 静默关掉。`HAL_DMA_Abort()` 自己会把 State 置成 READY，所以"READY 就是
+   * 已经收过尾"这个判据和 recover_rx 里用的完全一样。
+   *
+   * TX0 这一条单独说清楚（只加守卫、不删不改）：本固件的播放走 codec 自带 DMA
+   * （HAL_AUDCODEC_Transmit_DMA，见 hw_start 的说明），AUDPRC TX0 只在队列模式
+   * （enqueuebuffer）里才会真的起来，而本板两个 app 走的都是 read()/write()
+   * 直通 —— 所以它平时一直是空转。但 sf32lb52_audio_enqueuebuffer 里那条
+   * HAL_AUDPRC_Transmit_DMA 还在，队列模式真被用起来时这条 abort 就是必要的
+   * 收尾，因此按"不确定就别动"的规矩**保留**；加了守卫之后它平时也不会再写
+   * 别人的通道，两边的目的都达到了。 */
+
+  if (priv->aprc.hdma[HAL_AUDPRC_TX_CH0] == NULL ||
+      priv->aprc.hdma[HAL_AUDPRC_TX_CH0]->State != HAL_DMA_STATE_READY)
+    {
+      HAL_AUDPRC_DMAStop(&priv->aprc, HAL_AUDPRC_TX_CH0);
+    }
+
+  if (priv->aprc.hdma[HAL_AUDPRC_RX_CH0] == NULL ||
+      priv->aprc.hdma[HAL_AUDPRC_RX_CH0]->State != HAL_DMA_STATE_READY)
+    {
+      HAL_AUDPRC_DMAStop(&priv->aprc, HAL_AUDPRC_RX_CH0);
+    }
+
   __HAL_AUDPRC_DISABLE(&priv->aprc);
 
   /* AUDPRC 数字级软复位（厂商 bf0_audio_stop 收尾那套，见
@@ -1095,9 +1315,15 @@ static int sf32lb52_audio_hw_stop(FAR struct sf32lb52_audio_s *priv)
    * 数据通路拉断一次、从头到尾不复位。现场那次 irq 冻结在 2339、此后每次 read
    * 都超时，就是这一类内部卡死的形态。复位可能清掉的时钟/通路配置，由
    * hw_start() 里的 sf32lb52_audio_aprc_restore_adc() 每次会话开头重写，
-   * 两边配套、缺一不可。 */
+   * 两边配套、缺一不可。
+   *
+   * 判据和那次重建共用（见 sf32lb52_audio_aprc_has_config）：复位是破坏性的，
+   * 只有"这套配置确实写过、将来一定会被重建"时才允许做。 */
 
-  sf32lb52_audio_aprc_soft_reset(priv);
+  if (sf32lb52_audio_aprc_has_config(priv))
+    {
+      sf32lb52_audio_aprc_soft_reset(priv);
+    }
 
   /* 播放用的 DAC DMA 也要停，而且**必须停**：
    * HAL 把音频 DMA 初始化成 DMA_CIRCULAR（见 hw_init 的注释：WORD 对齐 +
@@ -1226,6 +1452,14 @@ static int sf32lb52_audio_hw_stop(FAR struct sf32lb52_audio_s *priv)
     }
 
   priv->running = false;
+
+  /* running 一清，这套持有者 id 就没有意义了。不清的话，下一个会话看到的是
+   * 上一条会话的线程 id，判"持有者还在不在"就会拿错人。 */
+
+  priv->holder_tid = (pid_t)-1;
+  priv->holder_pid = (pid_t)-1;
+  priv->user_tid   = (pid_t)-1;
+
   audinfo("audio stopped\n");
   return OK;
 }
@@ -1254,10 +1488,25 @@ static int sf32lb52_audio_hw_shutdown(FAR struct sf32lb52_audio_s *priv)
 {
   /* DMAStop / DISABLE 只做寄存器操作，风险低于模拟通路关闭，先保留；
    * 这两个本身在关中断上下文里是否安全还没有证据，若仍卡死，
-   * 下一步就把这两行也挪出 shutdown。 */
+   * 下一步就把这两行也挪出 shutdown。
+   *
+   * 两条 DMAStop 同样加"先看句柄状态"的守卫，理由和 hw_stop 里那对一模一样
+   * （见那段说明）：READY 就说明上一次 abort 已经收过尾，再 abort 一次写的是
+   * 可能已被别人分配走的物理通道。TX0 同样是"平时空转、队列模式才用得上"，
+   * 所以保留、只加守卫。 */
 
-  HAL_AUDPRC_DMAStop(&priv->aprc, HAL_AUDPRC_TX_CH0);
-  HAL_AUDPRC_DMAStop(&priv->aprc, HAL_AUDPRC_RX_CH0);
+  if (priv->aprc.hdma[HAL_AUDPRC_TX_CH0] == NULL ||
+      priv->aprc.hdma[HAL_AUDPRC_TX_CH0]->State != HAL_DMA_STATE_READY)
+    {
+      HAL_AUDPRC_DMAStop(&priv->aprc, HAL_AUDPRC_TX_CH0);
+    }
+
+  if (priv->aprc.hdma[HAL_AUDPRC_RX_CH0] == NULL ||
+      priv->aprc.hdma[HAL_AUDPRC_RX_CH0]->State != HAL_DMA_STATE_READY)
+    {
+      HAL_AUDPRC_DMAStop(&priv->aprc, HAL_AUDPRC_RX_CH0);
+    }
+
   __HAL_AUDPRC_DISABLE(&priv->aprc);
 
   /* 这里同样补软复位：close 掉最后一个 fd 是"把 AUDPRC 留在关着且没复位"
@@ -1265,9 +1514,13 @@ static int sf32lb52_audio_hw_shutdown(FAR struct sf32lb52_audio_s *priv)
    * 只写 CFG/RX_CH0_CFG 两个寄存器、不等待不睡眠，所以在本函数所处的
    * "持上层锁 + 中断关闭"上下文里是安全的（和上面几条 DMAStop 一个量级）。
    * 复位清掉的配置由下一次 hw_start() 的 sf32lb52_audio_aprc_restore_adc()
-   * 重写。 */
+   * 重写。判据与那次重建共用（见 sf32lb52_audio_aprc_has_config）：
+   * 能重建才允许复位，避免留下"清空过、但没人重建"的块。 */
 
-  sf32lb52_audio_aprc_soft_reset(priv);
+  if (sf32lb52_audio_aprc_has_config(priv))
+    {
+      sf32lb52_audio_aprc_soft_reset(priv);
+    }
 
   /* DAC 的 DMA 同样要停：它是 DMA_CIRCULAR，不停就会无限重播最后一段
    * （"昂昂昂昂"卡住不停）。close() 是最后一个 fd 被关时的收尾路径，
@@ -1323,6 +1576,14 @@ static int sf32lb52_audio_hw_shutdown(FAR struct sf32lb52_audio_s *priv)
   nxsem_post(&priv->rx_sem);
 
   priv->running = false;
+
+  /* 和 hw_stop() 一样要清持有者 id：close() 之后 running 变假，留着上一条会话的
+   * 线程 id 只会把下一次判定带偏（本函数所在的上下文不能加别的活，清几个
+   * pid_t 只是普通赋值）。 */
+
+  priv->holder_tid = (pid_t)-1;
+  priv->holder_pid = (pid_t)-1;
+  priv->user_tid   = (pid_t)-1;
   return OK;
 }
 
@@ -1526,6 +1787,77 @@ static int sf32lb52_audio_shutdown(FAR struct audio_lowerhalf_s *dev)
 }
 
 /****************************************************************************
+ * Name: sf32lb52_audio_tid_alive
+ *
+ * Description:
+ *   这个线程 id 对应的任务还在不在（还在返回 true）。
+ *
+ *   为什么用 nxsched_get_tcb() 而不是 kill(pid, 0) 看 ESRCH：NuttX 里线程退出时
+ *   nxsched_release_pid() 会把它的 pid 从 pidhash 里摘掉，三条退出路径都调
+ *   （task/exit.c、pthread/pthread_exit.c、task/task_terminate.c），所以"查不到
+ *   TCB"就等于"这个线程真的没了"，语义比信号那套干净得多 —— kill() 是"给某个
+ *   任务组发信号"，拿线程 id 去问会先过权限/组那一层，ESRCH 和 EPERM 分不干净，
+ *   把"没权限"当成"不存在"就是替一个活着的会话拆台。
+ *   查到了必须配对释放（引用计数，见 sched/sched/sched_gettcb.c）。
+ *
+ ****************************************************************************/
+
+static bool sf32lb52_audio_tid_alive(pid_t tid)
+{
+  FAR struct tcb_s *tcb;
+
+  if (tid < 0)
+    {
+      return false;
+    }
+
+  tcb = nxsched_get_tcb(tid);
+  if (tcb == NULL)
+    {
+      return false;
+    }
+
+  nxsched_put_tcb(tcb);
+  return true;
+}
+
+/****************************************************************************
+ * Name: sf32lb52_audio_holder_alive
+ *
+ * Description:
+ *   当前这次会话（running 为真）还有没有有效持有者。
+ *
+ *   两条独立证据，任一条成立就算"还活着"：
+ *     1) 把这次会话起起来的线程还在；
+ *     2) 最近一次 read()/write() 的线程还在（会话真的有人在用）。
+ *   两条都查不到 TCB 才判"没有有效持有者" —— 这时候反方向那条通路已经没人要了，
+ *   调用方可以强制收干净再切过去。
+ *
+ *   为什么不用"任务组还在"当证据：一个 app 的播放线程死掉时它的 task group 还活着
+ *   （app 没退），可那条播放通路已经没人管了；拿"组还在"当"持有者还在"就等于
+ *   放过这种残留，录音端会一直 -EBUSY —— 正是本次要根治的那种"永久聋到重启"。
+ *   组号只进日志，方便 ps 里对出是哪个 app。
+ *
+ *   判"活着"时调用方的行为**一个字都不能变**（仍然 -EBUSY）：半双工下录放必须
+ *   串行，不能替正在用的人把通路拆了。
+ *
+ ****************************************************************************/
+
+static bool sf32lb52_audio_holder_alive(FAR struct sf32lb52_audio_s *priv)
+{
+  /* 一个都没记过（理论上到不了：running 只由 hw_start 置真，那里一定会记）：
+   * 判不了就按"有人"处理，保持原来的 -EBUSY 行为。 */
+
+  if (priv->holder_tid < 0 && priv->user_tid < 0)
+    {
+      return true;
+    }
+
+  return sf32lb52_audio_tid_alive(priv->holder_tid) ||
+         sf32lb52_audio_tid_alive(priv->user_tid);
+}
+
+/****************************************************************************
  * Name: sf32lb52_audio_start
  *
  * Description: 处理上层 AUDIOIOC_START
@@ -1558,9 +1890,13 @@ static int sf32lb52_audio_start(FAR struct audio_lowerhalf_s *dev)
    * AUDPRC 使能（都在 hw_start 里）全没做，read() 的 DMA 起得来却永远等不到
    * 完成中断，5 秒后以 -110 收场，应用从此变聋。
    *
-   * 但"先完整 stop 再 start"这件事**只在方向一致时**才允许做。两个 app 同时
-   * 在线时，另一个方向的通路是别人正在用的，拆掉它的后果是录音被中止（或播放
-   * 只剩第一块），比拒绝这次 START 严重得多。所以这里按真实在跑的方向分岔。
+   * 但"先完整 stop 再 start"这件事**只在两种情况下**才允许做：
+   *   ① 方向一致（上一个持有者和本次要起的是同一条通路，收尾不会动到别人）；
+   *   ② 方向不一致，但那条通路的持有者线程已经不存在了（死掉的那个 app/线程
+   *      留下的残局，见下面的异方向分岔）。
+   * 除这两种以外一律拒绝。两个 app 同时在线、另一个方向的通路是别人正在用的，
+   * 拆掉它的后果是录音被中止（或播放只剩第一块），比拒绝这次 START 严重得多。
+   * 所以这里按"真实在跑的方向 + 持有者还在不在"分岔。
    */
 
   if (priv->running)
@@ -1576,32 +1912,58 @@ static int sf32lb52_audio_start(FAR struct audio_lowerhalf_s *dev)
 
       if (live && dir != want)
         {
-          /* 异方向：**拒绝**，不替对方拆台。
+          /* 异方向：先看对面是不是真有活人在用。
            *
-           * 返回 -EBUSY 是安全的：上层两个 app 都按 -16 处理 ——
-           * audio_in_start() 把它透出来（它自己有残留会话的自愈重试），
-           * robot_ui 的 alarm_audio_open() 报 "audio open failed" 后
-           * 当次播报静默走完，都不会因为这次拒绝崩掉。 */
+           * 持有者还活着 → **拒绝**，不替对方拆台。返回 -EBUSY 是安全的：上层
+           * 两个 app 都按 -16 处理 —— audio_in_start() 把它透出来（它自己有一拍
+           * 重试），robot_ui 的播报路径报 "audio open failed" 后当次静默走完，
+           * 都不会因为这次拒绝崩掉。
+           *
+           * 持有者线程已经不存在 → 这是死掉的那个 app（或那条播放线程）留下的
+           * 残局：没人会再来收，这里不收的话反方向的 START 就永远卡在 -EBUSY，
+           * 录音端从此永久聋到重启板子。判定依据见 sf32lb52_audio_holder_alive。 */
+
+          if (sf32lb52_audio_holder_alive(priv))
+            {
+              syslog(LOG_WARNING,
+                     "AUDIO: 拒绝方向切换：要起 %s，但 %s 通路正被占用"
+                     "（dac=%d pa=%d adc=%d running=%d 持有线程=%d 最近读写=%d "
+                     "组=%d）→ -EBUSY\n",
+                     want ? "播放" : "录音",
+                     dir ? "播放" : "录音",
+                     (int)priv->dac_path_on, (int)priv->pa_on,
+                     (int)priv->adc_path_on, (int)priv->running,
+                     (int)priv->holder_tid, (int)priv->user_tid,
+                     (int)priv->holder_pid);
+              return -EBUSY;
+            }
 
           syslog(LOG_WARNING,
-                 "AUDIO: 拒绝方向切换：要起 %s，但 %s 通路正被占用"
-                 "（dac=%d pa=%d adc=%d running=%d）→ -EBUSY\n",
+                 "AUDIO: 方向冲突但持有者已消失（要起 %s，%s 通路残留："
+                 "起会话的线程 %d / 最近读写的线程 %d / 组 %d 都已查不到 TCB），"
+                 "判定为残留会话，强制做一次干净 stop 再切到 %s\n",
                  want ? "播放" : "录音",
                  dir ? "播放" : "录音",
+                 (int)priv->holder_tid, (int)priv->user_tid,
+                 (int)priv->holder_pid,
+                 want ? "播放" : "录音");
+        }
+      else
+        {
+          /* 同方向：残留 / 重复 START，收干净再起 */
+
+          syslog(LOG_WARNING,
+                 "AUDIO: 检测到残留运行状态（running=1 dir=%s 与本次要起的 %s 一致，"
+                 "dac=%d pa=%d adc=%d），先做一次干净 stop 再启动\n",
+                 dir ? "播放" : "录音",
+                 want ? "播放" : "录音",
                  (int)priv->dac_path_on, (int)priv->pa_on,
-                 (int)priv->adc_path_on, (int)priv->running);
-          return -EBUSY;
+                 (int)priv->adc_path_on);
         }
 
-      /* 同方向：残留 / 重复 START，收干净再起 */
+      /* 两条路都走到这里：把旧会话收干净（异方向残留是刚判定完的，同方向是
+       * 重复 START），下面 hw_start 才从零开始把想要的那条通路起起来。 */
 
-      syslog(LOG_WARNING,
-             "AUDIO: 检测到残留运行状态（running=1 dir=%s 与本次要起的 %s 一致，"
-             "dac=%d pa=%d adc=%d），先做一次干净 stop 再启动\n",
-             dir ? "播放" : "录音",
-             want ? "播放" : "录音",
-             (int)priv->dac_path_on, (int)priv->pa_on,
-             (int)priv->adc_path_on);
       sf32lb52_audio_hw_stop(priv);
     }
 
@@ -1684,13 +2046,28 @@ static int sf32lb52_audio_cancelbuffer(FAR struct audio_lowerhalf_s *dev,
 
   if (priv->tx_apb == apb)
     {
-      HAL_AUDPRC_DMAStop(&priv->aprc, SF32LB52_AUDIO_PRC_TX_CH);
+      /* 守卫的规矩和 hw_stop / hw_shutdown 里那两对一样：READY 说明这条通道
+       * 已经收过尾，再 abort 一次写的是可能已被别人分配走的物理通道。
+       * 这条路只有在**队列模式**（enqueuebuffer 真的起过这条通道）时才走得
+       * 进来，正常情况下 tx_apb/rx_apb 都是 NULL、一个 abort 都不会发。 */
+
+      if (priv->aprc.hdma[SF32LB52_AUDIO_PRC_TX_CH] == NULL ||
+          priv->aprc.hdma[SF32LB52_AUDIO_PRC_TX_CH]->State != HAL_DMA_STATE_READY)
+        {
+          HAL_AUDPRC_DMAStop(&priv->aprc, SF32LB52_AUDIO_PRC_TX_CH);
+        }
+
       priv->tx_apb = NULL;
     }
 
   if (priv->rx_apb == apb)
     {
-      HAL_AUDPRC_DMAStop(&priv->aprc, SF32LB52_AUDIO_PRC_RX_CH);
+      if (priv->aprc.hdma[SF32LB52_AUDIO_PRC_RX_CH] == NULL ||
+          priv->aprc.hdma[SF32LB52_AUDIO_PRC_RX_CH]->State != HAL_DMA_STATE_READY)
+        {
+          HAL_AUDPRC_DMAStop(&priv->aprc, SF32LB52_AUDIO_PRC_RX_CH);
+        }
+
       priv->rx_apb = NULL;
     }
 
@@ -1743,6 +2120,12 @@ static ssize_t sf32lb52_audio_write(FAR struct audio_lowerhalf_s *dev,
     {
       return 0;
     }
+
+  /* 记下"这次会话最近一次真的有人在写"（判残留时的一条证据，见
+   * sf32lb52_audio_holder_alive）。放在 running 早退之后：设备没在跑就不算
+   * 有人用它。 */
+
+  priv->user_tid = nxsched_gettid();
 
   priv->wr_busy = true;
 
@@ -1890,6 +2273,13 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
   uint32_t irq_at_stop;         /* 收尾停 DMA **之前**的中断计数 */
   uint32_t aprc_state_at_stop;  /* 停 DMA 之前的 aprc.State[RX]（停完就是 0x1 了） */
   uint32_t dma_state_at_stop;   /* 停 DMA 之前的 hdma[RX].State（同上） */
+  uint32_t cndtr_at_stop;       /* 停 DMA 之前的剩余传输数（判决实验的核心） */
+  uint32_t ccr_at_stop;         /* 停 DMA 之前的 CCR：EN/TCIE/TEIE/CIRC 还在不在 */
+  uint32_t isr_at_stop;         /* 停 DMA 之前该 DMA 的 ISR（挂着哪些标志） */
+  uint32_t dma_err_code;        /* 停 DMA 之前的 hdma[RX].ErrorCode */
+  bool     rx_err;              /* 本次等待是被 DMA 传输错误(TE)结束的 */
+  bool     quiet;               /* 本次 TE 日志被限频窗口吞掉（只计数不打日志） */
+  clock_t  now;                 /* 本次收尾的时刻（日志时间戳 + 限频窗口比较） */
   int ret;
 
   priv->rx_read_count++;
@@ -1901,6 +2291,12 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
       return 0;
     }
 
+  /* 记下"这次会话最近一次真的有人在读"（判残留时的一条证据，见
+   * sf32lb52_audio_holder_alive）。起会话的线程可能早就退了、读数据的是另一个
+   * 线程 —— 这一行就是为了让那种会话不被当成残留拆掉。 */
+
+  priv->user_tid = nxsched_gettid();
+
   /* 先把上一次 stop 可能留下的计数清掉，再起 DMA。
    * 配合 hw_stop() 里"无条件 post"的唤醒：不清的话，上一次 stop 的 post
    * 会让本次 read 一进等待就立刻返回，把没采满的缓冲当数据交上去。 */
@@ -1909,6 +2305,13 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
 
   priv->rx_busy    = true;
   priv->rx_aborted = false;
+
+  /* TE 那面旗也一起清：它只表示"**本帧**等待期间 DMA 报了传输错误"。
+   * 清在这里而不是进了等待才清，是因为错误回调只在 rx_busy 为真时立旗
+   * （见 HAL_AUDPRC_ErrorCallback），而 rx_busy 就是刚刚置真的这一行 ——
+   * 两边对"本帧"的定义由此对齐。 */
+
+  priv->rx_dma_err = false;
 
   /* 本次 read 属于哪个会话。选在 nxsem_reset() 之后取：那次 reset 会把上一次
    * stop 留下的计数清掉，而接下来任何一个 hw_stop()/hw_shutdown()/新会话的
@@ -2064,7 +2467,12 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
    * 第三个判据（会话代号）是给"post 没生效 / 状态没来得及更新"兜底的：
    * 它比对的是**本次 read 的时代还在不在**，不依赖任何人把标志写好或者记得
    * 唤醒这个任务 —— 真机上正是"唤醒没生效"导致录音线程收不了尾（见那次的
-   * AUDIOIOC_STOP failed: 25 与 300ms join 超时）。 */
+   * AUDIOIOC_STOP failed: 25 与 300ms join 超时）。
+   *
+   * 第五个判据 rx_dma_err 是本次新增的：DMA 传输错误(TE)时错误回调会 post
+   * 一次信号量把这一片立刻叫醒（不等这 100ms），这里再判一次旗子是给
+   * "post 那一下又被别的 post 混掉"兜底 —— 两个机制合起来，TE 之后本次 read
+   * 最坏 100ms 就收尾，而不是空转满 5 秒。 */
 
   {
     int slice;
@@ -2074,7 +2482,7 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
         ret = nxsem_tickwait_uninterruptible(&priv->rx_sem, MSEC2TICK(100));
 
         if (ret == OK || priv->rx_aborted || !priv->running ||
-            gen != priv->session_gen)
+            gen != priv->session_gen || priv->rx_dma_err)
           {
             break;
           }
@@ -2112,11 +2520,41 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
    * 武装着（BUSY）、有没有人把它 abort 掉"。
    *
    * 注意顺序：本条 return 0 的路径（会话结束）说明不了任何事，所以快照放在
-   * 它后面；而它自己也有一处 DMAStop，那边不需要现场。 */
+   * 它后面；而它自己也有一处 DMAStop，那边不需要现场。
+   *
+   * 本次再补三个寄存器（同样必须在 abort 之前读，abort 会把它们清掉）：
+   *   CNDTR —— **判决实验的核心**。20ms@16k 单声道 16bit 一帧 = 640 字节
+   *            = 160 个 32bit 字，所以
+   *              CNDTR == 160（一字节没搬）→ DMA 的请求线从头到尾没被拉高，
+   *                                          坏在数据源头（ADC 模拟通路 /
+   *                                          AUDPRC 这一侧），和 DMA 通道无关；
+   *              CNDTR 停在 0..159        → 搬了一部分之后断流：数据真的流过，
+   *                                          是中途停的（请求线半路没了）。
+   *   CCR   —— 停机这一刻通道还"武装着"没有：EN（通道使能）、TCIE/TEIE（完成/
+   *            错误中断使能）、CIRC（循环位）。本驱动停之前它应当是
+   *            EN|TCIE|HTIE|TEIE|CIRC —— 少了哪一位就说明有人动过它。
+   *   ISR   —— 该 DMA 当时挂着哪些通道标志（TC/HT/TE）。和 irq/half/dma_err
+   *            三个计数配对：ISR 上还有 TC 而 irq 没涨 = "中断产生了但没人
+   *            处理"（NVIC 被关/优先级被压），ISR 干干净净 = "中断压根没产生"。
+   *   ErrorCode —— DMA 通道自己的错误码（HAL_DMA_ERROR_TE = 0x1）。 */
 
   irq_at_stop        = priv->rx_irq_count;
   aprc_state_at_stop = (uint32_t)priv->aprc.State[SF32LB52_AUDIO_PRC_RX_CH];
   dma_state_at_stop  = (hdma_rx != NULL) ? (uint32_t)hdma_rx->State : 0u;
+  cndtr_at_stop      = (hdma_rx != NULL && hdma_rx->Instance != NULL) ?
+                       (uint32_t)hdma_rx->Instance->CNDTR : 0u;
+  ccr_at_stop        = (hdma_rx != NULL && hdma_rx->Instance != NULL) ?
+                       (uint32_t)hdma_rx->Instance->CCR : 0u;
+  isr_at_stop        = (hdma_rx != NULL && hdma_rx->DmaBaseAddress != NULL) ?
+                       (uint32_t)hdma_rx->DmaBaseAddress->ISR : 0u;
+  dma_err_code       = (hdma_rx != NULL) ? (uint32_t)hdma_rx->ErrorCode : 0u;
+
+  /* 本次等待是不是被 DMA 传输错误结束的。旗子在这里读走并清掉：TE 的错误
+   * 回调只是在中断里立旗 + post 信号量（不在中断里打日志，见错误回调的注释），
+   * 收尾和日志都留在这一处任务上下文里做，两边对"本帧"的定义就唯一了。 */
+
+  rx_err = priv->rx_dma_err;
+  priv->rx_dma_err = false;
 
   /* 停止循环 DMA 传输（单次采集完成） */
 
@@ -2130,13 +2568,19 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
 
   priv->aprc.State[SF32LB52_AUDIO_PRC_RX_CH] = HAL_AUDPRC_STATE_READY;
 
-  if (ret < 0)
+  /* 两个入口：分片等待超时（ret < 0），或者等待被 DMA 传输错误结束（rx_err）。
+   * **rx_err 必须和超时走同一条出口**：TE 时错误回调 post 过一次信号量把
+   * 循环叫醒，于是 ret 是 OK —— 只看 ret 的话会掉进下面的 `return buflen`，
+   * 把一块**没被写过的**缓冲当"采满了"交给上层（比报错隐蔽得多的一种坏法）。 */
+
+  if (ret < 0 || rx_err)
     {
       /* 50 片 × 100ms 都等完、一片完成通知都没来：**这一片** DMA 就是没给数据。
        *
-       * 走到这里一定是"整整 5 秒没等到"：被 stop / 设备停了 / 会话换代这三种
+       * 超时走到这里一定是"整整 5 秒没等到"：被 stop / 设备停了 / 会话换代这三种
        * 都会让上面的循环提前 break，并且命中再上面那条 return 0（它们的返回值
-       * 必须是 0，语义是 EOF）。所以这里只剩超时这一种。
+       * 必须是 0，语义是 EOF）。所以超时这一路只剩"没等到"这一种。
+       * （rx_err 那一路不必等满 5 秒，它是被 TE 中断提前结束的。）
        *
        * 返回 -ETIMEDOUT（nuttx/include/errno.h:170，值 110 —— 现场日志里
        * ret=-110 的同一个错误号）：它表示"**这次读没拿到数据**"，不是"会话结束"。
@@ -2147,30 +2591,81 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
        * 0 一律当"会话死了"，于是每 5 秒拆一次设备重录 —— 一次抖动就毁掉整场录音。
        *
        * 判读方式（现场那次 irq=448 read=479 timeout=47，约 10% 超时）：
-       *   irq_delta=0 → 这 5 秒里完成中断一次都没来（下面那个判据）；
-       *   irq 在涨     → 中断是来的，问题在等待/唤醒这一段。 */
+       *   irq_delta=0 且 CNDTR=160 → 这 5 秒里中断一次都没来、一字节都没搬：
+       *                              请求线从未被拉高，坏在 ADC/AUDPRC 通路侧；
+       *   irq_delta=0 且 CNDTR<160 → 搬了一半之后断流（曾经在流、中途停了）；
+       *   half 在涨而 irq 不涨     → 数据其实是通的，只有 TC 那一路丢了；
+       *   err_te=1                 → 这一次是 DMA 传输错误(TE)结束的
+       *                              （HAL 已把通道 Free + State=READY）；
+       *   irq 在涨                 → 中断是来的，问题在等待/唤醒这一段。 */
 
-      priv->rx_timeout_count++;
+      now = clock_systime_ticks();
 
-      syslog(LOG_WARNING,
-             "AUDIO: read 等 DMA 超时/被停（ret=%d）"
-             " irq=%u read=%u timeout=%u busy_fail=%u not_armed=%u recov=%u"
-             " irq_delta=%u"
-             " aprc.State[RX]=0x%x hdma[RX].State=0x%x"
-             " running=%d playback=%d\n",
-             ret,
-             (unsigned)priv->rx_irq_count,
-             (unsigned)priv->rx_read_count,
-             (unsigned)priv->rx_timeout_count,
-             (unsigned)priv->rx_dma_busy_fail,
-             (unsigned)priv->rx_dma_not_armed,
-             (unsigned)priv->rx_recover_count,
-             (unsigned)(irq_at_stop - irq_before),
-             (unsigned)aprc_state_at_stop,
-             (unsigned)dma_state_at_stop,
-             (int)priv->running, (int)priv->playback);
+      if (rx_err)
+        {
+          /* TE 这条日志要限频：它让 read **立刻**返回（不像超时要等 5 秒），
+           * 持续性的 TE 就是"上层每次重试一条"。规矩和自愈日志一样
+           * （见 sf32lb52_audio_recover_log）：窗口内只累计、不打日志，
+           * 出窗口那一条把被吞掉的条数一起报出来。 */
+          quiet = (int32_t)(now - priv->rx_dma_err_log_next) < 0;
 
-      /* "RX 真的死了"的判据（两条必须同时成立）：
+          if (quiet)
+            {
+              priv->rx_dma_err_silenced++;
+            }
+          else
+            {
+              priv->rx_dma_err_log_next =
+                now + MSEC2TICK(SF32LB52_AUDIO_RECOVER_LOG_MS);
+            }
+        }
+      else
+        {
+          quiet = false;
+          priv->rx_timeout_count++;
+        }
+
+      if (!quiet)
+        {
+          syslog(LOG_WARNING,
+                 "AUDIO: read 等 DMA 失败（ret=%d err_te=%d）"
+                 " irq=%u half=%u read=%u timeout=%u busy_fail=%u not_armed=%u"
+                 " dma_err=%u dma_err_silenced=%u recov=%u irq_delta=%u"
+                 " CNDTR=%u CCR=0x%x ISR=0x%x dma_err_code=0x%x"
+                 " aprc.State[RX]=0x%x hdma[RX].State=0x%x"
+                 " t=%u running=%d playback=%d\n",
+                 ret, (int)rx_err,
+                 (unsigned)priv->rx_irq_count,
+                 (unsigned)priv->rx_half_irq_count,
+                 (unsigned)priv->rx_read_count,
+                 (unsigned)priv->rx_timeout_count,
+                 (unsigned)priv->rx_dma_busy_fail,
+                 (unsigned)priv->rx_dma_not_armed,
+                 (unsigned)priv->rx_dma_err_count,
+                 (unsigned)priv->rx_dma_err_silenced,
+                 (unsigned)priv->rx_recover_count,
+                 (unsigned)(irq_at_stop - irq_before),
+                 (unsigned)cndtr_at_stop,
+                 (unsigned)ccr_at_stop,
+                 (unsigned)isr_at_stop,
+                 (unsigned)dma_err_code,
+                 (unsigned)aprc_state_at_stop,
+                 (unsigned)dma_state_at_stop,
+                 (unsigned)TICK2MSEC(now),
+                 (int)priv->running, (int)priv->playback);
+
+          /* 报完就清：下一条窗口日志报的是**它这个窗口**里被吞掉的条数。
+           * 只在 TE 这一路清，别把 timeout 那条日志变成 TE 计数的清零点。 */
+
+          if (rx_err)
+            {
+              priv->rx_dma_err_silenced = 0;
+            }
+        }
+
+      /* "RX 真的死了"的判据（两种情况各两条）：
+       *
+       * A) 冻死（原有判据，两条必须同时成立）：
        *   1) irq_delta == 0：整整 5 秒，完成中断一次都没来；
        *   2) dma_state_at_stop == BUSY：停机之前句柄仍停在 BUSY，也就是这一路
        *      DMA 从头到尾都武装着（通道使能 + TC/HT/TE 中断使能 + CNDTR 都写好了），
@@ -2180,14 +2675,22 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
        * 时都会重新使能，见 bf0_hal_dma.c:299-309），坏的是它上游不再发数据请求，
        * 也就是 AUDPRC —— 所以这一次要做的是**完整的 AUDPRC 恢复**，不是再 arm 一遍。
        *
-       * 反过来说：只有 1) 成立（句柄已经不在 BUSY，说明被别处 abort 掉过）或者
-       * 只有 2) 成立（说明中断来过，是等待/唤醒那一侧的问题）都不做恢复 ——
-       * 那些不是这个病，贸然复位 AUDPRC 反而把正常通路拆了。
+       * B) DMA 传输错误（本次新增）：rx_err 为真就是 TE。这一类在原来那对判据下
+       *    **永远不会自愈**：HAL 自己在中断里就做完了 DMA_FreeChannel + State=READY
+       *    （bf0_hal_dma.c:1228-1235），于是 2) 必然不成立（句柄是 READY 而不是
+       *    BUSY），每次固定空转满 5 秒。TE 说明这一路 DMA 已经用不了了（通道被
+       *    回收、TC/HT/TE 中断全被关），要接着录只能把它重新武装到干净状态上 ——
+       *    和 A) 要做的是同一件事，所以并进同一个恢复调用，只是判据多这一条。
+       *
+       * 反过来说：只有 1) 成立（句柄已经不在 BUSY、又不是 TE）说明有人主动
+       * abort 过它；只有 2) 成立（说明中断来过，是等待/唤醒那一侧的问题）——
+       * 这两种都不做恢复，贸然复位 AUDPRC 反而把正常通路拆了。
        *
        * 恢复之后仍然按契约返回 -ETIMEDOUT（这一次确实没等到数据），
        * 下一次 read 会在恢复好的块上重新武装 DMA。 */
 
-      if (irq_at_stop == irq_before && dma_state_at_stop == HAL_DMA_STATE_BUSY)
+      if (rx_err ||
+          (irq_at_stop == irq_before && dma_state_at_stop == HAL_DMA_STATE_BUSY))
         {
           priv->rx_recover_count++;
           sf32lb52_audio_recover_rx(priv);
@@ -2245,6 +2748,13 @@ int sf32lb52_audio_initialize(void)
 
   nxsem_init(&priv->wr_sem, 0, 0);
   nxsem_init(&priv->rx_sem, 0, 0);
+
+  /* 持有者身份显式给 -1：kmm_zalloc 出来是全 0，而 pid 0 是 idle 任务 ——
+   * "没记过"和"真的记了一个 pid"必须分得开（见 struct 里那段说明）。 */
+
+  priv->holder_tid = (pid_t)-1;
+  priv->holder_pid = (pid_t)-1;
+  priv->user_tid   = (pid_t)-1;
 
   priv->dev.ops = &g_sf32lb52_audio_ops;
 
@@ -2346,4 +2856,100 @@ void HAL_AUDPRC_RxCpltCallback(AUDPRC_HandleTypeDef *haprc, int cid)
     {
       sf32lb52_audio_rx_complete(priv);
     }
+}
+
+/****************************************************************************
+ * Name: HAL_AUDPRC_RxHalfCpltCallback
+ *
+ * Description:
+ *   RX 半满中断 —— "数据真的在流"的第二个心跳。
+ *
+ *   Receive_DMA 本来就把 RX 装成了 DMACIRCULAR 并把半满回调挂在句柄上
+ *   （bf0_hal_audprc.c 里 AUDPRC_DMAHalfRxCplt → 这个 __weak 空实现），
+ *   只是一直没人接。本驱动每帧只等整满那一次完成中断，一旦 TC 那一路丢了
+ *   （或落在每帧 stop/re-arm 的窗口里被静默吞掉），日志上就只剩"irq=0"，
+ *   分不清"数据源头压根没动"和"数据在流、只是完成通知丢了"。
+ *   20ms 一帧 → 半满每 10ms 一次，这个计数就是那个分辨器。
+ *
+ *   这里**只累加一个计数器**：中断上下文里不能打串口日志（会抢控制台锁、
+ *   把整机挂住，本文件踩过一次），也不能做任何会改变通路状态的事 ——
+ *   它每 10ms 就来一次，做重活等于把录音通路拖垮。
+ ****************************************************************************/
+
+void HAL_AUDPRC_RxHalfCpltCallback(AUDPRC_HandleTypeDef *haprc, int cid)
+{
+  FAR struct sf32lb52_audio_s *priv;
+
+  if (haprc == NULL)
+    {
+      return;
+    }
+
+  priv = (FAR struct sf32lb52_audio_s *)
+         ((FAR char *)haprc - offsetof(struct sf32lb52_audio_s, aprc));
+
+  /* 无条件自增（和 rx_irq_count 同一个规矩：这条只回答"来过没有"）。 */
+
+  priv->rx_half_irq_count++;
+}
+
+/****************************************************************************
+ * Name: HAL_AUDPRC_ErrorCallback
+ *
+ * Description:
+ *   DMA 传输错误（TE）—— 这一类原来**永远不会自愈**，这里补上。
+ *
+ *   故障形态：TE 中断进来后 HAL 自己就做完了收尾
+ *   （bf0_hal_dma.c:1228-1235：关 TC/HT/TE 中断 → DMA_FreeChannel →
+ *   State=READY），随后 AUDPRC 侧的 AUDPRC_DMAError（bf0_hal_audprc.c:1062）
+ *   把 aprc->State[cid] 也置 READY 再回调到这里。于是现场表现是：
+ *       irq_delta == 0（完成中断确实没来）
+ *       hdma[RX].State == 0x1（READY，而不是 BUSY）
+ *   而 read() 里那条自愈判据要求"句柄仍 BUSY"，两条对不上 → 一次都不恢复，
+ *   每次固定空转满 5 秒再返回 -110。
+ *
+ *   本回调只做三件**中断安全**的轻活（**不打日志**：串口那一侧会抢控制台锁、
+ *   把整机挂住，本文件在播放完成回调里就为此删过一次 printf）：
+ *     1) rx_dma_err_count++：TE 次数的唯一凭据；
+ *     2) 立 rx_dma_err 旗：read() 的分片等待每 100ms 会看一眼，最坏 100ms
+ *        就把这一帧收尾；
+ *     3) 唤醒正在等帧的 read（post rx_sem），让它不必等那一片的 100ms。
+ *   日志与恢复都在 read() 的收尾分支里做（那里能拿到 CNDTR/CCR/ISR 的
+ *   停机前快照，信息比中断里全）。
+ *
+ *   只对 RX 通道立旗：TX0 只在队列模式（enqueuebuffer）里才会起来，那条路
+ *   没有阻塞在信号量上的读者，立旗没人消费反而会污染下一次 read。
+ ****************************************************************************/
+
+void HAL_AUDPRC_ErrorCallback(AUDPRC_HandleTypeDef *haprc, int cid)
+{
+  FAR struct sf32lb52_audio_s *priv;
+
+  if (haprc == NULL)
+    {
+      return;
+    }
+
+  priv = (FAR struct sf32lb52_audio_s *)
+         ((FAR char *)haprc - offsetof(struct sf32lb52_audio_s, aprc));
+
+  /* 计数无条件做：日志是限频的，计数器不是 —— "到底出过几次"只能靠它。
+   * 错误码不用在这里记：HAL 在调本回调**之前**已经把它写进
+   * hdma[cid]->ErrorCode（bf0_hal_dma.c:1228，值 HAL_DMA_ERROR_TE = 0x1），
+   * read() 的收尾日志直接读那个字段；直到下一次武装那一刻才被 HAL 清掉
+   * （HAL_DMA_Start_IT 开头置 NONE），所以这一帧读到的就是本帧的值。 */
+
+  priv->rx_dma_err_count++;
+
+  if (cid != SF32LB52_AUDIO_PRC_RX_CH || !priv->rx_busy)
+    {
+      /* 非 RX 通道，或者当前这一次等待已经收过尾（rx_busy 已清）：只计数。
+       * 不立旗是必须的 —— 旗子只有一个消费者（read()），在没人等的时候立下去，
+       * 下一次 read 会把它当成"自己这一帧出错了"。 */
+
+      return;
+    }
+
+  priv->rx_dma_err = true;
+  nxsem_post(&priv->rx_sem);
 }

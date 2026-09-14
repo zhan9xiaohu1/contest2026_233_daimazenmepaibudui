@@ -69,12 +69,32 @@ report_device_status(&st);
 report_alarm("fall", "检测到摔倒，位置：客厅");
 ```
 
-### 3.2 AI 交互
+### 3.2 AI 交互 —— ⚠️ 已废弃，不要调用
 
-```c
-ai_send_text("今天天气怎么样", my_reply_cb);      // 主题 zhi_ai/<id>/chat
-ai_send_voice_data(buf, len, my_reply_cb);        // 主题 zhi_ai/<id>/voice
-```
+> **本节原来的 `ai_send_text()` / `ai_send_voice_data()` 已废弃。** 两个原因：
+>
+> 1. **这是跨 task group 直发 socket 的危险路径。** 两个函数在 `network_comm.c`
+>    里直接调 `mqtt_publish()`，用的是 `network_comm` 自己那份
+>    `mqtt_config` / `mqtt_socket`。NuttX 的 fd 属于 task group：socket 是
+>    `network_task` 建的、只存在于那个组的 fd 表里，从别的组（比如 hello_app 的
+>    线程）拿同一个编号去 `send()`，要么 `EBADF`，要么发到本组里恰好占了这个编号
+>    的别的文件上。真机日志里那条
+>    `MQTT publish failed: -1, marked disconnected for reconnect` 就是这条路。
+> 2. **它们现在零调用者**，而且 `callback` 参数是纯占位：函数体里只有
+>    `TODO: 实际项目中需要等待云端回复并调用 callback`，**永远不回调**。
+>
+> 要发消息一律走**排队发布**，由 `network_task` 那条 socket 真正发出去：
+>
+> | 场景 | 用这个 |
+> |------|--------|
+> | 任意 topic | `mqtt_publish_queued(topic, payload, qos, retain)` |
+> | 报警 | `report_alarm_queued()` |
+> | 异常声音 | `report_abnormal_sound_queued()` |
+> | 设备命令 | `send_device_command_queued()` |
+>
+> 语音对话链路的现状：语音入口在 `ai_companion`（hello_app）那边走框架的
+> `llm_send_text()`；回传由 `ai_network_send_ai_reply()` 等 publish 到
+> `zhi_ai/<id>/command`。界面 `robot_ui` 不再自己开麦。收云端消息看第 3.4 节。
 
 ### 3.3 手机推送（走 HTTP，和 MQTT 是两条路）
 

@@ -20,6 +20,10 @@
  *   中途挂掉/退出时没人替它清这份状态，后面的 app 就会一直拿到 -16（EBUSY）。
  *   所以除了 fd 还记下"开它的线程 id"，audio_in_start() 在 EBUSY 时会先确认
  *   持有者线程是否还存在，消失了的就当残留丢掉再重开一次。
+ *   另一层在驱动里：AUDIOIOC_START 返回的 -EBUSY 现在只在"反方向那条通路的持有者
+ *   线程确实还活着"时才出现（持有者已消失的残留由驱动自己收干净），板级遇到
+ *   -EBUSY 只做一次有界重试、绝不去停别人的通路 —— 完整策略见
+ *   sf32lb52_audio_in.h 的「遇 EBUSY 怎么办」。
  *
  ****************************************************************************/
 
@@ -268,12 +272,59 @@ int audio_in_start(int sample_rate, int channels, int bits)
 
   if (ioctl(fd, AUDIOIOC_START, 0) < 0)
     {
-      int errcode = errno;
+      int  errcode = errno;
+      bool started = false;
 
-      close(fd);
-      nxmutex_unlock(&g_audio_in_lock);
-      syslog(LOG_ERR, "AUDIO_IN: AUDIOIOC_START failed: %d\n", errcode);
-      return -errcode;
+      /* -EBUSY 的一次性兜底。策略与边界写在 sf32lb52_audio_in.h 的
+       * 「遇 EBUSY 怎么办」那一段，这里的实现只做三件有界的事：看错误码是不是
+       * EBUSY、是就重试一次、失败就如实返回 —— 不循环、不 sleep、不发 AUDIOIOC_STOP。
+       *
+       * 为什么板级**不**做"先停再开"：驱动侧现在自己会分辨"反方向那条通路到底是
+       * 别人真在用，还是持有者早就死了的残局"（残留由驱动在里面收干净，这次 START
+       * 会直接成功）。所以 -EBUSY 透到板级时，驱动判定对面有活人。而板级到这一步
+       * **没有任何证据**能推翻它：本模块自己那份会话记录（g_audio_in_fd/
+       * g_audio_in_owner）在"有会话"的两种情况下都在函数开头就返回或清掉了，
+       * 能走到这里它一定是 -1。既然证不出来就绝不去停别人的通路 ——
+       * AUDIOIOC_STOP 会同时停掉录和放，停在别人正在出声的播报上就是打断它，
+       * 半双工的铁律不允许这么赌。
+       *
+       * 重试只有一次，接的是"上一拍的占用刚好在这一拍收尾"（对面的持有者在这两次
+       * 调用之间死了，或者它的 STOP 刚到）。重试合法：START 失败时上层状态还是
+       * PREPARED —— nuttx/audio/audio.c 的 audio_start() 只在成功时才
+       * audio_setstate(RUNNING)，同一个 fd 可以再发一次 AUDIOIOC_START。 */
+
+      if (errcode == EBUSY)
+        {
+          if (ioctl(fd, AUDIOIOC_START, 0) == 0)
+            {
+              started = true;
+              syslog(LOG_WARNING,
+                     "AUDIO_IN: AUDIOIOC_START 第一次 -EBUSY，重试一次成功"
+                     "（对面的占用在这两拍之间收尾了）\n");
+            }
+          else
+            {
+              errcode = errno;
+              syslog(LOG_ERR,
+                     "AUDIO_IN: AUDIOIOC_START 连续两次失败（第一次 -EBUSY = 驱动"
+                     "判定反方向通路仍有活着持有者；重试后 errno=%d）。设备确实被"
+                     "另一方向的会话占着：本次不打断、不停止，如实返回 %d\n",
+                     errcode, -errcode);
+            }
+        }
+      else
+        {
+          syslog(LOG_ERR,
+                 "AUDIO_IN: AUDIOIOC_START failed: %d（不是 EBUSY，不重试）\n",
+                 errcode);
+        }
+
+      if (!started)
+        {
+          close(fd);
+          nxmutex_unlock(&g_audio_in_lock);
+          return -errcode;
+        }
     }
 
   /* 最后一步才发布 fd：中途失败时全局状态始终是"未打开"，

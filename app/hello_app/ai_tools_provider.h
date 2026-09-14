@@ -76,13 +76,16 @@ int ai_tools_provider_init(void);
  * 只需设一次，之后不要再改：这个指针会被另一个任务读，中途换会读到半新半旧
  * 的状态。传 NULL 表示「撤销」（反初始化时用）。
  *
- * @param  ctx  已经 ai_network_init() 过的网络上下文，或 NULL
+ * @param  ctx  由 ai_network_start_shared() 建出来（或复用）的那份网络上下文，
+ *              或 NULL。**不要**用已删除的 ai_network_init() 另建一份：
+ *              network_comm 在一个固件里只有一份实例，另建会把界面正在用的
+ *              那条 MQTT 连接顶掉。
  */
 
 void ai_tools_provider_set_network_ctx(ai_network_context_t *ctx);
 
 /****************************************************************************
- * 运行时机：这两个函数该在哪调（接线留给 ai_companion_main.c 的 owner）
+ * 运行时机：这两个函数该在哪调（具体接线在 ai_companion_main.c 的 main() 里）
  *
  * 一、谁在跑框架的 agent loop
  *
@@ -98,10 +101,14 @@ void ai_tools_provider_set_network_ctx(ai_network_context_t *ctx);
  *
  * 二、调用顺序（都在 ai_companion 的 main() 里，建议紧挨着各自的依赖）
  *
- *   1. ai_network_init(&g_net_ctx, ...) 成功之后
+ *   1. ai_network_start_shared(&g_net_ctx, <client_id>) 成功之后
  *        -> ai_tools_provider_set_network_ctx(&g_net_ctx);
  *      理由：工具执行时要有 ctx 才能发 device_cmd。放太早会拿到没初始化的
  *      ctx（ai_network_is_mqtt_connected() 会直接判成没连上）。
+ *      这里只能借界面（robot_ui）那条连接，**不要**改回 ai_network_init() ——
+ *      那个入口连同 ai_network_send_voice() / ai_network_send_text() 一起删掉了
+ *      （零调用者），剩下的那条路会复位 network_comm 的全局状态、并把 MQTT
+ *      收包回调槽抢走。
  *
  *   2. 紧接着（同一处）调 ai_tools_provider_init();
  *      理由：注册本身跟网络无关，只要在「第一次向模型提问」之前完成就行。
@@ -116,8 +123,13 @@ void ai_tools_provider_set_network_ctx(ai_network_context_t *ctx);
  *      去发命令。注册本身不用撤销（provider 数组没有反注册接口，
  *      get_tools 也永远返回同一份清单）。
  *
- *   这三点都改 ai_companion_main.c，本次没动那个文件（正被别的 agent 改），
- *   只在这里写清楚。
+ *   这三点都接线在 ai_companion_main.c 的 main() 里（已经接好了），这里只把
+ *   约定写清楚。
+ *
+ *   另外：**MQTT 收包回调不在这里注册**。全固件只有一个槽，归 robot_ui 的
+ *   network_task —— app/robot_ui/main.c 里 network_set_mqtt_callback() 那一处，
+ *   只注册一次。hello_app 侧只 publish（走排队口 mqtt_publish_queued()）、
+ *   不订阅、不抢槽；抢了界面就再也收不到 ai_reply。
  ****************************************************************************/
 
 #ifdef __cplusplus

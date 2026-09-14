@@ -1,38 +1,88 @@
-# vendor_sifli 补丁
+# 补丁总览（openvela 工作区的三棵上游树）
 
-补丁按顺序应用(`git apply` 相对 `<openvela 工作区>/vendor/sifli` 目录):
-先 `vendor_sifli-boot-fixes.patch`,再 `vendor_sifli-audio-driver.patch`、
-`vendor_sifli-rtc-alarm-fix.patch`,最后 `vendor_sifli-lcd-brightness.patch`
-(四者改的文件互不重叠,顺序只为可复现)。
+本目录的补丁 apply 到 **openvela 工作区的三个不同仓库**（`git apply` 的 `cd` 目标
+在每节里写明），先总览一遍：
+
+| 补丁 | `cd` 到 | 目标文件 | 现在还需要吗 |
+|------|---------|---------|-------------|
+| `vendor_sifli-boot-fixes.patch` | `vendor/sifli` | `chips/sf32lb52/{sifli_uart,sifli_irq,sf32lb_flash}.c` | **要**：不修编不过/起不来 |
+| `vendor_sifli-rtc-alarm-fix.patch` | `vendor/sifli` | `chips/sf32lb52/sf32lb_rtc.c` | **要**：不修 RTC alarm 永不触发 |
+| `vendor_sifli-lcd-brightness.patch` | `vendor/sifli` | `boards/sf32lb52/drivers/lcd/sf32lb_lcd.c` | **要**：不修亮度只有 0/100 |
+| `vendor_sifli-usb-rndis.patch` | `vendor/sifli` | `chips/sf32lb52/sf32lb_usbdev.c` | **要**：不修 USB 枚举失败（Code 10） |
+| `nuttx-usbdev-rndis.patch` | `nuttx` | `drivers/usbdev/rndis.c` | **要**：不修 RX 会永久停摆 |
+| `nuttx-usbdev-rndis-nomem.patch` | `nuttx` | `drivers/usbdev/rndis.c` | **要**：不修 -ENOMEM 会把 USB 栈打死（需在上一条之后） |
+| `apps-ai-agent-velaclaw-sdk.patch` | `packages/ai_agent` | `CMakeLists.txt` | **要**：不补 `velaclaw_client_open` 链不上 |
+| `apps-ai-agent-llm-clock-fix.patch` | `packages/ai_agent` | `src/core/agent_loop.c` | **要**：不修 `ask` 永远报超时 |
+| `apps-ai-agent-vela-tls-chunked-end.patch` | `packages/ai_agent` | `src/infra/vela_tls.c` | **要**：不修 chunked 响应卡 120 秒 |
+| `apps-ai-agent-vela-tls-no-block-close.patch` | `packages/ai_agent` | `src/infra/vela_tls.c` | **要**：不修语音永远停在「处理中」（需在上一条之后） |
+| `apps-ai-agent-vela-tls-pool-owner.patch` | `packages/ai_agent` | `src/infra/vela_tls.c` | **要**：不修 TLS 连接池跨 task group 误关 fd（需在前两条之后） |
+
+补丁文件本身是给「上游树被重新 sync 之后要重打」用的场景留的：这三棵树的改动
+**都已经直接改在工作区里、未提交**，所以补丁都能 `git apply --check --reverse` 通过
+（= 和当前工作区逐字对应）。板级（`boards/`）的改动**不再属于这一套**，见下。
+
+## 板级改动不走补丁了（2026-09-15 清理）
+
+原先的 `vendor_sifli-audio-driver.patch` **已删除**。原因是它已经不只是一份
+「陈旧的快照」，而是**会骗人**：
+
+- 它的目标路径是 `boards/sf32lb52/sf32lb52_devkit_lcd/src/...`，而工作区里这个
+  目录是一个**指向本仓库 `board/contest_board` 的软链接**。这不是可有可无的摆设：
+  固件正是从这里取板级源码的 ——
+  `cmake_out/contest2026_233_board_sf32lb52_ai/.config` 里
+  `CONFIG_ARCH_BOARD_CUSTOM_DIR="../vendor/sifli/boards/sf32lb52/sf32lb52_devkit_lcd"`。
+  于是 `git apply` 拒绝穿过软链接，实际报错是：
+
+  ```
+  error: affected file 'boards/sf32lb52/sf32lb52_devkit_lcd/src/sifli_ap.c'
+         is beyond a symbolic link
+  ```
+
+  也就是说**在现在的工作区里它一个字也打不进去**。
+- 更坑的是：在**全新 sync、还没做软链接的上游 vendor 树**里它是能干净 apply 的
+  （已用 `git apply --check` 在 HEAD 的干净副本上验证过）。队友照 README 打完，
+  得到的是那份 1287 行的**旧驱动**，板级也回到旧版本 —— 当前固件里所有音频改动
+  （半双工串行化、`sf32lb52_audio_in.c` 的接入、DMAStop 复核……）全部不在里面，
+  而且 `sifli_ap.c` 会被改回 `CONFIG_LVX_USE_DEMO_CONTEST2026_000_HELLO_APP`
+  那段**永远不会生效的旧自启**。两边的量级差：
+  `sf32lb52_audio.c` 1287 → **2484 行**，`sifli_ap.c` 有 232 行差异，
+  `CMakeLists.txt` 现在多编 6 个板级源文件
+  （`sf32lb52_alarm.c` / `sf32lb52_rtc_alarm.c` / `sf32lb52_audio_in.c` /
+  `sf32lb52_backlight.c` / `sf32lb52_boardbtn.c` / `sf32lb52_status.c`）。
+  只有 `sf32lb52_audio.h` 两边**逐字节相同**，其余都不是「打上去就等价」。
+
+所以：**驱动直接在比赛仓库里改，不再靠补丁**。板级文件的唯一权威版本就是
+`board/contest_board/src/` 下的那些文件；`vendor/sifli/boards/.../<board>` 只是
+指向它的软链接，两边本来就是同一份文件。
+
+> 旧补丁内容仍在 git 历史里（`git show f5ff5ac:patches/vendor_sifli-audio-driver.patch`），
+> 需要考古时再取。
+>
+> 仓库里**已经没有**还在指向这个已删除补丁的地方了：`docs/audio_driver_usage.md`
+> 第 6 节「落地方式」2026-09-15 已改成"板级驱动直接写在 `board/contest_board/src/`、
+> 不要打板级补丁"（并写清 RNDIS 钩子在 `sifli_ap.c:694`，同样是仓库里的代码）。
+>
+> 仓库外还剩两处（不在本仓库里，本轮没动）：`/home/youdian/gen_patches.sh`、
+> `/home/youdian/commit_audio.sh` 是早期一次性脚本，仍写死旧文件名。它们**不是构建步骤、
+> 也不会被自动执行**（全仓没有任何脚本会自动 apply 补丁），但下次手工跑到会报
+> file not found；真要用就把那段删了。
 
 ## vendor_sifli-boot-fixes.patch
 
-让 openvela 在 SF32LB52-DevKit-LCD 上可编译/可启动的 5 处上游修复。
+让 openvela 在 SF32LB52-DevKit-LCD 上可编译/可启动的 3 处上游修复。
+**本补丁只改 `chips/sf32lb52/`，不含任何 `boards/` 文件。**
 
 ### 修复内容
 
 1. `chips/sf32lb52/sifli_uart.c` — `void up_putc()` 中删除非法的 `return ch;`
 2. `chips/sf32lb52/sifli_irq.c` — 补充 `arm_lowprintf` 的 extern 声明(定义在 sifli_start.c)
 3. `chips/sf32lb52/sf32lb_flash.c` — `HAL_FLASH_CONFIG_FULL_AHB_READ` → `HAL_FLASH_CONFIG_AHB_READ`(头文件中正确的函数名)
-4. `boards/.../sf32lb52_devkit_lcd/src/sifli_ap.c` — 补 `sifli_i2cbus_initialize` extern 声明 + `<nuttx/i2c/i2c_master.h>`
-5. `boards/.../sf32lb52_devkit_lcd/src/sifli_ap.c` — 删除错误的 `HAL_PIN_Set(PAD_PA37, I2C1_SCL, ...)`(DevKit-LCD 触摸 I2C1 SCL 应为 PA30,PA37 是 LCD 数据线;正确引脚已在 bsp_pinmux.c 配置)
 
-## vendor_sifli-audio-driver.patch
-
-SF32LB52-DevKit-LCD 音频驱动,注册 `/dev/audio0`(NuttX audio_lowerhalf),支持播放与录音。
-
-### 内容
-
-- 新增 `boards/.../sf32lb52_devkit_lcd/src/sf32lb52_audio.c` / `.h` — audio_lowerhalf 实现
-  (codec 模拟通路 AUDCODEC + 数字通路 AUDPRC TX0/RX0 DMA + AW8155 功放 GPIO)
-- `boards/.../src/CMakeLists.txt` — 加入音频源文件
-- `boards/.../src/sifli_ap.c` — bringup 中调用 `sf32lb52_audio_initialize()`(`CONFIG_AUDIO`)
-
-### 验证
-
-- 板级配置: `CONFIG_AUDIO=y` 等(见 `board/contest_board/configs/sf32lb52_ai/defconfig`)
-- 播放: `audio_test 3000 1000`(1 kHz 3 秒);录音: `audio_test record 3000`
-- 此补丁基于 boot 补丁已应用的状态生成,顺序不可颠倒
+> 早先这里还列过两条 `sifli_ap.c` 的修复（补 `sifli_i2cbus_initialize` extern +
+> `<nuttx/i2c/i2c_master.h>`；删掉误配到触摸 SCL 的 `HAL_PIN_Set(PAD_PA37, I2C1_SCL, ...)`，
+> 触摸 I2C1 是 SCL=PA30/SDA=PA33，由 `bsp_pinmux.c` 配）。
+> 那两条现在**直接写在 `board/contest_board/src/sifli_ap.c` 里**，
+> 既不在本补丁里，也不在任何其它补丁里 —— 想核对就去看那个文件。
 
 ## vendor_sifli-rtc-alarm-fix.patch（2026-09-12 新增，RTC alarm 不触发）
 
@@ -144,18 +194,24 @@ SF32LB52-DevKit-LCD 音频驱动,注册 `/dev/audio0`(NuttX audio_lowerhalf),支
 
 ## 应用方式
 
+三条 `vendor/sifli` 补丁（顺序只为可复现，改的文件互不重叠）：
+
 ```bash
 cd <openvela 工作区>/vendor/sifli
-git apply patches/vendor_sifli-boot-fixes.patch
-git apply patches/vendor_sifli-audio-driver.patch
-git apply patches/vendor_sifli-rtc-alarm-fix.patch
-git apply patches/vendor_sifli-lcd-brightness.patch
+git apply <本仓库>/patches/vendor_sifli-boot-fixes.patch
+git apply <本仓库>/patches/vendor_sifli-rtc-alarm-fix.patch
+git apply <本仓库>/patches/vendor_sifli-lcd-brightness.patch
 ```
+
+打之前先 `git apply --check <补丁>`（或 `--check --reverse` 看是不是已经打过了）。
 
 ## 说明
 
 - 补丁修复/功能均为上游 vendor_sifli 缺口(开启 I2C/DEBUG 等配置后编译必现),建议以团队名义向 [open-vela/vendor_sifli](https://github.com/open-vela/vendor_sifli) 提交 PR
 - 工作区中已直接应用了这些修复(未提交),补丁用于留存/提交/队友复现
+- **`boards/` 下的板级改动不在这里**：`board/contest_board` 是仓库内的文件，
+  `vendor/sifli/boards/.../<board>` 只是指向它的软链接。板级要改就改仓库，
+  不要为它生成补丁（原因见上面「板级改动不走补丁了」）。
 
 ---
 
@@ -210,10 +266,11 @@ USB device 控制器驱动的修复与清理：
 - 删除全部 `up_putc` / `[usbdbg]` 调试打点，以及 EP1..7 的 txmaxp 探测循环
   （那个循环还会把 EP5 的 txmaxp 覆盖成 64）
 
-> 注：`boards/.../src/sifli_ap.c` 里的 RNDIS bring-up 已经包含在
-> `vendor_sifli-audio-driver.patch` 中（该补丁生成时就带上了 RNDIS）。
-> 之后在这个文件上再改的只是删掉几行 `[usbdbg]` 调试打印（纯日志，不影响功能），
-> 以及加了一个 `usleep` 给 app 自启让路。
+> 注：`sifli_ap.c` 里的 RNDIS bring-up（`board_late_initialize()` 里
+> `#ifdef CONFIG_RNDIS` 那段 `usbdev_rndis_initialize()`，MAC `00:e0:4c:53:42:31`）
+> 现在是**比赛仓库里的代码**：`board/contest_board/src/sifli_ap.c:694`。
+> 它以前被裹在 `vendor_sifli-audio-driver.patch` 里，那个补丁已删除
+> （见上面「板级改动不走补丁了」）—— 要核对这段就去读仓库里那个文件。
 
 ## 板级配置（重要）
 
