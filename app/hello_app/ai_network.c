@@ -499,8 +499,10 @@ int ai_network_report_sound_alarm(ai_network_context_t *ctx,
       return -ENOTCONN;
     }
 
-  /* 调用 network_comm 上报异常声音 */
-  return report_abnormal_sound(sound_type, confidence);
+  /* 调用 network_comm 上报异常声音。
+   * 走排队口：本函数被 hello_app 的线程调用（"两轮都没听清就报未确认"），
+   * 直发会打在本组里一个无效/别人的 fd 上（理由见 ai_network_publish_command）。 */
+  return report_abnormal_sound_queued(sound_type, confidence);
 }
 
 /**
@@ -743,8 +745,12 @@ int ai_network_send_alarm(ai_network_context_t *ctx,
       return -ENOTCONN;
     }
 
-  /* 调用 network_comm 上报报警 */
-  return report_alarm(alarm_type, details);
+  /* 调用 network_comm 上报报警。
+   * 走排队口：本函数被 hello_app 的线程调用（紧急追问判定 + 上报警页），
+   * 直发会打在本组里一个无效/别人的 fd 上（理由见 ai_network_publish_command）。
+   * topic（.../alarm）、payload 结构、QoS1 和本地回调/手机推送都由
+   * network_comm 那侧的同一段代码负责，行为不变。 */
+  return report_alarm_queued(alarm_type, details);
 }
 
 /**
@@ -765,8 +771,15 @@ int ai_network_send_device_command(ai_network_context_t *ctx,
       return -ENOTCONN;
     }
 
-  /* 调用 network_comm 发送设备命令 */
-  return send_device_command(device_id, command);
+  /* 调用 network_comm 发送设备命令。
+   * 走排队口：本函数被 hello_app 的线程调用（灯控工具 ai_tools_provider），
+   * 直发必然失败 —— 真机日志里那条
+   *   [意图] 命中灯控: 开灯，但 device_cmd 发送失败(-107)，兜底回话「网络没连上，灯没打开」
+   * 就是这里；而 -107 的直接原因是前面那条 hello_app 的 publish 把 connected
+   * 标成了 false（理由见 ai_network_publish_command）。
+   * topic（.../device_cmd）、payload {"type":"device_command","device_id":...,
+   * "command":...}、QoS1 都不变，只是改由 network_task 那条 socket 发。 */
+  return send_device_command_queued(device_id, command);
 }
 
 /****************************************************************************
@@ -1030,6 +1043,33 @@ int ai_network_start_shared(ai_network_context_t *ctx, const char *client_id)
 
 /**
  * @brief  往 zhi_ai/<client_id>/command 发一条 {action, param}
+ *
+ * ⚠️ 为什么这里必须用 mqtt_publish_queued() 而不是 mqtt_publish()：
+ *
+ * NuttX 的 fd 属于 task group。mqtt_socket 是 robot_ui 的 network_task 建的，
+ * 只存在于那个组的 fd 表里；本函数跑在 **hello_app 的线程**（语音状态机 /
+ * 工具执行）里，拿同一个数字去 send()，要么 EBADF、要么发到本组里恰好占了
+ * 这个编号的别的文件上。
+ *
+ * 真机日志（一轮完整语音之后，网络本身是好的 —— 同一时刻 HTTPS / ASR 都成功、
+ * free 还有 5.4 MB 空闲内存）：
+ *
+ *   MQTT connected
+ *   MQTT publish failed: -1, marked disconnected for reconnect   <- 本条（voice_state）
+ *   MQTT disconnected
+ *   [语音] user_said MQTT 回传失败(-107)（界面已由直调刷过，手机端看不到）: 帮我打开灯。
+ *   [AI_NET ERR] MQTT not connected, cannot send device command
+ *   ...
+ *   MQTT connecting: broker.emqx.io:1883 -> MQTT connected
+ *   Publish to zhi_ai/zhi_ai_001/heartbeat: {...}                <- network_task 自己发，成功
+ *
+ * 判据：**心跳（network_task 自己发）永远成功，凡是 hello_app 线程发起的
+ * （voice_state / user_said / device_cmd）全部失败**。而且第一条失败会把
+ * connected 标成 false（那是 mqtt_publish 里正确的重连逻辑），于是后面几条
+ * 连试都不试，直接 -ENOTCONN(-107) —— 那两行 -107 不是"网络断了"。
+ *
+ * 排队之后这三条走的是同一条已带重连/失败标记的发送路径（network_task 里），
+ * 没有第二套逻辑；topic 名、payload 结构、QoS 一个字节都没改。
  */
 
 int ai_network_publish_command(ai_network_context_t *ctx,
@@ -1062,7 +1102,7 @@ int ai_network_publish_command(ai_network_context_t *ctx,
   snprintf(topic, sizeof(topic), AI_MQTT_TOPIC_COMMAND,
            ai_network_get_client_id(ctx));
 
-  ret = mqtt_publish(topic, payload, 0, false);
+  ret = mqtt_publish_queued(topic, payload, 0, false);
   if (ret < 0)
     {
       ai_network_err("命令下发失败: %s -> %d", topic, ret);

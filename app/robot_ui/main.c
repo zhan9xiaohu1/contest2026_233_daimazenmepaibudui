@@ -1396,6 +1396,50 @@ static void voice_cancel_handler(void *user_data)
     voice_mic_release_if_idle("用户取消了这一轮");
 }
 
+/* 镜像面板底部「提交」：请 hello_app 的 ai_companion 立刻收尾当前这一段录音
+ * （用户原话：「下面是关闭按钮，我希望换成提交按钮」）。
+ *
+ * 语义：老人说完话不用再干等 VAD 那 3 秒静音超时，点一下就把这一段送去识别。
+ * 常开麦 + VAD 自动断句照旧工作，「提交」只是多一个"提前收尾"的入口。
+ *
+ * 两条纪律（都在 app/hello_app/ai_companion_yield.h 里写死了）：
+ *   1) **非阻塞**：ai_companion_voice_submit() 只读一次 hello_app 的状态快照、
+ *      登记一个请求就返回；真正"结束这一段"的动作由 hello_app 自己那条录音线程
+ *      下一帧做（VAD 判"说完了"本来就在那条线程上）。所以本回调里不许等、不许
+ *      碰音频设备 —— 跨 app 同步动设备出过整组死掉的事故；
+ *   2) 本回调在 **LVGL 线程**里被调：这里只有"记一行日志 + 投一句界面文字"，
+ *      touch_ui_set_voice_status() 内部是 lv_async_call，安全（不能直接碰控件）。
+ */
+static void voice_mirror_submit_handler(void *user_data)
+{
+    int ret;
+
+    (void)user_data;
+
+    ret = ai_companion_voice_submit();
+
+    if (ret == AI_COMPANION_SUBMIT_ACCEPTED) {
+        /* 请求登记上了：给一句立刻的反馈。后面 VAD 那一套状态（正在想…/正在
+         * 说话…）会盖掉它，不会留着这句不动的。 */
+        printf("[VoiceChat] 「提交」已登记：等 ai_companion 收尾这一段\n");
+        touch_ui_set_voice_status("好，这就去识别…");
+        return;
+    }
+
+    if (ret == AI_COMPANION_SUBMIT_BUSY) {
+        /* 它正忙（送识别 / 等大模型 / 出声 / 追问流程）：这一下插一脚没有意义，
+         * 界面也**不能**提示"没听到" —— 面板上本来就写着"正在想…/正在说话…"，
+         * 再插一句只会让人以为它坏了。什么都不写，只留日志。 */
+        printf("[VoiceChat] 「提交」不适用：ai_companion 正在处理上一句\n");
+        return;
+    }
+
+    /* NONE：当前没在累积语音（还没听到人说话），请求根本没登记 —— 这时候
+     * 界面要如实说一句，否则老人会以为按钮坏了。不刷屏、不弹窗，就改状态行。 */
+    printf("[VoiceChat] 「提交」：当前没有听到人说话，只在状态行提示\n");
+    touch_ui_set_voice_status("没听到你说什么\n直接说话，说完再点「提交」");
+}
+
 /* ==================== 镜像面板自动弹出 ==================== */
 /*
  * 用户原话：「ai 说话界面交互性太差了，又看不到回复又看不到自己说了什么」。
@@ -1488,6 +1532,32 @@ void robot_ui_bridge_post_status(int status, int face, const char *reply)
 void robot_ui_bridge_panel_autoshow(void)
 {
     voice_mirror_autoshow();
+}
+
+/* ==================== 诊断：把内部状态交给 network_comm 报出去 ==================== */
+/*
+ * 串口线丢了，MQTT 是**唯一**的观测通道。心跳（30 秒一条）和 {"action":"diag"}
+ * 都要报"robot_ui 自己知道的"那几个状态，但它们都是本文件的 static
+ * （g_ai_initialized / g_audio_ctx / 镜像面板），network_comm 够不着，
+ * 所以这里注册一个只读提供者回调（和 network_set_mqtt_callback 那套一样，
+ * 注册一次，之后由它来问）。
+ *
+ * ⚠️ 这个回调跑在 **network_task（MQTT 收包）线程**里：只读几个全局量就返回，
+ *    不许碰 LVGL、不许等设备、不许做网络请求 —— 它一慢，心跳和重连就一起停摆，
+ *    那正是"连唯一的观测通道也没了"。
+ *    这里只有三类读操作，都符合上面的要求：
+ *      g_ai_initialized            —— 本文件的 bool（初始化完成后不再改）；
+ *      audio_is_recording/playing  —— ai_audio 里的纯状态查询（别的线程早就在读它，
+ *                                     见 ambient_busy()）；
+ *      touch_ui_voice_chat_active()—— 头文件里写明可跨线程读（只是个指针判空）。
+ *    取不到/不确定就留 -1：心跳里"不知道"和"没有"是两回事，不能混。
+ */
+static void local_state_probe(local_state_t *out)
+{
+    out->ai_init   = g_ai_initialized ? 1 : 0;
+    out->recording = audio_is_recording(&g_audio_ctx) ? 1 : 0;
+    out->playing   = audio_is_playing(&g_audio_ctx) ? 1 : 0;
+    out->panel     = touch_ui_voice_chat_active() ? 1 : 0;
 }
 
 /* ==================== AI 命令回调处理 ==================== */
@@ -1589,10 +1659,16 @@ static void on_ai_command_received(const char *action, const char *param)
          * touch_ui_set_voice_state() 内部都是 lv_async_call，不能在这里直接碰控件
          * （跨线程改 LVGL 会撞 rendering_in_progress 断言把 app 打死）。
          * 面板没开着时 touch_ui_set_voice_state() 自己是空操作，不用先判断。 */
-        if (strcmp(param, "listening") == 0 || strcmp(param, "speaking") == 0) {
-            /* 「在听」「在说」都说明语音链路正在动：先把镜像面板弹出来，用户才能
-             * 看见识别文字和回复。thinking 不触发（它一定跟在 listening 后面，那
-             * 时面板已经弹了）；idle 也不触发（那是常态待机，弹出来就是骚扰）。
+        if (strcmp(param, "speaking") == 0) {
+            /* ⚠️ **不要**把 "listening" 放进来：hello_app 是开机自启的，它一启动就
+             * 进入"我在听"状态并推一条 listening —— 那样开机第一眼看到的就是语音
+             * 面板，而不是主菜单（用户实测反馈："为什么一开机就是语音聊天页面？
+             * 我希望看到主菜单"）。
+             *
+             * 现在的策略：只在"确实有语音活动"时才弹 ——
+             *   - 用户说的话到了（user_said 分支里那处 autoshow）→ 弹出并显示"你说：…"
+             *   - 机器人正在回话（speaking）→ 弹出并显示回复
+             * "thinking" 也不必触发（识别一出来就会先走 user_said 那处）。
              * 抑制规则见 voice_mirror_autoshow() 上面的说明。 */
             voice_mirror_autoshow();
         }
@@ -1613,6 +1689,31 @@ static void on_ai_command_received(const char *action, const char *param)
             /* 不认识的状态不改界面：宁可少刷一次，也不要把面板停在一个错的字上 */
             printf("[AI] voice_state 不认识的状态: %s\n", param);
         }
+    }
+    else if (strcmp(action, "diag") == 0 || strcmp(action, "voice_diag") == 0) {
+        /* 诊断入口：从 PC 往 zhi_ai/<client_id>/command 发
+         *   {"action":"diag"}        （voice_diag 是等价别名，两个都认）
+         * 板子立刻回一条完整快照到 zhi_ai/<client_id>/status（QoS0、不 retain）：
+         *   {"type":"diag","device_id":"zhi_ai_001","timestamp":...,"uptime":...,
+         *    "robot":{"ai_init":1,"rec":0,"play":0,"panel":0,"tasks":27,
+         *             "mqtt":true,"broker":"broker.emqx.io","mqtt_fails":0,
+         *             "broker_switches":0},
+         *    "hello":{"..."}}          <- hello_app 那一份，原样内嵌
+         *    "hello":"unavailable"     <- hello_app 没在跑（这就是最有价值的证据）
+         *
+         * 为什么值一个动作：串口线丢了之后这是唯一一条"能问板子内部"的路。
+         * hello_app 的语音链路哑掉时它自己那条 MQTT 上报是死的，光看心跳只能
+         * 从 ha 位看出"它没了"，问 diag 才能把它自己报的状态整份拿出来。
+         *
+         * 组装和发布都在 network_comm 的 report_diag() 里（那边才看得见 broker、
+         * 连续失败计数、任务数；hello_app 的快照也在那边取，心跳要用同一份判断）。
+         * 本回调跑在 network_task 线程里，而 mqtt_publish 用的正是这个任务自己的
+         * socket —— 同任务调用，不涉及跨任务抢 fd（见 network_comm.c 里
+         * mqtt_publish 那段说明：跨任务 close/send 会把整机打复位）。 */
+        int ret = report_diag();
+
+        printf("[Diag] 收到诊断请求（action=%s）：报告%s发出 ret=%d\n",
+               action, (ret < 0) ? "未能" : "已", ret);
     }
     else if (strcmp(action, "start_remind") == 0) {
         /* 开始提醒 */
@@ -1721,7 +1822,7 @@ static void sound_alarm_callback(sound_type_t type, float confidence, void *user
 
     /* 触发报警（投递到 LVGL 线程建报警页） */
     ui_post_alarm(type_name);
-    report_alarm(type_name, "Abnormal sound detected");
+    report_alarm_queued(type_name, "Abnormal sound detected");
 
     /* 通知状态机 */
     sm_handle_event(&g_sm_ctx, SM_EVENT_ALARM_DETECTED);
@@ -1902,7 +2003,7 @@ static void emergency_call_handler(void *user_data)
     printf("[Emergency] Sending emergency alarm\n");
 
     /* MQTT 上报 */
-    report_alarm("emergency", "老人按下紧急呼叫按钮");
+    report_alarm_queued("emergency", "老人按下紧急呼叫按钮");
 
     /* 手机推送 */
     push_send_alarm("emergency", "老人按下紧急呼叫按钮，请立即查看！");
@@ -2891,6 +2992,10 @@ int main(int argc, char *argv[])
     /* ===== 注册回调函数 ===== */
     network_set_mqtt_callback(on_mqtt_message_received);
     network_set_ai_command_callback(on_ai_command_received);
+    /* 心跳/诊断要报 robot_ui 自己的状态（AI 就绪、录音、放音、镜像面板），
+     * 而那几个量只有本文件看得见 —— 注册一个只读回调给 network_comm 来问
+     * （跑在 network_task 线程里，只读全局量，见 local_state_probe 的说明）。 */
+    network_set_local_state_provider(local_state_probe);
 
     /* ===== 初始化 AI 模块 (成员二) ===== */
     printf("Initializing AI modules...\n");
@@ -3000,6 +3105,9 @@ int main(int argc, char *argv[])
     /* 语音聊天弹窗的两个出口：提交 -> 工作线程跑 ASR→LLM→TTS；× -> 停录音丢缓冲 */
     touch_ui_set_voice_submit_cb(voice_submit_handler, NULL);
     touch_ui_set_voice_cancel_cb(voice_cancel_handler, NULL);
+    /* 镜像面板（常开麦那一套的显示器）底部的「提交」：只转发一次"请立刻收尾
+     * 这一段"给 hello_app，不起线程、不碰音频设备（见 voice_mirror_submit_handler）。 */
+    touch_ui_set_voice_mirror_submit_cb(voice_mirror_submit_handler, NULL);
 
     /* ===== 注册提醒的到点回调 ===== */
     /* 必须在添加提醒之前注册：注册完下面 touch_ui_add_reminder() 会立刻

@@ -735,9 +735,16 @@ void robot_ui_show_alarm(const char *content)
     /* ③ 上报：MQTT 发到 zhi_ai/<client_id>/alarm（+ 手机推送）。
      * 以前这里没接，所以按了报警按钮只响、不上报；补上这一句
      * 才算"响 + 屏幕 + 上报 + 推送"四个动作齐全。
-     * 注意 report_alarm() 不阻塞（MQTT 没连上时它内部会很快失败返回）。 */
+     *
+     * ⚠️ 必须用 **report_alarm_queued()**，不能用 report_alarm()：
+     * 这里跑在 **LVGL 线程**（报警按钮的回调），而 MQTT socket 的 fd 属于
+     * robot_ui 的 network_task —— 跨 task group 直接 send() 那个 fd 号必然失败
+     * （真机日志：`[ALARM] report_alarm type=ui … ret=-1` 后面紧跟着
+     * `MQTT publish failed: -1`，而同一时刻 net_task 的心跳是成功的）。
+     * 排队版本只把消息拷进队列、由 network_task 去发，可从任意线程调。
+     * 详情见 network_comm.h 里 mqtt_publish_queued() 的说明。 */
     {
-        int rret = report_alarm("ui", "用户按下报警按钮");
+        int rret = report_alarm_queued("ui", "用户按下报警按钮");
         if (rret < 0) {
             printf("robot_ui: report_alarm failed: %d（MQTT 没连上？）\n", rret);
         }

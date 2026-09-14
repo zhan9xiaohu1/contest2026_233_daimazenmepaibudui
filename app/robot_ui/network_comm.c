@@ -34,6 +34,24 @@
  * 这里只负责把 MQTT 连接状态喂进去，供 hw_test status / UI 统一查询。 */
 #include "sf32lb52_status.h"
 
+/* hello_app 的语音链路诊断接口（app/hello_app/ai_companion_diag.h）：
+ *   int ai_companion_diag_snapshot(char *buf, size_t len);  返回写入长度，<0=不可用
+ * 头文件路径由 app/robot_ui/CMakeLists.txt 的 INCLUDE_DIRECTORIES `../hello_app`
+ * 提供（robot_ui 早就在反向调 hello_app：ai_companion_yield.h / mimo_voice.h）。
+ * 符号在最终链接时解析（整机是单一大镜像）。
+ *
+ * 为什么在这里用：串口线丢了之后，MQTT 是**唯一**的观测通道，而 hello_app 的
+ * 语音链路哑掉时它自己的 MQTT 上报是死的（被 g_net_started 钉死）。心跳里的
+ * 那个 ha 位、以及 {"action":"diag"} 里内嵌的 hello 块，都只能靠这个接口问出来；
+ * 它返回负值这件事本身就是"hello_app 没在跑"的证据。 */
+#include "ai_companion_diag.h"
+
+/* nxsched_foreach()：诊断里报"ps 里有多少个任务/线程"。
+ * 它把每个 TCB 交给回调，内部短暂进出临界区（普通任务里可以调，别在中断里调）。
+ * 这是在数"hello_app 的几条线程还在不在"的粗粒度证据 —— 出过的那次事故就是
+ * hello_app 组里的 pthread 全没了，而外面完全看不出来。 */
+#include <nuttx/sched.h>
+
 /* cJSON 用于 JSON 解析 */
 #include <netutils/cJSON.h>
 
@@ -58,6 +76,22 @@ static device_status_t device_status = {0};
 
 /* MQTT 连接 socket */
 static int mqtt_socket = -1;
+
+/* MQTT 连续连接失败次数 + 已经换过几次 broker（降级）。
+ *
+ * 这两个原来是 network_task() 里的局部变量，模块外一个字节都看不到，于是
+ * "连了几次没连上、换没换过台"这种现场只能靠串口日志猜 —— 串口线丢了之后
+ * 就彻底是黑盒。提升成静态量（network_task 里只管加/清零），心跳和诊断报文
+ * 才报得出来，外部也能用 mqtt_get_fails() 读。
+ *
+ * 只由 network_task 写、别的线程读：32 位对齐的 int 在这颗 Cortex-M 上是
+ * 原子读写，观测用的计数不需要额外加锁。 */
+static int g_mqtt_fails = 0;
+static int g_mqtt_broker_switches = 0;
+
+/* robot_ui 本地状态的提供者（main.c 启动时注册，见 network_set_local_state_provider）。
+ * NULL = 没注册，诊断/心跳里那几个字段一律报 -1（"取不到"），不编造。 */
+static local_state_provider_t g_local_state_provider = NULL;
 
 /* 回调函数 */
 static mqtt_msg_callback_t mqtt_callback = NULL;
@@ -432,6 +466,12 @@ bool mqtt_is_connected(void)
     return mqtt_config.connected;
 }
 
+/* 连续连接失败次数（只读）。见 g_mqtt_fails 上面的说明。 */
+int mqtt_get_fails(void)
+{
+    return g_mqtt_fails;
+}
+
 /* ==================== MQTT 订阅 ==================== */
 int mqtt_subscribe(const char *topic, int qos)
 {
@@ -489,6 +529,243 @@ int mqtt_publish(const char *topic, const char *payload, int qos, bool retain)
     return ret;
 }
 
+/* ==================== MQTT 排队发布（跨任务组唯一安全的发布方式） ==================== */
+/*
+ * 为什么必须排队、不能在自己的线程里直接 mqtt_send_publish()：
+ *
+ * NuttX 的 fd 是**按 task group 分配的**。mqtt_socket 是 network_task 建出来的，
+ * 只存在于它那个组的 fd 表里。hello_app 的任务组里那个数字要么压根不存在
+ * （EBADF），要么指向它自己打开过的别的文件 —— 两种都是"往错误的 fd 上 send"。
+ *
+ * 真机日志（一轮完整语音之后，网络本身完全正常：同一时刻 HTTPS / ASR 都成功、
+ * free 还有 5.4 MB 空闲内存）：
+ *
+ *   MQTT connecting: broker.emqx.io:1883
+ *   MQTT DNS: broker.emqx.io -> 44.232.241.40
+ *   MQTT connected
+ *   [MQTT] connected broker=broker.emqx.io:1883
+ *   MQTT publish failed: -1, marked disconnected for reconnect   <- hello_app 那条
+ *   MQTT disconnected
+ *   [语音] user_said MQTT 回传失败(-107)（界面已由直调刷过，手机端看不到）: 帮我打开灯。
+ *   [AI_NET ERR] MQTT not connected, cannot send device command
+ *   [意图] 命中灯控: 开灯，但 device_cmd 发送失败(-107)，兜底回话「网络没连上，灯没打开」
+ *   ...
+ *   MQTT connecting: broker.emqx.io:1883 -> MQTT connected
+ *   Publish to zhi_ai/zhi_ai_001/heartbeat: {...}                <- network_task 自己发，成功
+ *
+ * 判据非常干净：**心跳（network_task 自己发）永远成功，凡是 hello_app 线程
+ * 发起的（voice_state / user_said / device_cmd）全部失败**。
+ * 而且第一条失败还会把 connected 标成 false（那是 mqtt_publish 里正确的重连
+ * 逻辑），于是 hello_app 后面几条连试都不试，直接 -ENOTCONN(-107) ——
+ * 日志里那两行 -107 就是这么来的，不是"网络断了"。
+ *
+ * 所以这一节只做两件事：把 topic + payload **拷进队列**，再给 network_task
+ * 一个信号。一个字节的 socket 操作都不做（连"现在连没连上"都不判 —— 那是
+ * 真正发送那一刻的事）。真正的发送由 network_task 在它自己的循环里取出来做，
+ * 用的是原来那条已经带重连 / 失败标记的路径，这里不另写第二套。
+ */
+
+#define MQTT_QUEUE_SLOTS        8      /* 槽位数。满了丢新来的：这些都是"此刻状态"，
+                                        * 旧消息过了这一拍就没价值了。 */
+#define MQTT_QUEUE_TOPIC_MAX    128    /* 装得下 zhi_ai/<client_id>/device_state 这类 */
+#define MQTT_QUEUE_PAYLOAD_MAX  640    /* 比 ai_network.c 能拼出的最长载荷（约 576）宽一点，
+                                        * 正常路径不会截断；topic + payload 也远小于
+                                        * mqtt_send_publish() 的 1024 字节包缓冲。 */
+
+typedef struct
+{
+    char topic[MQTT_QUEUE_TOPIC_MAX];
+    char payload[MQTT_QUEUE_PAYLOAD_MAX];
+    int  qos;
+    bool retain;
+} mqtt_queue_item_t;
+
+static mqtt_queue_item_t g_mqtt_queue[MQTT_QUEUE_SLOTS];
+static int g_mqtt_queue_head = 0;    /* 取的位置 */
+static int g_mqtt_queue_tail = 0;    /* 放的位置 */
+static int g_mqtt_queue_count = 0;
+
+/* 队列锁：只保护上面那三个下标和槽里的字节，**绝不可以在持锁时做 socket 操作**。
+ *
+ * 用 PTHREAD_MUTEX_INITIALIZER（和本文件推送队列 g_push_job_lock 同一个写法）：
+ * 静态初始化过的 pthread_mutex 在 NuttX task 和 pthread 之间都能用，
+ * 而本文件那个推送队列早就被 net_task 和 LVGL 线程同时锁过了（真机跑通的）。
+ * 出过事的是"忘了初始化、.bss 全 0 就当互斥量用"，那才会撞 NXSEM_IS_MUTEX 断言。 */
+static pthread_mutex_t g_mqtt_queue_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* 生产者 -> network_task 的唤醒信号。
+ * 只是"有货了"的提示：network_task 的分片睡眠里 trywait 到就提前结束这一觉，
+ * 所以消息最迟 10ms 被取走（不靠它做互斥，也就不怕丢信号）。 */
+static sem_t g_mqtt_queue_sem;
+static bool  g_mqtt_queue_sem_ready = false;
+
+/* 取出时的落地副本。
+ * 用 static 而不是 network_task 的栈：那个任务的栈只有 12 KB，而它这一路还要
+ * 走 report_diag()（里面要装 hello_app 快照），能省一点是一点。
+ * 只有 network_task 会取消息，所以不存在两个取者抢这份副本。 */
+static mqtt_queue_item_t g_mqtt_queue_drain_item;
+
+/* 丢弃计数 + 日志节流时刻。队列满和"MQTT 没连上整队丢"分开计，
+ * 现场看日志一眼就能分清是"发得太快"还是"根本没连上"。 */
+static unsigned g_mqtt_queue_drop_full = 0;
+static unsigned g_mqtt_queue_drop_nolink = 0;
+static time_t   g_mqtt_queue_drop_log_at = 0;
+
+/* 必须在持 g_mqtt_queue_lock 时调：懒初始化唤醒信号。
+ * 静态 sem_t 全 0 本来就是"计数 0"的合法初值，这里显式初始化一次只是
+ * 让它和本文件其它信号量（g_push_job_sem）的写法一致、也免得以后有人改坏。 */
+static void mqtt_queue_sem_ensure(void)
+{
+    if (!g_mqtt_queue_sem_ready) {
+        sem_init(&g_mqtt_queue_sem, 0, 0);
+        g_mqtt_queue_sem_ready = true;
+    }
+}
+
+/* 队列里还有几条（只给日志用，读一个 int 就行） */
+static int mqtt_queue_count_read(void)
+{
+    int n;
+
+    pthread_mutex_lock(&g_mqtt_queue_lock);
+    n = g_mqtt_queue_count;
+    pthread_mutex_unlock(&g_mqtt_queue_lock);
+
+    return n;
+}
+
+int mqtt_publish_queued(const char *topic, const char *payload, int qos, bool retain)
+{
+    const char *t = (topic != NULL) ? topic : "";
+    const char *p = (payload != NULL) ? payload : "";
+    size_t tlen;
+    size_t plen;
+    bool cut = false;
+
+    if (t[0] == '\0') {
+        printf("[MQTTQ] 拒绝入队：topic 为空\n");
+        return -EINVAL;
+    }
+
+    tlen = strlen(t);
+    plen = strlen(p);
+
+    /* 超长就截断，但**必须**说出来：静默丢内容在现场是查不出来的
+     * （这条纪律和 mqtt_send_publish 里那道长度检查是同一个理由）。 */
+    if (tlen > MQTT_QUEUE_TOPIC_MAX - 1) {
+        tlen = MQTT_QUEUE_TOPIC_MAX - 1;
+        cut = true;
+    }
+    if (plen > MQTT_QUEUE_PAYLOAD_MAX - 1) {
+        plen = MQTT_QUEUE_PAYLOAD_MAX - 1;
+        cut = true;
+    }
+    if (cut) {
+        printf("[MQTTQ] 载荷超长已截断: topic %u->%u 字节, payload %u->%u 字节\n",
+               (unsigned)strlen(t), (unsigned)tlen,
+               (unsigned)strlen(p), (unsigned)plen);
+    }
+
+    pthread_mutex_lock(&g_mqtt_queue_lock);
+    mqtt_queue_sem_ensure();
+
+    if (g_mqtt_queue_count >= MQTT_QUEUE_SLOTS) {
+        time_t now;
+
+        g_mqtt_queue_drop_full++;
+
+        /* 节流：一秒最多打一条。这里已经被别的任务拿它当高频入口了
+         * （voice_state 每变一次就来一条），不节流会把串口刷爆。 */
+        now = time(NULL);
+        if (now != g_mqtt_queue_drop_log_at) {
+            g_mqtt_queue_drop_log_at = now;
+            printf("[MQTTQ] 队列满(%d 槽)，本条丢弃: topic=%s（累计丢 %u 条）\n",
+                   MQTT_QUEUE_SLOTS, t, g_mqtt_queue_drop_full);
+        }
+
+        pthread_mutex_unlock(&g_mqtt_queue_lock);
+        return -ENOSPC;
+    }
+
+    {
+        mqtt_queue_item_t *slot = &g_mqtt_queue[g_mqtt_queue_tail];
+
+        memcpy(slot->topic, t, tlen);
+        slot->topic[tlen] = '\0';
+        memcpy(slot->payload, p, plen);
+        slot->payload[plen] = '\0';
+        slot->qos = qos;
+        slot->retain = retain;
+
+        g_mqtt_queue_tail = (g_mqtt_queue_tail + 1) % MQTT_QUEUE_SLOTS;
+        g_mqtt_queue_count++;
+    }
+
+    pthread_mutex_unlock(&g_mqtt_queue_lock);
+
+    /* 出锁之后再唤醒：signalling 跟队列本身没有关系，也没必要占着锁。 */
+    sem_post(&g_mqtt_queue_sem);
+
+    return OK;
+}
+
+/* 取一条出来（0 = 取到，-1 = 队列空）。
+ * 交出去的是一份**拷贝**，槽位立刻释放 —— 所以绝不能把槽位指针传到外面去。 */
+static int mqtt_queue_pop(mqtt_queue_item_t *out)
+{
+    int ret = -1;
+
+    pthread_mutex_lock(&g_mqtt_queue_lock);
+
+    if (g_mqtt_queue_count > 0) {
+        *out = g_mqtt_queue[g_mqtt_queue_head];
+        g_mqtt_queue_head = (g_mqtt_queue_head + 1) % MQTT_QUEUE_SLOTS;
+        g_mqtt_queue_count--;
+        ret = 0;
+    }
+
+    pthread_mutex_unlock(&g_mqtt_queue_lock);
+
+    return ret;
+}
+
+/* 每拍搬一次队。**只有 network_task 调**（它是 mqtt_socket 的拥有者）。
+ *
+ * 取一条、立刻出锁、再发 —— 持锁期间只碰队列里的字节，绝不 send()。
+ * MQTT 没连上时整队丢掉：留着它们会一直占满 8 个槽（新消息全被拒），
+ * 而且重连之后会把一堆过期状态一次性冲出去（界面会闪回旧状态）。 */
+static void mqtt_queue_drain(void)
+{
+    int sent = 0;
+
+    while (sent < MQTT_QUEUE_SLOTS && mqtt_queue_pop(&g_mqtt_queue_drain_item) == 0) {
+        if (!mqtt_config.connected) {
+            g_mqtt_queue_drop_nolink++;
+            if (g_mqtt_queue_drop_nolink == 1 ||
+                (g_mqtt_queue_drop_nolink % 32) == 0) {
+                printf("[MQTTQ] MQTT 未连接，丢弃排队消息（累计丢 %u 条）\n",
+                       g_mqtt_queue_drop_nolink);
+            }
+            continue;
+        }
+
+        {
+            int ret = mqtt_publish(g_mqtt_queue_drain_item.topic,
+                                   g_mqtt_queue_drain_item.payload,
+                                   g_mqtt_queue_drain_item.qos,
+                                   g_mqtt_queue_drain_item.retain);
+
+            /* 这一行就是"排队这条路通了"的验收证据：它前面紧跟着
+             * mqtt_publish 自己打的 "Publish to <topic>: <payload>"。 */
+            printf("[MQTTQ] 队列发出: topic=%s qos=%d ret=%d（队列剩 %d 条）\n",
+                   g_mqtt_queue_drain_item.topic,
+                   g_mqtt_queue_drain_item.qos, ret, mqtt_queue_count_read());
+        }
+
+        sent++;
+    }
+}
+
 /* ==================== 上报设备状态 ==================== */
 int report_device_status(const device_status_t *status)
 {
@@ -507,9 +784,15 @@ int report_device_status(const device_status_t *status)
 }
 
 /* ==================== 上报报警 ==================== */
-int report_alarm(const char *alarm_type, const char *details)
+/* queued=false：直接发。**调用者必须是 network_task 那个 task group**
+ * （只有它手里有 mqtt_socket），robot_ui 收包回调 / 心跳那条路走的就是它。
+ * queued=true ：拷进队列，交给 network_task 发。给 hello_app 的线程用
+ * （见 mqtt_publish_queued() 上面那段真机日志）。
+ * 两种走法除发布方式外完全一致：同 topic、同 payload、同 QoS、同本地回调 + 推送。 */
+static int alarm_publish(const char *alarm_type, const char *details, bool queued)
 {
     char topic[128];
+
     snprintf(topic, sizeof(topic), "zhi_ai/%s/alarm", mqtt_config.client_id);
 
     /* 构建报警 JSON */
@@ -527,7 +810,8 @@ int report_alarm(const char *alarm_type, const char *details)
     }
 
     /* 发布报警消息（QoS 1，确保送达） */
-    int ret = mqtt_publish(topic, json, 1, false);
+    int ret = queued ? mqtt_publish_queued(topic, json, 1, false)
+                     : mqtt_publish(topic, json, 1, false);
     free(json);
 
     /* 这一行是特意加出来给人看的：原来这里完全静默，串口上看不出它到底跑没跑、
@@ -547,16 +831,227 @@ int report_alarm(const char *alarm_type, const char *details)
     return ret;
 }
 
+int report_alarm(const char *alarm_type, const char *details)
+{
+    return alarm_publish(alarm_type, details, false);
+}
+
+int report_alarm_queued(const char *alarm_type, const char *details)
+{
+    return alarm_publish(alarm_type, details, true);
+}
+
+/* ==================== 诊断：把板子内部状态从 MQTT 捞出来 ==================== */
+/*
+ * 背景：**串口线丢了**，MQTT 是唯一的观测通道。而这次故障最难的地方是
+ * "hello_app 的语音链路哑了，但从外面看不出来"——它自己的 MQTT 上报被
+ * g_net_started 钉死，心跳和 light_on 都是 robot_ui 干的活，证明不了它活着。
+ *
+ * 所以这一节做两件事：
+ *   1) 心跳（每 30 秒一次、已经被证明可靠）里加几个状态字段 —— 长期观测面；
+ *   2) {"action":"diag"} 动作（main.c 那边分发）立刻回一条完整快照 —— 现场取证。
+ *
+ * 快照分三块，各由"知道它的人"提供：
+ *   robot —— robot_ui 自己的（AI 初始化 / 录音 / 放音 / 面板），由 main.c 注册的
+ *            提供者回调给；
+ *   net   —— 本文件知道的（broker、连接状态、连续失败次数、uptime、任务数）；
+ *   hello —— hello_app 自己的（ai_companion_diag_snapshot 原样内嵌；拿不到就是
+ *            "unavailable"，而"拿不到"恰恰是最有价值的证据）。
+ *
+ * 纪律：取状态不许阻塞、不许引入失败 —— 拿不到就写 -1/"unavailable"，
+ * 绝不能因为某个字段取不到而让心跳或诊断本身发不出去。
+ */
+
+void network_set_local_state_provider(local_state_provider_t provider)
+{
+    g_local_state_provider = provider;
+}
+
+/* 问一次 robot_ui 那侧的状态。没有提供者就不覆盖，四个字段留在 -1。 */
+static void diag_local_state(local_state_t *out)
+{
+    out->ai_init   = -1;
+    out->recording = -1;
+    out->playing   = -1;
+    out->panel     = -1;
+
+    if (g_local_state_provider != NULL) {
+        g_local_state_provider(out);
+    }
+}
+
+/* hello_app 的语音诊断接口在不在？>=0 = 它在跑并交了快照，<0 = 不可用。
+ * 心跳里只留一个 bit（ha），所以这里不要完整快照，给个够用的缓冲、内容丢掉。
+ * 缓冲不给太小：快照按字段拼长度，万一实现是"装不下就报错"的那种，
+ * 缓冲过小会把"hello_app 活着"误报成不可用，那比不报还糟。 */
+static bool hello_diag_available(void)
+{
+    char buf[128];
+
+    return ai_companion_diag_snapshot(buf, sizeof(buf)) >= 0;
+}
+
+/* 开机到现在的秒数。用 CLOCK_MONOTONIC 而不是 time()：后者会因为开机对时而
+ * 跳变（板子没有备份电池，上电时间从 2000 年开始，对时之后直接跳），
+ * uptime 要的是"这次开机跑了多久"，正好用来区分"板子重启过"和"一直没动过"。
+ * 取不到就报 -1：这只是观测信息，绝不能让心跳/诊断因此失败。 */
+static long diag_uptime_sec(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return -1;
+    }
+
+    return (long)ts.tv_sec;
+}
+
+/* 数一下现在有多少个任务/线程（就是 ps 里的行数）。 */
+static void diag_task_count_cb(FAR struct tcb_s *tcb, FAR void *arg)
+{
+    (void)tcb;
+    (*(int *)arg)++;
+}
+
+static int diag_task_count(void)
+{
+    int n = 0;
+
+    nxsched_foreach(diag_task_count_cb, &n);
+    return n;
+}
+
+/* 内嵌 hello_app 快照的上限。整条载荷最后要塞进 mqtt_send_publish() 那个
+ * 1024 字节的固定包缓冲（topic 最长 77 + 固定头），快照不能无限大。 */
+#define DIAG_HELLO_MAX    512
+
+/* 快照不能当对象内嵌、只能当字符串贴出来时的上限。
+ * 为什么必须截：cJSON 会把引号/反斜杠转义成两个字节，不截的话一条 512 字节的
+ * 快照最坏能顶出 1 KB，把整条报文顶出上面那个包缓冲。300 字节最坏转义成 600，
+ * 加上 robot 和外壳仍在安全范围内。截掉多少由 hello_len 说明（见 diag_build_payload）。 */
+#define DIAG_HELLO_STR_MAX 300
+
+/* 整条载荷的上限：超过就退化成"不内嵌快照"的短版本。宁可用一条短回复说明
+ * "快照太长"，也不要发一条被截断成非法 JSON 出去 —— 对端解析不了就全丢了。 */
+#define DIAG_PAYLOAD_MAX  900
+
+/* 组一条 diag 载荷。
+ *   hello/hello_len: hello_app 的快照（hello_len < 0 = 不可用）
+ *   skip_hello     : true = 不内嵌内容，只报长度（快照太长时的退路）
+ * 无论哪条路，返回的都是**合法 JSON 的字符串**（堆上，调用方 free）：
+ * 快照解析不了（被截断 / 不是合法对象）时按字符串贴出来，cJSON 负责转义。 */
+static char *diag_build_payload(const char *hello, int hello_len, bool skip_hello)
+{
+    local_state_t st;
+    cJSON *root;
+    cJSON *robot;
+    cJSON *item;
+    char *json;
+
+    diag_local_state(&st);
+
+    root = cJSON_CreateObject();
+    if (root == NULL) {
+        return NULL;
+    }
+
+    cJSON_AddStringToObject(root, "type", "diag");
+    cJSON_AddStringToObject(root, "device_id", mqtt_config.client_id);
+    cJSON_AddNumberToObject(root, "timestamp", (double)time(NULL));
+    cJSON_AddNumberToObject(root, "uptime", (double)diag_uptime_sec());
+
+    robot = cJSON_CreateObject();
+    if (robot == NULL) {
+        cJSON_Delete(root);
+        return NULL;
+    }
+
+    cJSON_AddNumberToObject(robot, "ai_init", st.ai_init);
+    cJSON_AddNumberToObject(robot, "rec", st.recording);
+    cJSON_AddNumberToObject(robot, "play", st.playing);
+    cJSON_AddNumberToObject(robot, "panel", st.panel);
+    cJSON_AddNumberToObject(robot, "tasks", diag_task_count());
+    cJSON_AddBoolToObject(robot, "mqtt", mqtt_config.connected);
+    cJSON_AddStringToObject(robot, "broker", mqtt_config.broker);
+    cJSON_AddNumberToObject(robot, "mqtt_fails", g_mqtt_fails);
+    cJSON_AddNumberToObject(robot, "broker_switches", g_mqtt_broker_switches);
+    cJSON_AddItemToObject(root, "robot", robot);
+
+    if (skip_hello && hello_len > 0) {
+        /* 上一次组装出来太长（见 report_diag）：这一次一个字节内容都不内嵌，
+         * 只说快照有多长。这一路是保底 —— 保证对端至少能收到 robot 那一块。 */
+        cJSON_AddStringToObject(root, "hello", "too_long");
+        cJSON_AddNumberToObject(root, "hello_len", hello_len);
+    } else if (hello_len < 0) {
+        /* <0 = hello_app 没在跑（接口取不到），这是最该报出来的一条证据，原样说 */
+        cJSON_AddStringToObject(root, "hello", "unavailable");
+    } else if (hello_len == 0) {
+        /* 接口答了但什么都没写。**不能**当成 unavailable：那是对 hello_app
+         * 状态的另一种断言（"它没在跑"），而这里并不知道这件事 —— 观测报文宁可
+         * 说"没内容"，也不要编一个结论出来。 */
+        cJSON_AddStringToObject(root, "hello", "empty");
+    } else {
+        item = cJSON_Parse(hello);
+        if (item != NULL && cJSON_IsObject(item)) {
+            cJSON_AddItemToObject(root, "hello", item);   /* 正常：对象原样内嵌 */
+        } else {
+            char cut[DIAG_HELLO_STR_MAX + 1];
+            int  n = (hello_len > DIAG_HELLO_STR_MAX) ? DIAG_HELLO_STR_MAX
+                                                      : hello_len;
+
+            /* 解析不成对象（被截断的片段 / 接口报的不是对象）：原样贴出来，
+             * 现场才有东西可看。但要按 DIAG_HELLO_STR_MAX 截一刀，
+             * 理由见那个宏的说明。截掉多少由 hello_len 说明。 */
+            if (item != NULL) {
+                cJSON_Delete(item);
+            }
+
+            memcpy(cut, hello, n);
+            cut[n] = '\0';
+            cJSON_AddStringToObject(root, "hello", cut);
+
+            if (n < hello_len) {
+                cJSON_AddNumberToObject(root, "hello_len", hello_len);
+            }
+        }
+    }
+
+    json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    return json;
+}
+
 /* ==================== 上报心跳 ==================== */
 int report_heartbeat(void)
 {
     char topic[128];
+    local_state_t st;
+
     snprintf(topic, sizeof(topic), "zhi_ai/%s/heartbeat", mqtt_config.client_id);
+
+    /* 把所有要报的状态先读齐（读不到的字段自己会留 -1），再建 JSON：
+     * 中途不碰任何可能阻塞的东西，见本节头上的纪律。 */
+    diag_local_state(&st);
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "type", "heartbeat");
     cJSON_AddStringToObject(root, "device_id", mqtt_config.client_id);
     cJSON_AddNumberToObject(root, "timestamp", (double)time(NULL));
+
+    /* 心跳是长期观测面（30 秒一条、且已经证明可靠），所以状态字段挂在这里。
+     * 全部是当场读的廉价量，一个都不去等设备/等网络：
+     *   ha           hello_app 的语音诊断接口还在不在（= 它还在跑）。1/0。
+     *   rec/play/panel  robot_ui 自己：在录音 / 在放音 / 镜像面板开着。1/0/-1。
+     *   mqtt_fails   连续连接失败次数（这个字段本身在 MQTT 连着的时候才有意义，
+     *                它一直涨说明"连上了又被踢"，也是现场常见的那种）。
+     *   uptime       开机秒数，用来区分"板子重启过"和"一直是同一次开机"。
+     * 取不到就写 -1，绝不为了凑齐字段而等待。 */
+    cJSON_AddNumberToObject(root, "ha", hello_diag_available() ? 1 : 0);
+    cJSON_AddNumberToObject(root, "rec", st.recording);
+    cJSON_AddNumberToObject(root, "play", st.playing);
+    cJSON_AddNumberToObject(root, "panel", st.panel);
+    cJSON_AddNumberToObject(root, "mqtt_fails", g_mqtt_fails);
+    cJSON_AddNumberToObject(root, "uptime", (double)diag_uptime_sec());
 
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -568,6 +1063,69 @@ int report_heartbeat(void)
     int ret = mqtt_publish(topic, json, 0, false);
     free(json);
 
+    return ret;
+}
+
+/* ==================== 上报完整诊断快照（{"action":"diag"}） ==================== */
+int report_diag(void)
+{
+    char topic[128];
+    char hello[DIAG_HELLO_MAX];
+    char *json;
+    int hlen;
+    int ret;
+
+    /* 1) 先问 hello_app 要它那一份。返回负值 = 它没在跑 / 接口取不到 ——
+     *    这个结论本身就照原样报出去（"hello":"unavailable"），不要吞掉。 */
+    hlen = ai_companion_diag_snapshot(hello, sizeof(hello));
+
+    /* 防守：接口承诺"返回写入长度"，但真写满时不保证有结尾的 '\0'，
+     * 而下面要把它当字符串解析/输出，所以这里夹一下长度再自己收尾。
+     * 夹完 hlen <= sizeof(hello) - 1，hello[hlen] 一定在数组内。 */
+    if (hlen > (int)sizeof(hello) - 1) {
+        hlen = (int)sizeof(hello) - 1;
+    }
+    if (hlen > 0) {
+        hello[hlen] = '\0';
+    }
+
+    /* 2) 组装。太长（hello_app 报了个特别长的快照）就退化成不内嵌内容的短版本：
+     *    mqtt_send_publish() 的包缓冲只有 1024 字节，硬发会被它自己拒掉，
+     *    那样对端连"板子回话了"都看不到。 */
+    json = diag_build_payload(hello, hlen, false);
+    if (json == NULL) {
+        printf("[Diag] 载荷组装失败（内存不足）\n");
+        return -1;
+    }
+
+    if (strlen(json) > DIAG_PAYLOAD_MAX) {
+        printf("[Diag] 载荷 %u 字节太长，退化成不内嵌快照的短版本\n",
+               (unsigned)strlen(json));
+        free(json);
+        json = diag_build_payload(hello, hlen, true);
+        if (json == NULL) {
+            return -1;
+        }
+    }
+
+    /* 3) 发到 zhi_ai/<client_id>/status。
+     *    选这条 topic 而不是新开一条：它已经是本设备在用的"状态"话题
+     *    （遗嘱消息也发在这里），对端只订阅 zhi_ai/# 就能同时看到心跳、遗嘱和
+     *    诊断，不用额外记住一个新名字；诊断消息靠 "type":"diag" 区分。
+     *    QoS0 + 不 retain：
+     *      QoS0     —— 诊断是"问一次答一次"的即时快照，丢一条再问一次就是，
+     *                  不必为它引入 QoS1 的重发/包 ID 那套；
+     *      不 retain —— 这条 topic 上保留着的是遗嘱（设备掉线时 broker 代发的
+     *                  "OFF"）和设备状态的老语义；把一份带时间戳的快照留在
+     *                  broker 上，下一个订阅者连上就会看到一份过期的诊断。 */
+    snprintf(topic, sizeof(topic), "zhi_ai/%s/status", mqtt_config.client_id);
+
+    ret = mqtt_publish(topic, json, 0, false);
+
+    printf("[Diag] 诊断已发布 topic=%s len=%u hello_len=%d ret=%d\n",
+           topic, (unsigned)strlen(json), hlen, ret);
+
+    free(json);
     return ret;
 }
 
@@ -1365,7 +1923,9 @@ int ai_send_text(const char *text, ai_reply_callback_t callback)
 
 /* ==================== 异常声音检测接口 ==================== */
 
-int report_abnormal_sound(const char *sound_type, int confidence)
+/* queued 的语义同 alarm_publish()（见上面那段说明）：
+ * false = 直接发（调用者必须在 network_task 组里），true = 排队交给 network_task。 */
+static int sound_alarm_publish(const char *sound_type, int confidence, bool queued)
 {
     char topic[128];
     snprintf(topic, sizeof(topic), "zhi_ai/%s/sound_alarm", mqtt_config.client_id);
@@ -1384,7 +1944,8 @@ int report_abnormal_sound(const char *sound_type, int confidence)
     }
 
     /* 高优先级发送（QoS 1） */
-    int ret = mqtt_publish(topic, json, 1, false);
+    int ret = queued ? mqtt_publish_queued(topic, json, 1, false)
+                     : mqtt_publish(topic, json, 1, false);
     free(json);
 
     /* 触发本地报警回调 */
@@ -1393,6 +1954,16 @@ int report_abnormal_sound(const char *sound_type, int confidence)
     }
 
     return ret;
+}
+
+int report_abnormal_sound(const char *sound_type, int confidence)
+{
+    return sound_alarm_publish(sound_type, confidence, false);
+}
+
+int report_abnormal_sound_queued(const char *sound_type, int confidence)
+{
+    return sound_alarm_publish(sound_type, confidence, true);
 }
 
 /* ==================== 主动关怀接口 ==================== */
@@ -1447,7 +2018,11 @@ int report_health_data(int heart_rate, int blood_oxy)
 
 /* ==================== 设备联动接口 ==================== */
 
-int send_device_command(const char *device_id, const char *command)
+/* queued 的语义同 alarm_publish()：
+ * false = 直接发（robot_ui 收包回调里"替用户开灯"那条路），
+ * true  = 排队交给 network_task（hello_app 的灯控工具那条路）。 */
+static int device_command_publish(const char *device_id, const char *command,
+                                  bool queued)
 {
     char topic[128];
     snprintf(topic, sizeof(topic), "zhi_ai/%s/device_cmd", mqtt_config.client_id);
@@ -1465,10 +2040,21 @@ int send_device_command(const char *device_id, const char *command)
         return -1;
     }
 
-    int ret = mqtt_publish(topic, json, 1, false);
+    int ret = queued ? mqtt_publish_queued(topic, json, 1, false)
+                     : mqtt_publish(topic, json, 1, false);
     free(json);
 
     return ret;
+}
+
+int send_device_command(const char *device_id, const char *command)
+{
+    return device_command_publish(device_id, command, false);
+}
+
+int send_device_command_queued(const char *device_id, const char *command)
+{
+    return device_command_publish(device_id, command, true);
 }
 
 /* ==================== 内部函数实现 ==================== */
@@ -1690,6 +2276,22 @@ static int mqtt_send_publish(const char *topic, const char *payload, int qos, bo
 {
     uint8_t packet[1024];
     int pos = 0;
+
+    /* 装不下就别装。
+     *
+     * 这一层原来没有长度检查：超过 packet[] 的载荷会在下面 memcpy 时直接写坏
+     * network_task 的栈（表现是随机的整机异常，极难查）。心跳/报警那几条一直很短
+     * 所以没撞上，而诊断报文里要内嵌 hello_app 的快照（长度不受我们控制），
+     * 正好是最容易撞上这个上限的一条 —— 所以在这里补一道。
+     *
+     * 开销：1 字节固定头 + 最多 4 字节剩余长度 + 2 字节 topic 长度，其余是
+     * topic 和载荷，QoS>0 再多 2 字节包 ID。宁可这次不发（返回 -1，调用方按
+     * 失败处理/记日志），也绝不打坏栈。 */
+    if (strlen(topic) + strlen(payload) + ((qos > 0) ? 2 : 0) + 7 > sizeof(packet)) {
+        printf("MQTT publish 拒绝：太长 topic=%d payload=%d（包缓冲 %u 字节）\n",
+               (int)strlen(topic), (int)strlen(payload), (unsigned)sizeof(packet));
+        return -1;
+    }
 
     /* 固定头 */
     uint8_t type = 0x30;  // PUBLISH
@@ -1918,9 +2520,11 @@ void network_task(void *arg)
      * 连了 5 次还不行就换下一台 broker。
      */
     int mqtt_retry_tick = 0;
-    int mqtt_fails = 0;
     int broker_idx = 0;
-    int broker_switches = 0;
+    int i;
+
+    /* 失败计数和换台次数不再是本函数的局部变量：它们的定义搬到了文件头上的
+     * g_mqtt_fails / g_mqtt_broker_switches（否则心跳和诊断报文读不到它们）。 */
 
     while (1) {
         /* 检查 WiFi 状态 */
@@ -1944,29 +2548,29 @@ void network_task(void *arg)
                  * 否则会变成"每台试 5 次、15 次一轮"地一直锤公共服务器。
                  */
                 mqtt_retry_tick =
-                    (broker_switches == 0 && mqtt_fails < 5) ? 50 : 300;
+                    (g_mqtt_broker_switches == 0 && g_mqtt_fails < 5) ? 50 : 300;
 
                 /* 尝试连接 MQTT */
                 if (mqtt_connect(mqtt_config.broker, mqtt_config.port,
                                  mqtt_config.client_id, mqtt_config.username,
                                  mqtt_config.password) < 0) {
-                    mqtt_fails++;
+                    g_mqtt_fails++;
 
                     /* 配置里钉了 broker（mqtt_broker）就不再降级：现场要的是
                      * "只连队友那台"，自己漂到别的 broker 反而更难查
                      * （板子显示已连接、收不到东西）。没配时行为完全不变。 */
-                    if (mqtt_fails >= 5 && MQTT_NBROKERS > 1 && !g_mqtt_broker_pinned) {
+                    if (g_mqtt_fails >= 5 && MQTT_NBROKERS > 1 && !g_mqtt_broker_pinned) {
                         /* 这台连不上（公共实例限流很常见），换下一台 */
                         broker_idx = (broker_idx + 1) % MQTT_NBROKERS;
-                        broker_switches++;
+                        g_mqtt_broker_switches++;
                         strncpy(mqtt_config.broker, g_mqtt_broker_list[broker_idx],
                                 sizeof(mqtt_config.broker) - 1);
                         mqtt_config.broker[sizeof(mqtt_config.broker) - 1] = '\0';
                         printf("MQTT broker 切换到 %s\n", mqtt_config.broker);
-                        mqtt_fails = 0;
+                        g_mqtt_fails = 0;
                     }
                 } else {
-                    mqtt_fails = 0;
+                    g_mqtt_fails = 0;
                 }
             }
         }
@@ -1983,6 +2587,30 @@ void network_task(void *arg)
             }
         }
 
-        usleep(100000);  // 100ms
+        /* 把别的任务组排好队的消息发出去。
+         *
+         * 这是**唯一**允许在 network_task 之外产生的 publish 的落地处：hello_app
+         * 那里的 voice_state / user_said / device_cmd / 报警全部走 mqtt_publish_queued()
+         * 拷进队列（它自己一个 socket 操作都不做），由这一句取出来发。
+         * 放的位置和心跳同一段：都用本任务手里那条 socket，必须串行。
+         * 没连上时它会在内部整队丢掉（不会留一堆过期状态等着重连后再冲出去）。 */
+        mqtt_queue_drain();
+
+        /* 睡一小会儿。
+         *
+         * 分片睡（10ms × 10）而不是一次 usleep(100000)，是为了让"生产者拷进队列 +
+         * 唤醒本任务"这句话真的有用：队列里有货就立刻结束这一觉，消息最迟 10ms
+         * 就被取走（原来最多要等满 100ms）。总时长不变，节奏和以前一样。
+         *
+         * 刻意**不用**阻塞式信号量等待（nxsem_tickwait 之类）：本项目有过
+         * "带超时的等待没按时返回"的实锤，而这条单线程循环是 MQTT 的命根子
+         * （它一停就心跳、重连、收包全停，看起来跟死机一样），不能赌。 */
+        for (i = 0; i < 10; i++) {
+            if (sem_trywait(&g_mqtt_queue_sem) == OK) {
+                break;      /* 有货，别睡了，回上面去发 */
+            }
+
+            usleep(10000);  // 10ms
+        }
     }
 }
