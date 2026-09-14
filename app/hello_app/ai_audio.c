@@ -570,7 +570,14 @@ static void *audio_record_thread(void *arg)
   ssize_t nbytes;
   int read_errno = 0;          /* 这一次 audio_in_read() 之后 errno 的快照 */
   bool stale = false;          /* 醒过来才发现自己已经被新一代会话接管 */
-  bool lost = false;           /* 这一代是被别人带走的（不是本层让它停的） */
+
+  /* 这一代是怎么死的（两个都是"不是本层让它停的"那一类，本层让停的都不置）。
+   * 必须分成两个量：死因决定了**线程末尾怎么把设备还回去**，而这两种死因的
+   * 正确收尾正好相反（abandon vs stop，理由见发现死亡那一刻和线程末尾两处
+   * 注释）。在发现死亡的那一拍就定下来，之后不再读任何会变的标志。 */
+
+  bool stolen = false;         /* 被别人抢走：read 返回 0/EOF（对家发了设备级 STOP） */
+  bool starved = false;        /* 自己断粮：连续读超时到上限，或其它真错误 */
 
   AUDIO_DEBUG("录音线程启动");
 
@@ -763,12 +770,12 @@ static void *audio_record_thread(void *arg)
            *     这一代录音到此为止，而且不会有 VAD 回调来收尾 —— 上层要是不知道，
            *     状态机就会一直停在"正在听"直到自己超时，用户体感就是"卡死了"。
            *     所以置上 record_died，让上层下一拍（100ms）就能重开。
-           *     同一个判据还要**顺手定下这一代的收尾方式**（下面的 lost）：
-           *     没人让停的会话，设备多半已经握在别人手里了，线程收尾时绝不能
-           *     再发设备级 STOP（理由和做法见线程末尾那段）。
-           *     在这里定、不在收尾处再读一次 record_stop：中间那几微秒里上层
-           *     完全可能正好调 audio_record_stop()，那样"这一次是异常死亡"就会
-           *     被读成"本层在停"，收尾方式正好反了。
+           *     同一个判据还要**顺手把死因定下来**（stolen / starved），因为
+           *     死因决定了线程末尾怎么把设备还回去，而两种死因的正确收尾正好
+           *     相反（被抢走 → 只 close；自己断粮 → 先 STOP 再 close，
+           *     理由见线程末尾那段）。在这里定、不在收尾处再读一次 record_stop：
+           *     中间那几微秒里上层完全可能正好调 audio_record_stop()，
+           *     那样"这一次是异常死亡"就会被读成"本层在停"，收尾方式正好反了。
            *
            * 注意这里**不能**去补一次 vad_callback(false) 冒充"语音结束"：
            * VAD 报 false 的意思是"人说完了一句完整的话，去送 ASR"，
@@ -829,10 +836,35 @@ static void *audio_record_thread(void *arg)
 
           if (!ctx->record_stop)
             {
-              ctx->record_died = true;
-              lost = true;             /* 收尾改走 abandon，不再发设备级 STOP */
-              printf("[录音] 录音异常中断（read 返回 %ld，errno=%d，不是本层在停），"
-                     "会话已死\n", (long)nbytes, read_errno);
+              /* 死因在**发现死亡的这一刻**就落地，线程末尾据此选收尾方式。
+               * 两种死因的正确收尾正好相反，所以这里不能只置一个"死了"：
+               *
+               *   - nbytes == 0（EOF）：是**别人**把这一代停掉的。本层没让它停
+               *     （上面的 record_stop 已经把自己排除了），而 EOF 只有三个来源
+               *     —— 被 AUDIOIOC_STOP 打断 / 设备没在跑 / 会话换代 —— 三个都
+               *     说明设备已经不在我们手里了。此时发设备级 STOP 只会把刚接管
+               *     设备的那个会话打死（半双工），所以走 stolen → 只 close。
+               *   - 其余（连续读超时到上限，或 -EINVAL/fd 失效这类真错误）：
+               *     **没有任何人发过 STOP**，这一代很可能就是我们自己在用，
+               *     走 starved → 先 STOP 再 close，把设备收干净。
+               *     这两种归到一类是因为判据一致：都没有"别人把我停了"的实证，
+               *     而那正是 stolen 唯一成立的理由。 */
+
+              if (nbytes == 0)
+                {
+                  stolen = true;
+
+                  printf("[录音] 录音被外部停掉（read 返回 0/EOF，不是本层在停）："
+                         "设备已被别人接手，收尾只关自己的 fd、不发 STOP\n");
+                }
+              else
+                {
+                  starved = true;
+
+                  printf("[录音] 录音异常中断（read 返回 %ld，errno=%d，"
+                         "不是本层在停）：没人发过 STOP，收尾按最后使用者"
+                         "停掉设备\n", (long)nbytes, read_errno);
+                }
             }
           else
             {
@@ -859,33 +891,64 @@ static void *audio_record_thread(void *arg)
       return NULL;
     }
 
-  /* 线程自己收尾时也要把设备还回去，但**怎么还**取决于这一代是谁结束的
-   * （就是上面那个 lost）。
+  /* 线程自己收尾时也要把设备还回去，但**怎么还**取决于这一代是怎么死的
+   * （stolen / starved，在发现死亡那一刻定下来）。
    *
-   * 本层让停的（lost 为假）照旧走 audio_in_stop()：它幂等，audio_record_stop()
-   * 那条路到这里通常已经是空操作（设备早停了），只有"那次 STOP 被驱动拒了"
-   * （现场见过 ENOTTY）时才真的有用 —— 那是把设备还回去的最后一次机会，
-   * 不能省。而"线程压根没进循环"（want 为 0，帧长配置异常）也落在这一支：
-   * 设备是 audio_record_start() 刚 START 好的，只有本层能动它。
+   * 没有一个"本层让停"的分支单独写：那种情况下两个量都是假，
+   * 照旧走 audio_in_stop()。它幂等，audio_record_stop() 那条路到这里通常已经是
+   * 空操作（设备早停了），只有"那次 STOP 被驱动拒了"（现场见过 ENOTTY）时才真的
+   * 有用 —— 那是把设备还回去的最后一次机会，不能省。而"线程压根没进循环"
+   * （want 为 0，帧长配置异常）也落在这一支：设备是 audio_record_start() 刚
+   * START 好的，只有本层能动它。
    *
-   * 异常死亡的（lost 为真）改走 audio_in_abandon()。这一代已经**不是我们的**了：
-   * 最典型的是设备被别的会话抢走（半双工，对方一个 STOP 就把录放两条通路一起
-   * 停掉，我们的 read() 于是以 0/EOF 醒来）。此刻握住设备的正是刚接管它的那个
-   * 会话 —— 现场多半是正在播报的 TTS —— 收尾时再发一次**设备级** AUDIOIOC_STOP
-   * 就会连它一起打死（串口里"[录音] 录音异常中断…会话已死"后面紧跟播报半路
-   * 哑掉，就是这条路径，而且在现场反复出现）。
+   * **被抢走的（stolen）只能 abandon（只 close）**：
+   * 此刻握住设备的正是刚接管它的那个会话 —— 现场多半是正在播报的 TTS ——
+   * 收尾时再发一次**设备级** AUDIOIOC_STOP 就会连它一起打死（现场老串口里
+   * "[录音] 录音异常中断…会话已死"后面紧跟播报半路哑掉，就是这条路径，
+   * 而且在现场反复出现；那行日志现在按死因拆成了"被外部停掉"和"异常中断"两行，
+   * 走本支的是前一行）。abandon 不会漏设备：它只关本层那个 fd，而关 fd 是否真去动
+   * 硬件由 NuttX 上层决定 —— 上层在**这个设备上最后一个 fd 被关**时才调驱动的
+   * hw_shutdown（nuttx/audio/audio.c:263-275，upper->head 变空才调），
+   * hw_shutdown 自己会停 DMA、DISABLE AUDPRC、关功放、把卡在 read 里的会话作废。
+   * 所以有人接管时对方毫发无伤；万一没人接管，我们就是最后一个 fd，驱动照常
+   * 收尾，设备照样被放回去。
    *
-   * 改走 abandon 不会漏设备：它只关本层那个 fd，而关 fd 是否真去动硬件由 NuttX
-   * 上层决定 —— fs 上层在**这个设备上最后一个 fd 被关**时才调驱动的 hw_shutdown
-   * （见 nuttx/audio/audio.c 的 audio_close：upper->head 变空才调），而
-   * hw_shutdown 自己会停 RX/TX DMA、DISABLE AUDPRC、关功放、并把卡在 read 里的
-   * 会话作废（见 board 的 sf32lb52_audio_hw_shutdown）。于是两种情况都对：
-   *   - 有人接管着设备 → 它自己那份 fd 还在，我们这一 close 到不了驱动，
-   *     对方的录/放毫发无伤（这正是要的效果）；
-   *   - 没人接管（连续读超时到上限这种"会话自己没了"）→ 我们是最后一个 fd，
-   *     驱动照常收尾，设备被放回去，下次 audio_in_start() 不会拿到 -EBUSY。 */
+   * **自己断粮的（starved）要走 stop，不能图省事一律 abandon** —— 这是本轮
+   * 复核定下来的分岔，两边的理由都写在这里：
+   *   · abandon 的清理效果不是本层说了算：它只 close 自己的 fd，而"这一 close
+   *     到底动不动硬件、什么时候动"取决于这个设备上还有没有别的 file 对象
+   *     （上层内部的条件，本层看不见）；而且它**不唤醒**任何阻塞中的 read
+   *     （见 sf32lb52_audio_in.h 里 abandon 那段边界：同一个 file 对象还被
+   *     阻塞的 read 持着时，close 只是减引用计数，真正的 close 和上层 shutdown
+   *     要等那次 read 返回）。starved 已经判定"设备是我们自己在用"，
+   *     这种场合要的是**主动、确定**地把它收掉，那就只有 STOP：它明确停驱动
+   *     （清 running、停 DMA、关模拟通路/功放），随后的 close 在关掉上层
+   *     status 时会连还可能钉着的 DRAINING 一起释放。
+   *     （stop 万一被驱动拒了，行为与本层让停那一支完全一样：板级会留一行
+   *      AUDIOIOC_STOP failed 的 ERR，不关 fd 也不清全局，下一次
+   *      audio_record_start() 开头会先重试一次 stop，成功了就自然恢复。
+   *      这里不额外兜底，免得把板级"STOP 失败就别动设备"的设计绕过去。）
+   *   · 而"被抢走"那一支又绝不能跟着走 stop：那时 STOP 到不了驱动
+   *     （audio.c:685-688 要求自己的 status 是 RUNNING/PAUSED **且**除自己以外
+   *     所有 openpriv 都是 OPEN；对家只要成功 CONFIGURE 过一次，
+   *     priv->state 就 ≥ PREPARED，条件不成立），却照样会白踩下面这个共享状态。
+   *   · STOP 真被转下去时的副作用（正是 starved 需要它、stolen 必须躲开它的
+   *     原因）：audio.c:692 会把**共享的** upper->status->state 置成 DRAINING，
+   *     而且驱动成功返回也**不还原**。本固件没有任何路径会发
+   *     AUDIO_CALLBACK_COMPLETE / AUDIO_APB_FINAL（板级只在队列模式回调里发，
+   *     而全仓库没人置那一位），而 DRAINING 只在两种情况下才会消失
+   *     （audio.c:1556-1561 的 COMPLETE 回调，或最后一个 fd 被关时连
+   *     upper->status 一起释放）—— 也就是说它会一直钉着，期间每个新会话的
+   *     CONFIGURE（audio.c:479）和 START（audio.c:621-658）都被上层静默吞掉：
+   *     返回 OK、驱动一次都没被调用，"看着在录、一个字节都没有"。
+   *     starved 这一支是主动收自己这一代（stop + close），DRAINING 不会留到下一代；
+   *     stolen 那一支要是也发 STOP，受害的却是后面每一个会话。
+   * "先探测一下有没有别人在用、再决定发不发 STOP" 这条路走不通：别人的
+   * openpriv / state 只在上层内部，本层没有任何接口问得出来。
+   * 也不能靠"线程末尾再读一次 record_stop"来分岔：那几微秒里上层完全可能
+   * 正好调 audio_record_stop()（所以死因在发现死亡那一刻就定了）。 */
 
-  if (lost)
+  if (stolen)
     {
       audio_in_abandon();
     }
@@ -897,6 +960,19 @@ static void *audio_record_thread(void *arg)
   AUDIO_DEBUG("录音线程退出");
   ctx->recording = false;
   ctx->state = ctx->playing ? AUDIO_STATE_PLAYING : AUDIO_STATE_IDLE;
+
+  /* 异常死亡的标记**在这里**才对上层可见，而不是在发现死亡那一刻。
+   * 判死处就置位的话，监听守护可能正好在"还 active、却已经 died"的那半拍里
+   * 进来（它只在会话不活跃时才清标记），把这一代的死亡标记顺手清掉，于是
+   * 死亡失去"下一拍就重开"的资格。放在 recording 已清、record_exited 未置的
+   * 窗口里，守护只可能看到"已经不活跃 + 已经 died"这个自洽组合。
+   * 这一支的收尾方式（上面）不影响这个时机的选择：无论 abandon 还是 stop，
+   * 标记都在 recording 清掉之后才置位。 */
+
+  if (stolen || starved)
+    {
+      ctx->record_died = true;
+    }
 
   /* 最后一步：告诉 audio_reap_record_thread() "我已经跑完了"。
    * 必须在所有收尾动作**之后**置位，否则别人会立刻 join 走 TCB。 */
