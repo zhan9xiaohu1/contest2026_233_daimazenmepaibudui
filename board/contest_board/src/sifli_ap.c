@@ -760,16 +760,25 @@ void board_late_initialize(void)
    * 后续：整个固件原来是 -O0（CONFIG_DEBUG_NOOPT，见 defconfig 里的说明），
    * 打开 -O2 之后重新测试本开关。
    *
-   * ⚠ 2026-09-13：这个开关现在置 0 关掉，原因是**麦克风只有一个**：
+   * ⚠ 2026-09-13：这个开关当时置 0，原因是**麦克风只有一个**：
    *   hello_app 一启动就常开录音、独占 /dev/audio/audio0（半双工设备），
    *   而界面所在的 app 是 robot_ui —— "语音聊天"要由 robot_ui 自己录音并播放，
    *   两个 app 抢同一个设备必然互相打断（audio_in_start() 直接 -EBUSY）。
-   *   所以 robot_ui 现在是唯一的语音入口；ai_companion 仍可在 NSH 里手动
-   *   `ai_companion` 起来（调试 AI 状态机/声音检测时用），只是不要和
-   *   robot_ui 的语音聊天同时用。
-   *   要恢复开机自启，把它改回 1，并把 robot_ui 的语音聊天入口当成不能用。
+   *
+   * ✅ 2026-09-14 晚：**语音入口已统一到框架侧，所以重新打开自启（置 1）**。
+   *   - robot_ui 的「语音聊天」入口已下线（touch_ui.c 的 case 0 只弹提示），
+   *     robot_ui 默认不再开麦（常态听音 enable_ambient_listen 也默认关）；
+   *   - 语音闭环改由 ai_companion（本任务）承担：常听 → ASR → 大模型（MiMo，
+   *     走 ai_agent 的 llm_proxy/velaclaw）→ TTS 播放；对话文字通过 MQTT
+   *     publish 到 `zhi_ai/<client_id>/command`，由 robot_ui 的
+   *     on_ai_command_received() 投递到界面显示（见 ai_network.c 的
+   *     ai_network_send_ai_reply / ai_network_start_shared）；
+   *   - 所以现在**只有 hello_app 一个持有麦克风**，不再冲突。
+   *   - 栈必须仍是 CONFIG_HELLO_APP_STACKSIZE（defconfig 里 64KB）：
+   *     早先硬编码 16384 时 ai_companion_main 一进函数就要 32KB 栈帧，
+   *     一启动就踩穿栈 hard fault（见下）。
    */
-#define AUTOSTART_HELLO_APP 0
+#define AUTOSTART_HELLO_APP 1
 #if AUTOSTART_HELLO_APP
   {
     /* 入口符号由 nuttx_add_application(NAME ...) 决定：

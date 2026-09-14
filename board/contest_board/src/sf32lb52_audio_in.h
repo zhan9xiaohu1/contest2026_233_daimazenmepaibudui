@@ -109,8 +109,23 @@ ssize_t audio_in_read(FAR void *buf, size_t len);
  *   停止并关闭录音通路（ioctl(AUDIOIOC_STOP) + close(fd)）。
  *   没在录音时是安全的空操作，返回 OK。
  *
- *   可以从别的任务调用来"救"一个正阻塞在 audio_in_read() 里的任务
- *   （驱动已修：STOP 能唤醒阻塞中的 read，read 会返回 0）。
+ *   可以从**同一个 app 的另一个线程**调用来"救"一个正阻塞在
+ *   audio_in_read() 里的任务（驱动已修：STOP 能唤醒阻塞中的 read，read 返回 0）。
+ *   task_create() 出来的子任务（hw_test 的读任务就是）虽然属于另一个 task group，
+ *   但它的 fd 是**复制父任务 fd 表**得来的、指向同一个 file 对象，同样合法。
+ *
+ *   ⚠️ 边界：fd 号只在"开它的那个 task group"里保证有意义。别的 app（各自 exec
+ *   起来的独立程序）拿着这个数字去 ioctl/close，只会打到它自己组里的另一个
+ *   file 对象上 —— 真机事故就是这样：AUDIOIOC_STOP failed: 25（ENOTTY，音频
+ *   驱动压根没收到命令），而原来紧接着还会 print "stopped" 并 close 掉那个无关
+ *   fd，于是持有者的录音线程一直卡在 read() 里、300ms 收不了尾。
+ *   现在的行为：跨组调用先做一次只读的身份探测（GETCAPS(QUERY)），
+ *     - 探测不过 → 返回 -EPERM，**STOP 不发、fd 不关、全局状态不动**；
+ *     - 探测通过（就是复制来的同一个音频设备）→ 照常停，日志里留下一行 WARNING；
+ *     - 本组自己的调用 → 直接停。
+ *   而且只有 STOP **成功**之后才 close/清全局；STOP 失败时什么都不动（设备可能
+ *   仍在跑，持有者可以重试），错误原因和双方 group/线程 id 都打进日志。
+ *   跨 app 要让路请改成"登记请求 + 持有者自己的线程执行"。
  *
  *   提醒：如果本模块是设备上**唯一**的使用者，close() 会走驱动的
  *   shutdown 路径；该路径曾在关中断上下文里卡死整机，现已修成最小化
@@ -119,7 +134,8 @@ ssize_t audio_in_read(FAR void *buf, size_t len);
  *   **不要在中断上下文里调用**（close 路径可能取锁）。
  *
  * Returned Value:
- *   OK on success; a negated errno value on failure.
+ *   OK：正常停掉（或本来就没在录）；-EPERM：跨组调用且 fd 不是音频设备，
+ *   本次没有动设备；-errno：AUDIOIOC_STOP 失败（设备可能仍在跑，日志里有明细）。
  *
  ****************************************************************************/
 

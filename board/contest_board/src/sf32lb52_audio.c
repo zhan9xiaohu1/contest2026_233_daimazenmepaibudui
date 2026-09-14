@@ -102,8 +102,25 @@ struct sf32lb52_audio_s
   AUDCODEC_HandleTypeDef  codec;        /* 音频 codec（模拟前端） */
   AUDPRC_HandleTypeDef    aprc;         /* 音频处理器（数据通路 DMA） */
   bool                    running;      /* 设备是否在运行 */
-  bool                    playback;     /* 当前方向：true=播放 false=录音 */
+  bool                    playback;     /* 已提交方向：true=播放 false=录音（只在 running 为真时有意义） */
+  bool                    pending_playback; /* 最近一次 CONFIGURE 记下的方向意图，START 成功才提交 */
   int                     playback_db; /* 当前播放音量(dB)，标准接口可改 */
+
+  /* 真实通路状态位 —— 这是"硬件到底开着哪几条模拟级"的唯一真相，
+   * **不是**方向标签。
+   *
+   * 为什么不能拿 playback 当真相：整机是单一大镜像，priv 全局只有一份，
+   * 两个 app（hello_app 常开麦录音 / robot_ui 偶尔播报）都在用它。某一个 app
+   * 只做一次 CONFIGURE(OUTPUT)（例如 ai_audio.c 的 audio_hw_set_volume()，
+   * 它 open + CONFIGURE + close、**不 START**）就会把正在录音的那个会话的
+   * 方向标签翻成"播放"。方向标签一旦是谎话，收尾时就只有两种坏法：
+   *   去关一条从没打开过的模拟通路（实测重复关模拟级会整机静默卡死），
+   *   或者该关的 DAC/功放永远漏关（录音把标签翻回 false，播放侧收尾就跳过）。
+   * 所以下面这三个位在真正开/关那一行如实置位/清位，收尾只看它们。 */
+
+  bool                    dac_path_on;  /* codec DAC 模拟通路确实开着 */
+  bool                    adc_path_on;  /* codec ADC 模拟通路确实开着 */
+  bool                    pa_on;        /* 功放（AW8155）确实使能着 */
   int                     samplerate;   /* 当前采样率 */
   int                     nchannels;    /* 当前通道数 */
   int                     bpsamp;       /* 当前采样位深 */
@@ -114,6 +131,38 @@ struct sf32lb52_audio_s
   sem_t                   rx_sem;       /* read() 同步信号量 */
   bool                    rx_busy;      /* read() DMA 进行中 */
   bool                    rx_aborted;   /* stop() 打断了正在等待的 read() */
+
+  /* 会话代号：每一次让"录音这次会话"作废的事件都会 +1 —— hw_start（新会话开始）、
+   * hw_stop（上层 STOP）、hw_shutdown（最后一个 fd 被 close）。
+   *
+   * read() 进分片等待前先记下它，每一片醒来都比对一次。为什么要这个额外判据：
+   * 那个循环的出口原来只有"被 post 唤醒 / rx_aborted / running 变假"三种，全都
+   * 依赖**别的上下文确实把那两个标志写好或真的唤醒过它**。真机上出现过唤醒没生效
+   * （见 ai_audio.c 里"连 nxsem_tickwait 的 5 秒超时都没回来"那条记录），也出现过
+   * 新的会话/新的 STOP 把旧 read 的等待拖住的情形。有了会话代号，只要这次 read 的
+   * 时代已经过去，它下一片醒来就自己收摊 —— 不需要任何人记得去唤醒它。 */
+
+  uint32_t                session_gen;
+
+  /* -110（read 等 DMA 超时）的现场证据。
+   *
+   * 光看"read 超时"一句话分不清是哪一种坏法，这 5 个计数器就是分诊用的：
+   *   irq 一直不动 + read 次数在涨  → DMA 起了但完成中断压根没来
+   *                                  （最可疑：ADC 模拟通路/AUDPRC 没真使能，
+   *                                    也就是 hw_start 被 start 的早退跳过了）
+   *   busy_fail 在涨                → Receive_DMA 起的不是新传输（HAL 侧 BUSY）
+   *   not_armed 在涨                → Receive_DMA 回了 HAL_OK，可 DMA 句柄压根没
+   *                                  进 BUSY：Start_IT 没干活（它自己的 HAL_BUSY
+   *                                  被厂商丢掉了，见 read 里的第二次校验）
+   *   irq 在涨而 timeout 也在涨     → 中断其实来了，是等待/唤醒这一侧的问题
+   * 都是单调递增的 32bit 计数，不做回绕保护（真跑到回绕早该查完这件事了）。
+   */
+
+  uint32_t                rx_irq_count;       /* RxCplt 中断次数（无条件自增） */
+  uint32_t                rx_read_count;      /* read() 进入次数 */
+  uint32_t                rx_timeout_count;   /* read() 等待超时次数 */
+  uint32_t                rx_dma_busy_fail;   /* 起 DMA 返回非 HAL_OK 的次数 */
+  uint32_t                rx_dma_not_armed;   /* 声称起好了但句柄没进 BUSY 的次数 */
 };
 
 /****************************************************************************
@@ -151,6 +200,10 @@ static int  sf32lb52_audio_hw_start(FAR struct sf32lb52_audio_s *priv,
 static int  sf32lb52_audio_hw_stop(FAR struct sf32lb52_audio_s *priv);
 static int  sf32lb52_audio_hw_shutdown(FAR struct sf32lb52_audio_s *priv);
 static void sf32lb52_audio_pa_enable(bool enable);
+static void sf32lb52_audio_path_bit(FAR bool *bit, bool on,
+                                    FAR const char *name,
+                                    FAR const char *why);
+static void sf32lb52_audio_tx_freeze(FAR struct sf32lb52_audio_s *priv);
 static void sf32lb52_audio_tx_complete(FAR struct sf32lb52_audio_s *priv);
 static void sf32lb52_audio_rx_complete(FAR struct sf32lb52_audio_s *priv);
 static int  sf32lb52_audio_dma1_irq(int irq, FAR void *context,
@@ -225,6 +278,74 @@ static void sf32lb52_audio_pa_enable(bool enable)
 {
   HAL_GPIO_WritePin(SF32LB52_AUDIO_PA_GPIO, SF32LB52_AUDIO_PA_PIN,
                     enable ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+/****************************************************************************
+ * Name: sf32lb52_audio_path_bit
+ *
+ * Description:
+ *   改一个真实通路状态位，值真的变了才打一行 LOG_INFO（位名 + 为什么）。
+ *
+ *   为什么不直接 syslog：hw_start/hw_stop 每次会话都会跑到这里，无条件打
+ *   就是刷屏；而"哪条模拟通路在什么时候被开了/关了"正是收尾判断的依据，
+ *   串口上必须能一条一条对着看（本次改动的验收判据）。
+ *   只在值变化时打，正常一次会话最多 3 行（DAC/PA/ADC 各一行）。
+ *
+ ****************************************************************************/
+
+static void sf32lb52_audio_path_bit(FAR bool *bit, bool on,
+                                    FAR const char *name,
+                                    FAR const char *why)
+{
+  if (*bit == on)
+    {
+      return;
+    }
+
+  *bit = on;
+  syslog(LOG_INFO, "AUDIO: 通路位 %s -> %d（%s）\n",
+         name, (int)on, why);
+}
+
+/****************************************************************************
+ * Name: sf32lb52_audio_tx_freeze
+ *
+ * Description:
+ *   在 DMA 完成中断里**立刻**掐断 codec 的 DAC 数据通路。
+ *
+ *   为什么必须在中断里做：HAL_AUDCODEC_Transmit_DMA() 把 TX DMA 设成
+ *   DMA_CIRCULAR（见 bf0_hal_audcodec_m.c 的 HAL_AUDCODEC_DMA_Init /
+ *   HAL_AUDCODEC_Transmit_DMA），这一块传到末尾的**同时**硬件就从头再传一遍。
+ *   而"停下来"原来只有 write() 被信号量唤醒之后才会调 HAL_AUDCODEC_DMAStop()，
+ *   中间隔着"中断返回 → 调度器唤醒线程 → 线程真的跑起来"这段软件延迟
+ *   （几十 us 到 ms 量级，看有没有更高优先级任务在跑）。这段时间里缓冲区
+ *   开头会被重播，块尾跳到块首那一下就是一声"啪" —— 100 ms 一块时一秒十声，
+ *   上层听到的就是"每个字都有爆音"。
+ *
+ *   这里在中断里直接关掉两样东西，重播长度就压到"中断入口延迟"这一个量级
+ *   （不到一个 32bit 字，16k 单声道下约 2 个采样），上层再做几毫秒的淡入淡出
+ *   （见 app/hello_app/ai_audio.c 的 audio_apply_chunk_fade）就完全盖住了。
+ *
+ *   只写寄存器，不做 HAL_DMA_Abort 那套重活（禁中断 / 回收通道 / 复位 State）：
+ *   那些收尾仍然留给 write() 里的 HAL_AUDCODEC_DMAStop()。
+ ****************************************************************************/
+
+static void sf32lb52_audio_tx_freeze(FAR struct sf32lb52_audio_s *priv)
+{
+  FAR DMA_HandleTypeDef *hdma = priv->codec.hdma[HAL_AUDCODEC_DAC_CH0];
+
+  /* 先关 codec 这一侧的 DMA 使能：数据不再往 DAC 里送，重播当头断掉。
+   * 这一位 write() 收尾时也会清（HAL_AUDCODEC_DMAStop），这里是抢在它前面。 */
+
+  priv->codec.Instance->DAC_CH0_CFG &= ~AUDCODEC_DAC_CH0_CFG_DMA_EN;
+
+  /* 再把 DMA 通道停掉。只清 CCR 的 EN 位；Instance 用的是 HAL 动态分配之后
+   * 实际占住的那个通道（DMA_AllocChannel 可能改过 Instance），不能写死。 */
+
+  if (hdma != NULL)
+    {
+      __HAL_DMA_DISABLE(hdma);
+    }
 }
 
 /****************************************************************************
@@ -636,6 +757,13 @@ static int sf32lb52_audio_hw_start(FAR struct sf32lb52_audio_s *priv,
   HAL_AUDCODEC_Config_Analog_ADCPath(codec->Init.adc_cfg.adc_clk);
   __HAL_AUDCODEC_ADC_ENABLE(codec);
 
+  /* ADC 模拟通路就在这一行真正开了：如实置位。
+   * 注意它**不分方向**（原来的行为就是这样）：录音要用它，播放时也跟着使能、
+   * 只是数据不经过它。删除它要另外验证，不在本次改动范围里。 */
+
+  sf32lb52_audio_path_bit(&priv->adc_path_on, true, "adc_path_on",
+                          "hw_start 开 ADC 模拟通路");
+
   /* codec：DAC 模拟通路 + 功放 —— 只有播放才碰。
    *
    * 纯录音时打开 DAC/功放是白开：麦克风数据不经过它，但功放使能那一下会在
@@ -653,11 +781,23 @@ static int sf32lb52_audio_hw_start(FAR struct sf32lb52_audio_s *priv,
       HAL_AUDCODEC_Config_DACPath(codec, 1);
       HAL_AUDCODEC_Config_Analog_DACPath(codec->Init.dac_cfg.dac_clk);
       HAL_AUDCODEC_Config_DACPath(codec, 0);
+
+      /* DAC 模拟通路开完就置位：收尾时只按这个位决定要不要关它 */
+
+      sf32lb52_audio_path_bit(&priv->dac_path_on, true, "dac_path_on",
+                              "hw_start 开 DAC 模拟通路");
+
       HAL_AUDCODEC_Config_DACPath_Volume(codec, 0, SF32LB52_AUDIO_VOL_MUTE);
       HAL_AUDCODEC_Config_DACPath_Volume(codec, 1, SF32LB52_AUDIO_VOL_MUTE);
       up_mdelay(SF32LB52_AUDIO_SETTLE_MS);
 
       sf32lb52_audio_pa_enable(true);
+
+      /* 功放使能这一下也如实记：hw_stop/hw_shutdown 只有 pa_on 为真才去关它 */
+
+      sf32lb52_audio_path_bit(&priv->pa_on, true, "pa_on",
+                              "hw_start 开功放");
+
       up_mdelay(20);   /* 等功放上电稳定 */
 
       HAL_AUDCODEC_Config_DACPath_Volume(codec, 0, priv->playback_db);
@@ -670,8 +810,26 @@ static int sf32lb52_audio_hw_start(FAR struct sf32lb52_audio_s *priv,
       audinfo("ADC path started (record only, DAC/PA untouched)\n");
     }
 
+  /* 到这里硬件都真起来了，才把方向"提交"为当前会话的方向。
+   * 在 START 成功这一刻提交（而不是 CONFIGURE 那一刻写）是本文件的关键约定：
+   * 只 CONFIGURE、没 START 的调用（ai_audio.c 的 audio_hw_set_volume() 就是）
+   * 必须**不改变**任何真实通路状态和当前会话方向，否则它会替正在录音的会话
+   * 把方向翻成播放。pending_playback 只表示"下一次 START 想要的方向"。 */
+
   priv->playback = playback;
   priv->running  = true;
+
+  /* 新会话开始：上一次会话遗留的 read()（如果有）到此作废 —— 它的会话代号
+   * 已经对不上，下一次从分片等待里醒来就会退出，不会把新会话的数据接走。 */
+
+  priv->session_gen++;
+
+  /* 这一行是"hw_start 到底有没有跑"的唯一凭据：
+   *   有它 → ADC 模拟通路 / AUDPRC 真使能过，收不到数据要去查中断和数据通路；
+   *   没有 → 上层 START 根本没执行到这里（多半被残留 running 的早退挡掉了），
+   *          read() 等 DMA 超时（-110）就是从这个洞进来的。 */
+
+  syslog(LOG_INFO, "AUDIO: hw_start 真跑了：playback=%d\n", (int)playback);
   return OK;
 }
 
@@ -691,11 +849,32 @@ static int sf32lb52_audio_hw_stop(FAR struct sf32lb52_audio_s *priv)
    * （见 sf32lb52_audio_hw_shutdown 的注释）。
    * 判据里除了 running 还要看 rx_busy/rx_aborted/rx_apb/tx_apb：
    * 这些都是"还没收尾"的状态，有一样没清就走完整流程，别漏掉 buffer。
+   *
+   * 三个真实通路位也必须进判据 —— 原来那五项的判据在新位参与后**不再成立**：
+   * hw_shutdown() 是故意不关模拟通路的（关中断上下文里关模拟级会卡死），
+   * 它只清 running、把功放关掉，于是会出现"running=false 但 dac_path_on /
+   * adc_path_on 仍为真"的合法状态。这种情况下再调 hw_stop()，旧判据会直接
+   * 早退，那条还开着的模拟通路就**永远漏关**了（下一位持有者一直带着它跑，
+   * 直到下一次 hw_start 又把它当新的开一遍）。加上这三个位之后，
+   * 收尾的语义才闭合：只要还有任何一条模拟级开着或功放开着，就走完整流程。
+   *   反过来，位都是假时早退是安全的：那些行的作用全是"把 DMA / buffer /
+   *   ADC 通路收掉"，没有通路开着就没有对应的东西要收；而无条件 post 出来
+   *   的多余计数会被 read() 开头的 nxsem_reset() 清掉（见下面的注释）。
    */
 
   if (!priv->running && !priv->rx_busy && !priv->rx_aborted &&
-      priv->rx_apb == NULL && priv->tx_apb == NULL)
+      priv->rx_apb == NULL && priv->tx_apb == NULL &&
+      !priv->dac_path_on && !priv->adc_path_on && !priv->pa_on)
     {
+      /* 早退也要放一次"还卡在 read 里的任务"：设备虽然早停了，但真机上出现过
+       * "stop 那次唤醒没生效"，那种情况下录音线程会一直卡在分片等待里（界面
+       * 跟着遭殃）。这里补一次和完整流程末尾同样的唤醒 + 会话作废，代价只是
+       * 一个信号量计数（read() 开头会 reset 掉），换来的是"任何一次 stop 调用
+       * 都不可能留着别人卡住"。 */
+
+      priv->rx_aborted = priv->rx_busy;
+      priv->session_gen++;
+      nxsem_post(&priv->rx_sem);
       return OK;
     }
 
@@ -741,6 +920,8 @@ static int sf32lb52_audio_hw_stop(FAR struct sf32lb52_audio_s *priv)
    * （实测那次漏了）。配对措施见 read()：起 DMA 前先 nxsem_reset()，多余计数
    * 不会被下次 read 当成"采集完成"。 */
 
+  priv->session_gen++;      /* 会话作废：read 即使没被这次 post 唤醒，下一片醒来也能自己退出 */
+
   nxsem_post(&priv->rx_sem);
 
   /* 把还挂着的 buffer 归还给上层。
@@ -750,6 +931,14 @@ static int sf32lb52_audio_hw_stop(FAR struct sf32lb52_audio_s *priv)
    * 却不归还，正在阻塞的 read() 永远等不到回调 —— 线程就此卡死。
    * 实测：录音 read 阻塞中发 AUDIOIOC_STOP，3 秒都不返回。
    * （DMA 已经停了，这时归还 buffer 是安全的）
+   *
+   * 只有**确实挂着本会话的 buffer** 时才回调：两个指针都只有队列模式
+   * （上层 AUDIOIOC_ENQUEUEBUFFER）才会被赋值，本板两个 app 走的都是直通
+   * read()/write()，所以直接通道下这里恒为 NULL、一个回调都不会发出去。
+   * 这一点很重要：上层 audio_dequeuebuffer() 会写 upper->status，而
+   * upper->status 在"最后一个 fd 被 close"时就被释放并置 NULL 了 —— 真要
+   * 在那种时刻回调进去就是空指针。保留"有 buffer 才回调"这个惯判据，
+   * 就同时挡住了"打向正在销毁的 task group"和"打向已释放的 upper 状态"。
    */
 
   if (priv->rx_apb != NULL)
@@ -771,23 +960,53 @@ static int sf32lb52_audio_hw_stop(FAR struct sf32lb52_audio_s *priv)
   /* 关断顺序必须和开机顺序反过来：先把 DAC 拉到最小音量，再关功放，
    * 最后才断模拟通路。原来的顺序（先 Close_Analog_DACPath 再关功放）是
    * 把还开着的 DAC 输出直接抽掉，那一下直流跳变经功放放大 = 结尾一声爆音。
+   *
+   * 每一步只看**真实通路位**，不看方向标签：标签是别的 app 一次 CONFIGURE
+   * 就能改的谎话（见 struct 里的注释），按标签决定就会去关一条从没开过的
+   * 模拟通路（重复关模拟级实测整机静默卡死），或者漏关真正开着的 DAC/功放
+   * （录音把标签翻回 false 之后播放收尾就跳过了）。不变量：
+   *   关之前一定开着、关完立刻清位，位关闭一次、开一次严格配对。
    */
 
-  if (priv->playback)
+  if (priv->dac_path_on)
     {
       HAL_AUDCODEC_Config_DACPath_Volume(&priv->codec, 0,
                                          SF32LB52_AUDIO_VOL_MUTE);
       HAL_AUDCODEC_Config_DACPath_Volume(&priv->codec, 1,
                                          SF32LB52_AUDIO_VOL_MUTE);
       up_mdelay(SF32LB52_AUDIO_SETTLE_MS);
-
-      sf32lb52_audio_pa_enable(false);
-      up_mdelay(5);
-
-      HAL_AUDCODEC_Close_Analog_DACPath();
     }
 
-  HAL_AUDCODEC_Close_Analog_ADCPath();
+  if (priv->pa_on)
+    {
+      sf32lb52_audio_pa_enable(false);
+      sf32lb52_audio_path_bit(&priv->pa_on, false, "pa_on",
+                              "hw_stop 关功放");
+
+      /* 留 5ms 让功放放电：紧接着（DAC 还开着时）就要断模拟通路，
+       * 顺序反了那一下跳变会被还激活的功放放大成爆音。 */
+
+      up_mdelay(5);
+    }
+
+  if (priv->dac_path_on)
+    {
+      HAL_AUDCODEC_Close_Analog_DACPath();
+      sf32lb52_audio_path_bit(&priv->dac_path_on, false, "dac_path_on",
+                              "hw_stop 关 DAC 模拟通路");
+    }
+
+  /* ADC 模拟通路同理：只有真开着才关。原来这里是无条件关的，加上新判据之后
+   * 就危险了 —— 本函数现在会在"running=false、只剩某一两个通路位为真"的状态下
+   * 也落进来（比如 hw_shutdown 之后又走到收尾），那种状态下 ADC 通路很可能
+   * 早关掉了，无条件关一次就是重复关模拟级（实测整机静默卡死）。 */
+
+  if (priv->adc_path_on)
+    {
+      HAL_AUDCODEC_Close_Analog_ADCPath();
+      sf32lb52_audio_path_bit(&priv->adc_path_on, false, "adc_path_on",
+                              "hw_stop 关 ADC 模拟通路");
+    }
 
   priv->running = false;
   audinfo("audio stopped\n");
@@ -843,12 +1062,39 @@ static int sf32lb52_audio_hw_shutdown(FAR struct sf32lb52_audio_s *priv)
   priv->aprc.State[HAL_AUDPRC_TX_CH0] = HAL_AUDPRC_STATE_READY;
   priv->aprc.State[HAL_AUDPRC_RX_CH0] = HAL_AUDPRC_STATE_READY;
 
-  /* 关功放是普通 GPIO 写，安全；只有这次确实是播放方向才碰 */
+  /* 关功放是普通 GPIO 写，安全；但判据只能用真实位 pa_on，不能用方向标签
+   * （标签会被别的 app 的一次 CONFIGURE 改掉：标签说"录音"时功放可能正开着，
+   * 那就漏关；标签说"播放"时功放可能从没开过，那就是白关一下）。
+   * 注意这条路径在**持上层锁 + 关中断**的上下文里（见本函数上面的注释），
+   * 所以这里的 syslog 只在位真的变化时才出现 —— 正常收尾一次都不会打。 */
 
-  if (priv->playback)
+  if (priv->pa_on)
     {
       sf32lb52_audio_pa_enable(false);
+      sf32lb52_audio_path_bit(&priv->pa_on, false, "pa_on",
+                              "hw_shutdown 关功放");
     }
+
+  /* 这里**不**关 DAC/ADC 模拟通路，也不清这两个位：关中断上下文里关模拟级
+   * 会整机卡死（见上面的注释）。留下的"通路还开着"由下一次 hw_stop() 收尾 ——
+   * 它的早退判据已经把这两个位算进去了（见 hw_stop 里的说明）。 */
+
+  /* 最后一件必须做的事：把可能正阻塞在 read() 里的任务放出来。
+   *
+   * 这条路径只做 DMA/寄存器和 GPIO，原来一句唤醒都没有 —— 于是"最后一个 fd
+   * 被 close、但没人发过 STOP"时（fd 被上层收掉、或 STOP 压根没送到驱动），
+   * 录音线程只能靠 read() 自己那 5 秒分片超时出来，收尾慢得离谱（真机上表现
+   * 就是 join 等 300ms 直接放弃）。这里的 post 与 hw_stop 里那句同一目的：
+   * 给出一个不依赖任何超时的出口。
+   *
+   * 关于上下文：本函数在"持 upper->lock + 关中断"里被调（见函数头的说明），
+   * nxsem_post() 在这种上下文里是合法的（它内部自己关中断，中断处理里也照样
+   * 能调），不会去碰模拟级、也不会回调上层 —— 和上面刻意避开的那两类操作不同。
+   * 顺序上 DMA 已经在前面停掉了，所以被唤醒的 read() 不会收到"采集完成"的假象。 */
+
+  priv->rx_aborted = priv->rx_busy;
+  priv->session_gen++;
+  nxsem_post(&priv->rx_sem);
 
   priv->running = false;
   return OK;
@@ -932,10 +1178,19 @@ static int sf32lb52_audio_configure(FAR struct audio_lowerhalf_s *dev,
     (FAR struct sf32lb52_audio_s *)dev;
   int ret = OK;
 
+  /* 方向只在这里记成"下一次 START 的意图"，**不动**真实通路状态、也不动
+   * 当前会话方向（真实状态要等 sf32lb52_audio_hw_start() 真的开起硬件才提交）。
+   *
+   * 原来这两行是直接写 priv->playback 的，而 ai_audio.c 的
+   * audio_hw_set_volume() 是 open + CONFIGURE(OUTPUT) + close、**不 START**：
+   * 它一进来就把正在录音的那个会话的方向标签翻成"播放"，之后录音侧收尾就
+   * 变成"按播放收尾"——去关一条没开的 DAC 通路，同时漏关真正开着的 ADC 通路。
+   * 见 struct 里真实通路位那一段注释。 */
+
   switch (caps->ac_type)
     {
       case AUDIO_TYPE_INPUT:
-        priv->playback = false;
+        priv->pending_playback = false;
         ret = sf32lb52_audio_hw_configure(priv,
                                           caps->ac_controls.hw[0] |
                                           (caps->ac_controls.b[3] << 16),
@@ -944,7 +1199,7 @@ static int sf32lb52_audio_configure(FAR struct audio_lowerhalf_s *dev,
         break;
 
       case AUDIO_TYPE_OUTPUT:
-        priv->playback = true;
+        priv->pending_playback = true;
         ret = sf32lb52_audio_hw_configure(priv,
                                           caps->ac_controls.hw[0] |
                                           (caps->ac_controls.b[3] << 16),
@@ -962,8 +1217,18 @@ static int sf32lb52_audio_configure(FAR struct audio_lowerhalf_s *dev,
              * 直接当 dB 传进去，大于 60 的一律返回 HAL_ERROR，
              * 等于上层设音量根本没生效。
              *
-             * 按当前方向生效：播放改 DAC 音量，录音改 ADC 数字增益
+             * 按方向生效：播放改 DAC 音量，录音改 ADC 数字增益
              * （这套 feature unit 里没有单独的麦克风增益控制，只能这样暴露）。
+             *
+             * 判据用"刚 CONFIGURE 的方向意图 + 那条通路真的开着"，
+             * 不再用 running + playback 这个方向标签：
+             *   - playback 只在 START 成功时才提交，别的 app 一次 CONFIGURE
+             *     就能改掉它，拿它分方向会把音量下到错的通路上；
+             *   - running 也可能是残留（上一个持有者已死），拿它当"真在录"
+             *     会去改根本没在用的 ADC 增益。
+             * 音量的数值先记进 playback_db（下一次播放启动时由 hw_start 应用），
+             * 只有 DAC 模拟通路真开着才顺手把音量写进寄存器 —— 通路没开时写它
+             * 等于去碰一条没打开的模拟级，没有必要。
              */
 
             uint16_t volume = caps->ac_controls.hw[0];
@@ -978,7 +1243,7 @@ static int sf32lb52_audio_configure(FAR struct audio_lowerhalf_s *dev,
                          (SF32LB52_AUDIO_VOL_MAX - SF32LB52_AUDIO_VOL_MIN) *
                          (int)volume / AUDIO_VOLUME_MAX;
 
-                if (priv->running && !priv->playback)
+                if (!priv->pending_playback && priv->adc_path_on)
                   {
                     priv->aprc.Init.adc_cfg.vol_l = db;
                     priv->aprc.Init.adc_cfg.vol_r = db;
@@ -988,8 +1253,12 @@ static int sf32lb52_audio_configure(FAR struct audio_lowerhalf_s *dev,
                 else
                   {
                     priv->playback_db = db;
-                    HAL_AUDCODEC_Config_DACPath_Volume(&priv->codec, 0, db);
-                    HAL_AUDCODEC_Config_DACPath_Volume(&priv->codec, 1, db);
+
+                    if (priv->dac_path_on)
+                      {
+                        HAL_AUDCODEC_Config_DACPath_Volume(&priv->codec, 0, db);
+                        HAL_AUDCODEC_Config_DACPath_Volume(&priv->codec, 1, db);
+                      }
                   }
 
                 audinfo("volume %d/1000 -> %d dB\n", volume, db);
@@ -1020,10 +1289,12 @@ static int sf32lb52_audio_shutdown(FAR struct audio_lowerhalf_s *dev)
   FAR struct sf32lb52_audio_s *priv =
     (FAR struct sf32lb52_audio_s *)dev;
 
-  if (!priv->running)
-    {
-      return OK;
-    }
+  /* 这里**故意不**用 priv->running 早退（原来那句 `if (!priv->running)
+   * return OK;` 已删）：close() 是应用退出后的最后一道收尾，而残留
+   * running==true 恰恰说明上一个持有者没走干净。无条件跑一遍
+   * hw_shutdown()，把 running 和各个 DMA/通道状态清到底，
+   * 下一个 app 才有机会拿到一个干净的会话（否则就是"ps 里没有那个 app 了，
+   * 但 hw_test 的 audio_in_start 一直 -16 EBUSY"）。 */
 
   return sf32lb52_audio_hw_shutdown(priv);
 }
@@ -1039,13 +1310,76 @@ static int sf32lb52_audio_start(FAR struct audio_lowerhalf_s *dev)
 {
   FAR struct sf32lb52_audio_s *priv =
     (FAR struct sf32lb52_audio_s *)dev;
+  bool want;
+  bool live;
+  bool dir;
+
+  /* 本次要起的方向：取最近一次 CONFIGURE 记下的意图（START 成功才提交成
+   * priv->playback）。不加这一步而直接读 priv->playback 的话，这里的"要起的
+   * 方向"其实是上一次会话的方向 —— 而这个函数在方向不同的时候必须拒绝，
+   * 判错方向就等于替别人把正在用的通路拆了。 */
+
+  want = priv->pending_playback;
+
+  /* running 已经是 true 时**不能**直接 return OK（原来就是这么写的，把整段
+   * hw_start 跳过了）：
+   *
+   * 这套硬件是半双工，设计上同一时刻只有一个持有者；NuttX 上层只在
+   * PREPARED→RUNNING 时才调 start，所以 running==true 只可能是
+   *   1) 上一个持有者（app）录音中途挂掉/退出，没走 close → 残留；
+   *   2) 同一方向的重复 START（同一个 app 自己重来一次），旧通路还没收尾。
+   * 两种情况都需要先把旧通路收干净。直接 OK 走人的后果是：ADC 模拟通路、
+   * AUDPRC 使能（都在 hw_start 里）全没做，read() 的 DMA 起得来却永远等不到
+   * 完成中断，5 秒后以 -110 收场，应用从此变聋。
+   *
+   * 但"先完整 stop 再 start"这件事**只在方向一致时**才允许做。两个 app 同时
+   * 在线时，另一个方向的通路是别人正在用的，拆掉它的后果是录音被中止（或播放
+   * 只剩第一块），比拒绝这次 START 严重得多。所以这里按真实在跑的方向分岔。
+   */
 
   if (priv->running)
     {
-      return OK;
+      /* "真实在跑的方向"= 已提交的方向 + 至少一条通路位确实开着。
+       * 三个位全假说明 running 是残留（没有对应的硬件状态），按"没有方向"
+       * 处理：那种情况下任何方向都只是残局，可以收尾后重起。
+       * 这里**不**看 priv->pending_playback 之外的东西：pending 是本次要起的
+       * 方向，把两者比一比就知道是不是在抢别人的通路。 */
+
+      live = priv->dac_path_on || priv->pa_on || priv->adc_path_on;
+      dir  = priv->playback;
+
+      if (live && dir != want)
+        {
+          /* 异方向：**拒绝**，不替对方拆台。
+           *
+           * 返回 -EBUSY 是安全的：上层两个 app 都按 -16 处理 ——
+           * audio_in_start() 把它透出来（它自己有残留会话的自愈重试），
+           * robot_ui 的 alarm_audio_open() 报 "audio open failed" 后
+           * 当次播报静默走完，都不会因为这次拒绝崩掉。 */
+
+          syslog(LOG_WARNING,
+                 "AUDIO: 拒绝方向切换：要起 %s，但 %s 通路正被占用"
+                 "（dac=%d pa=%d adc=%d running=%d）→ -EBUSY\n",
+                 want ? "播放" : "录音",
+                 dir ? "播放" : "录音",
+                 (int)priv->dac_path_on, (int)priv->pa_on,
+                 (int)priv->adc_path_on, (int)priv->running);
+          return -EBUSY;
+        }
+
+      /* 同方向：残留 / 重复 START，收干净再起 */
+
+      syslog(LOG_WARNING,
+             "AUDIO: 检测到残留运行状态（running=1 dir=%s 与本次要起的 %s 一致，"
+             "dac=%d pa=%d adc=%d），先做一次干净 stop 再启动\n",
+             dir ? "播放" : "录音",
+             want ? "播放" : "录音",
+             (int)priv->dac_path_on, (int)priv->pa_on,
+             (int)priv->adc_path_on);
+      sf32lb52_audio_hw_stop(priv);
     }
 
-  return sf32lb52_audio_hw_start(priv, priv->playback);
+  return sf32lb52_audio_hw_start(priv, want);
 }
 
 /****************************************************************************
@@ -1080,7 +1414,14 @@ static int sf32lb52_audio_enqueuebuffer(FAR struct audio_lowerhalf_s *dev,
 
   DEBUGASSERT(priv && apb);
 
-  if (priv->playback)
+  /* 队列模式的方向：正在跑就按**已提交的**会话方向（别人一次 CONFIGURE 不能
+   * 把在跑的会话的 buffer 改道），没在跑就按刚 CONFIGURE 的意图。
+   * 这是原来的等价语义 —— 原来 priv->playback 会被 CONFIGURE 直接改掉，
+   * 也就是"没 START 也按 CONFIGURE 的方向"，现在只有 START 过才算数。
+   * 本板两个 app（hello_app / robot_ui）走的都是 write/read 直通，没有队列
+   * 模式的使用者，这里只是把语义摆正、不留一个会被方向标签污染的口子。 */
+
+  if (priv->running ? priv->playback : priv->pending_playback)
     {
       priv->tx_apb = apb;
       res = HAL_AUDPRC_Transmit_DMA(&priv->aprc, apb->samp, apb->nbytes,
@@ -1158,7 +1499,8 @@ static int sf32lb52_audio_ioctl(FAR struct audio_lowerhalf_s *dev, int cmd,
  * Name: sf32lb52_audio_write
  *
  * Description:
- *   直通写入：把应用数据经 AUDPRC TX0 DMA 送出并等待播放完成。
+ *   直通写入：把应用数据经 codec 自带的 DAC DMA（HAL_AUDCODEC_Transmit_DMA）
+ *   送出并等待播放完成。
  *   （NuttX 标准 buffer 队列流程之外的简单同步播放接口）
  *
  ****************************************************************************/
@@ -1275,7 +1617,15 @@ static ssize_t sf32lb52_audio_write(FAR struct audio_lowerhalf_s *dev,
 
   priv->wr_busy = false;
 
-  /* 停止 DMA 传输（单次播放完成） */
+  /* 停止 DMA 传输（单次播放完成）。
+   *
+   * 注意这里的两下收尾大多已经做过了：DMA 完成中断里的
+   * HAL_AUDCODEC_TxCpltCallback 已经把 DAC 的 DMA 使能和 DMA 通道关掉了
+   * （sf32lb52_audio_tx_freeze）—— 就是为了不让循环 DMA 在"中断返回 → 本线程
+   * 被唤醒"这段窗口里从块首重播。这里再走一遍是给下面几条路兜底：
+   * 中断没来（等超时）、Transmit 起不来、上层提前把会话停掉。
+   * HAL_AUDCODEC_DMAStop() 内部是 HAL_DMA_Abort + 清 DAC_CHx_CFG 的 DMA_EN，
+   * 幂等，重复调没问题。 */
 
   HAL_AUDCODEC_DMAStop(&priv->codec, HAL_AUDCODEC_DAC_CH0);
   priv->codec.State[HAL_AUDCODEC_DAC_CH0] = HAL_AUDCODEC_STATE_READY;
@@ -1307,8 +1657,12 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
 {
   FAR struct sf32lb52_audio_s *priv =
     (FAR struct sf32lb52_audio_s *)dev;
+  FAR DMA_HandleTypeDef *hdma_rx;
   HAL_StatusTypeDef res;
+  uint32_t gen;
   int ret;
+
+  priv->rx_read_count++;
 
   if (buffer == NULL || buflen == 0 || !priv->running)
     {
@@ -1325,6 +1679,50 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
 
   priv->rx_busy    = true;
   priv->rx_aborted = false;
+
+  /* 本次 read 属于哪个会话。选在 nxsem_reset() 之后取：那次 reset 会把上一次
+   * stop 留下的计数清掉，而接下来任何一个 hw_stop()/hw_shutdown()/新会话的
+   * hw_start() 都会让 gen 变号 —— 只要变了，就说明这次等待已经没有意义了。 */
+
+  gen = priv->session_gen;
+
+  hdma_rx = priv->aprc.hdma[SF32LB52_AUDIO_PRC_RX_CH];
+
+  /* 起传输前先把 DMA 句柄的状态摆正 —— 和 write() 里那层兜底对称（write 侧
+   * 对应的是 codec 的 DAC 句柄，这边是 AUDPRC 的 RX 句柄）。
+   *
+   * 为什么必须兜：厂商的 HAL_DMA_Start_IT() 只在 hdma->State ==
+   * HAL_DMA_STATE_READY 时才真正发传输，否则直接返回 HAL_BUSY 什么都不做
+   * （bf0_hal_dma.c:829 判 READY，否则 883 行 status = HAL_BUSY 后 goto __EXIT）；
+   * 而 HAL_AUDPRC_Receive_DMA() 把它的返回值**丢掉**，自己照样 return HAL_OK
+   * （bf0_hal_audprc.c:818 调用处没接返回值，828 行无条件 return HAL_OK）。
+   * 于是句柄只要残留非 READY，read() 就会"以为起来了、其实没起"，一路干等 5 秒
+   * 以 -110 收场 —— 正是这层兜底要堵的洞。
+   *
+   * 兜法分两步，缺一不可：
+   *   1) HAL_AUDPRC_DMAStop() 内部是 HAL_DMA_Abort()，它把 hdma->State 置 READY
+   *      （bf0_hal_dma.c:923）；真正把通道收干净的是这一步；
+   *   2) 再手动把两个 State 都置 READY。因为同一个 DMAStop 里厂商把
+   *      `haprc->State = HAL_AUDPRC_STATE_READY` 那行**注释掉了**
+   *      （bf0_hal_audprc.c:850），只 abort 不看 haprc->State 的话，
+   *      Receive_DMA 开头那句 `State & HAL_AUDPRC_STATE_BUSY_RX` 判断
+   *      （bf0_hal_audprc.c:774）照样会回 HAL_BUSY —— 这是本文件里已经踩过的
+   *      同族坑（见下面 DMAStop 之后的注释）。
+   *
+   * 这条警告正常录音时一次都不该出现；出现了就说明上一条路径没收好尾。 */
+
+  if (hdma_rx != NULL && hdma_rx->State != HAL_DMA_STATE_READY)
+    {
+      syslog(LOG_WARNING,
+             "AUDIO: RX 的 DMA 句柄状态残留(0x%x)，先停 DMA 再强制复位成 READY\n",
+             (unsigned)hdma_rx->State);
+
+      HAL_AUDPRC_DMAStop(&priv->aprc, SF32LB52_AUDIO_PRC_RX_CH);
+
+      hdma_rx->State = HAL_DMA_STATE_READY;
+      priv->aprc.State[SF32LB52_AUDIO_PRC_RX_CH] = HAL_AUDPRC_STATE_READY;
+    }
+
   res = HAL_AUDPRC_Receive_DMA(&priv->aprc, (FAR uint8_t *)buffer, buflen,
                                SF32LB52_AUDIO_PRC_RX_CH);
 
@@ -1335,7 +1733,51 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
   if (res != HAL_OK)
     {
       priv->rx_busy = false;
-      syslog(LOG_ERR, "AUDIO: read 起 DMA 失败 %d\n", (int)res);
+      priv->rx_dma_busy_fail++;
+
+      /* 起不来 DMA 的现场：HAL 手上有 hdma_rx 的通道状态和 aprc 的通道状态，
+       * 两个都打出来才能分清是"AUDPRC 这一侧还认为 RX 在忙"还是
+       * "DMA 通道自己没释放"。hdma_rx 可能还没分配（hw_init 失败过），
+       * 所以打 State 前先判空，不能为了日志把驱动打崩。 */
+
+      syslog(LOG_ERR,
+             "AUDIO: read 起 DMA 失败 res=%d aprc.State[RX]=0x%x "
+             "hdma[RX].State=0x%x running=%d\n",
+             (int)res,
+             (unsigned)priv->aprc.State[SF32LB52_AUDIO_PRC_RX_CH],
+             hdma_rx != NULL ? (unsigned)hdma_rx->State : 0u,
+             (int)priv->running);
+      return 0;
+    }
+
+  /* 返回 HAL_OK 也不能就信 —— 上面说过，Receive_DMA 把 HAL_DMA_Start_IT() 的
+   * 返回值丢了，自己无条件 return HAL_OK（bf0_hal_audprc.c:818 / 828）。
+   * 所以这里再验一次"到底起没起"：Start_IT 成功时会把句柄置成
+   * HAL_DMA_STATE_BUSY（bf0_hal_dma.c:841），没进 BUSY 就说明它走了 else 分支
+   * 直接 return HAL_BUSY，DMA 一个字节都不会传。
+   *
+   * 这种情况**不能**接着往下等：等下去必然是 5 秒后那个 -110，而且把时间白白
+   * 花掉。直接返回 0（上层拿到 0 就走正常收尾、把麦克风还回去），并把句柄没
+   * 到位这件事记进 rx_dma_not_armed —— 它是"OK 但没起来"这一类坏法的唯一凭据
+   * （busy_fail 只统计 res 非 HAL_OK，压根覆盖不到这里）。
+   *
+   * 顺手把 aprc 的 RX 通道状态掰回 READY：Receive_DMA 在 Start_IT **之前**就
+   * 先把 State 置成了 BUSY_RX（bf0_hal_audprc.c:785），不回退的话本次会话后面
+   * 每一次 read 都会被开头那句 BUSY_RX 判断直接挡回去（774 行）。这里只做一个
+   * 字段写，不碰寄存器，也就没有"句柄可能还没分配过通道"的风险。 */
+
+  if (hdma_rx != NULL && hdma_rx->State != HAL_DMA_STATE_BUSY)
+    {
+      priv->rx_busy = false;
+      priv->rx_dma_not_armed++;
+      priv->aprc.State[SF32LB52_AUDIO_PRC_RX_CH] = HAL_AUDPRC_STATE_READY;
+
+      syslog(LOG_ERR,
+             "AUDIO: read 的 DMA 其实没起来（hdma[RX].State=0x%x "
+             "aprc.State[RX]=0x%x running=%d not_armed=%u），不等了直接返回 0\n",
+             (unsigned)hdma_rx->State,
+             (unsigned)priv->aprc.State[SF32LB52_AUDIO_PRC_RX_CH],
+             (int)priv->running, (unsigned)priv->rx_dma_not_armed);
       return 0;
     }
 
@@ -1343,9 +1785,14 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
    * 上层的 audio_record_stop() 是"先停设备再 join 录音线程"，而 join 是在
    * LVGL 线程里调的。实测出现过"停设备那一下没能唤醒这个等待、5 秒超时也没
    * 回来"（提交按钮一直绿着、界面整块卡死），录音线程于是永远出不来。
-   * 分片之后：每 100ms 主动看一眼 rx_aborted / running，只要 stop 走过就把
-   * 这一片收掉返回 0，最坏 100ms 就能把录音线程放出来，不再靠那一次 post
-   * 或者那一次超时。 */
+   * 分片之后：每 100ms 主动看一眼 rx_aborted / running / 会话代号，只要
+   * stop（或 close）走过就把这一片收掉返回 0，最坏 100ms 就能把录音线程
+   * 放出来，不再靠那一次 post 或者那一次超时。
+   *
+   * 第三个判据（会话代号）是给"post 没生效 / 状态没来得及更新"兜底的：
+   * 它比对的是**本次 read 的时代还在不在**，不依赖任何人把标志写好或者记得
+   * 唤醒这个任务 —— 真机上正是"唤醒没生效"导致录音线程收不了尾（见那次的
+   * AUDIOIOC_STOP failed: 25 与 300ms join 超时）。 */
 
   {
     int slice;
@@ -1354,7 +1801,8 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
       {
         ret = nxsem_tickwait_uninterruptible(&priv->rx_sem, MSEC2TICK(100));
 
-        if (ret == OK || priv->rx_aborted || !priv->running)
+        if (ret == OK || priv->rx_aborted || !priv->running ||
+            gen != priv->session_gen)
           {
             break;
           }
@@ -1363,10 +1811,10 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
 
   priv->rx_busy = false;
 
-  /* 被 stop() 打断（或设备已经不在跑了）：按 EOF 返回（不能报 buflen，
-   * 数据并没采满；上层拿到 0 就会跳出录音循环、把麦克风还回去）。 */
+  /* 被 stop() / close / 新会话打断（或设备已经不在跑了）：按 EOF 返回（不能报
+   * buflen，数据并没采满；上层拿到 0 就会跳出录音循环、把麦克风还回去）。 */
 
-  if (priv->rx_aborted || !priv->running)
+  if (priv->rx_aborted || !priv->running || gen != priv->session_gen)
     {
       priv->rx_aborted = false;
       HAL_AUDPRC_DMAStop(&priv->aprc, SF32LB52_AUDIO_PRC_RX_CH);
@@ -1390,9 +1838,31 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
     {
       /* 分片等待里出现过超时（也可能是 stop 把 running 清掉后正常回 0）。
        * 用 syslog：这条在真机上必须看得见 —— 上层录音线程就是靠 read 返回
-       * 0 才能跳出循环退出的。 */
+       * 0 才能跳出循环退出的。
+       *
+       * 这里是 -110 的现场：5 个计数 + 两个通道状态 + running/playback 一起打，
+       * 不做限流（超时本来就是异常路径，正常录音一次都不该出现）。
+       * 判读方式：
+       *   irq=0 而 read 在涨 → DMA 起了但完成中断一个都没来，回到 hw_start
+       *                        那条 LOG_INFO 看它到底跑没跑；
+       *   irq 在涨           → 中断是来的，问题在等待/唤醒这一段。 */
 
-      syslog(LOG_WARNING, "AUDIO: read 等 DMA 超时/被停（ret=%d）\n", ret);
+      priv->rx_timeout_count++;
+
+      syslog(LOG_WARNING,
+             "AUDIO: read 等 DMA 超时/被停（ret=%d）"
+             " irq=%u read=%u timeout=%u busy_fail=%u not_armed=%u"
+             " aprc.State[RX]=0x%x hdma[RX].State=0x%x"
+             " running=%d playback=%d\n",
+             ret,
+             (unsigned)priv->rx_irq_count,
+             (unsigned)priv->rx_read_count,
+             (unsigned)priv->rx_timeout_count,
+             (unsigned)priv->rx_dma_busy_fail,
+             (unsigned)priv->rx_dma_not_armed,
+             (unsigned)priv->aprc.State[SF32LB52_AUDIO_PRC_RX_CH],
+             hdma_rx != NULL ? (unsigned)hdma_rx->State : 0u,
+             (int)priv->running, (int)priv->playback);
       return 0;
     }
 
@@ -1493,7 +1963,6 @@ void HAL_AUDCODEC_TxCpltCallback(AUDCODEC_HandleTypeDef *hacodec, int cid)
 {
   FAR struct sf32lb52_audio_s *priv;
 
-  (void)cid;
   if (hacodec == NULL)
     {
       return;
@@ -1505,6 +1974,17 @@ void HAL_AUDCODEC_TxCpltCallback(AUDCODEC_HandleTypeDef *hacodec, int cid)
   if (priv->wr_busy)
     {
       priv->wr_busy = false;
+
+      /* 传输完成：**先冻结再唤醒 write()**。
+       * 顺序反了（或者干脆不冻结）就会在"唤醒 → 线程真的跑到 DMAStop()"
+       * 这段窗口里从块首重播，每块一声"啪" —— 详见 tx_freeze 的注释。
+       * write() 只用 DAC_CH0，别的通道进来不动。 */
+
+      if (cid == HAL_AUDCODEC_DAC_CH0)
+        {
+          sf32lb52_audio_tx_freeze(priv);
+        }
+
       nxsem_post(&priv->wr_sem);
     }
 }
@@ -1520,6 +2000,12 @@ void HAL_AUDPRC_RxCpltCallback(AUDPRC_HandleTypeDef *haprc, int cid)
 
   priv = (FAR struct sf32lb52_audio_s *)
          ((FAR char *)haprc - offsetof(struct sf32lb52_audio_s, aprc));
+
+  /* 无条件计数，**放在 rx_busy 判断之前**：这条只回答一个事实 ——
+   * "RX 完成中断到底来过没有"。如果它在 read 超时时还是 0，就说明
+   * DMA 根本没收到数据/中断没使能，而不是等待逻辑的问题。 */
+
+  priv->rx_irq_count++;
 
   if (priv->rx_busy)
     {
