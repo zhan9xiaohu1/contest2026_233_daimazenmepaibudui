@@ -46,6 +46,12 @@
  * （listen_supervise_tick，跑在主循环线程里）—— 理由见 mic_hold_apply 的说明。 */
 #include "ai_companion_yield.h"
 
+/* 只读诊断快照（robot_ui 的 network_task 每 30 秒的心跳、以及每次
+ * {"action":"diag"} 都会来问一次）：调用契约写在那个头文件头上，这里只实现
+ * 内部门面 ai_companion_state_snapshot_impl()（真话得从本文件的 static 里拿）。
+ * 那个头文件同样是自给自足的 —— robot_ui 也要 include 它。 */
+#include "ai_companion_diag.h"
+
 #include "voice/voice_asr.h"
 #include "voice/voice_tts.h"
 #include "volc_asr.h"
@@ -201,9 +207,28 @@ static care_context_t g_care_ctx;
 /* 全局网络上下文（AI 回复/表情/报警要回传给界面，见 ai_network.h） */
 static ai_network_context_t g_net_ctx;
 
+/* 网络回传通道的**补连**状态（主循环每拍跑 net_retry_tick，见那一段的说明）：
+ *   g_net_client_id    —— 补连时复用 main() 收到的 --client-id（可能是 NULL，
+ *                         ai_network_set_client_id() 自己会兜默认值）
+ *   g_net_retry_at     —— 下次补连的时间点（0 = 还没排，先等 NET_RETRY_INTERVAL_MS）
+ *   g_net_retry_count  —— 补连尝试次数（日志节流 + 诊断快照的 nrt 字段） */
+
+static const char *g_net_client_id;
+static uint32_t    g_net_retry_at;
+static uint32_t    g_net_retry_count;
+
 /* 语音段累积缓冲区 (用于 ASR) */
 
 #define SPEECH_BUF_MAX_FRAMES  (16000 * 10)  /* 最长10秒 @16kHz */
+
+/* 一段语音至少要有多长才值得送去识别：1600 帧 = 100ms @16kHz。
+ * 两个地方共用它，口径必须一致：
+ *   - process_ai_dialogue()：不够长就"语音数据不足，跳过"（不白跑一次识别）；
+ *   - ai_companion_voice_submit()：「提交」按同一个门槛判"有没有听到人说话"
+ *     —— 不够长就什么都不登记，界面提示"没听到你说什么"。 */
+
+#define SPEECH_MIN_FRAMES_FOR_ASR  1600
+
 static int16_t *g_speech_buf = NULL;
 static size_t   g_speech_frames = 0;
 static bool     g_speech_capturing = false;
@@ -488,6 +513,24 @@ static void speech_capture_begin(sm_context_t *ctx)
 }
 
 /**
+ * @brief  这一段语音说完了：走 ASR（VAD 静音超时 和 「提交」共用这一段）
+ *
+ * 只有一份是刻意的：「提交」只是把静音超时**提前**，语义必须和自动断句完全
+ * 一致（清 capturing → 状态机 VOICE_COMPLETE → AI_TALKING → process_ai_dialogue
+ * 送 ASR）。两条路的差别只有"谁在什么时候调它"：
+ *   - 自动断句：ai_audio.c 的录音线程判到静音超时 → vad_callback(false) → 这里；
+ *   - 「提交」：录音线程的数据回调（audio_data_callback）认领到请求 → 这里。
+ * 两条都在**同一条录音线程**上，所以不存在"两个线程同时收尾"的时序问题。
+ */
+
+static void speech_capture_complete(sm_context_t *ctx)
+{
+  printf("[VAD] 语音结束 (累积 %zu 帧)\n", g_speech_frames);
+  g_speech_capturing = false;
+  sm_handle_event(ctx, SM_EVENT_VOICE_COMPLETE);
+}
+
+/**
  * @brief  VAD回调 - 语音活动检测
  */
 
@@ -502,16 +545,14 @@ static void vad_callback(bool speech_detected, void *user_data)
     }
   else
     {
-      printf("[VAD] 语音结束 (累积 %zu 帧)\n", g_speech_frames);
-      g_speech_capturing = false;
-      sm_handle_event(ctx, SM_EVENT_VOICE_COMPLETE);
+      speech_capture_complete(ctx);
     }
 }
 
 static void audio_data_callback(const int16_t *data, size_t frames,
                                 void *user_data)
 {
-  (void)user_data;
+  sm_context_t *ctx = (sm_context_t *)user_data;
 
   /* 累积语音数据到缓冲区，供 ASR 使用 */
 
@@ -524,6 +565,41 @@ static void audio_data_callback(const int16_t *data, size_t frames,
           memcpy(&g_speech_buf[g_speech_frames], data,
                  copy * sizeof(int16_t));
           g_speech_frames += copy;
+        }
+    }
+
+  /* 「提交」（语音聊天镜像面板底部那个按钮）：外部请我们"立刻收尾这一段"，
+   * 就在这里做掉。
+   *
+   * ★ 为什么偏偏在这条线程、这个位置：
+   *   - 这里是**录音线程**（ai_audio.c 的 audio_record_thread 每帧回调一次），
+   *     而 VAD 判"说完了"本来也在这条线程上，就在本回调前面几行。用同一条线程、
+   *     同一段收尾代码（speech_capture_complete），就不存在"两条路同时收尾"的
+   *     时序问题；
+   *   - 换别的线程做（主循环 / 让路线程）会把整段 ASR（阻塞 HTTPS）拽到那条线程
+   *     上阻塞几秒甚至几十秒 —— 让路线程被拽住就是"提醒的提示音又等不到让路"，
+   *     主循环被拽住会拖住监听守护和追问流程。这两个坑本文件都踩过（见让路线程
+   *     与监听守护那两节的说明），所以「提交」不往那两条线程上加东西。
+   *
+   * 顺序：先认领（一次性，读走就清），再判有没有真的在累积 —— 没有就安静地丢掉
+   * （界面那边已经据此提示过"没听到你说什么"了，这里只留一行日志）。
+   * ⚠️ 必须同时把 VAD 的相位收掉（audio_vad_end_speech）：不然 3 秒后静音超时
+   * 还会就**同一段音频**再报一次"语音结束"，同一句话会被送去识别两次。 */
+
+  if (ai_companion_voice_submit_take())
+    {
+      if (g_speech_capturing && g_speech_buf != NULL && g_speech_frames > 0)
+        {
+          printf("[语音] 「提交」：不等静音超时，立刻收尾这一段(累积 %zu 帧)\n",
+                 g_speech_frames);
+          audio_vad_end_speech(&g_audio_ctx);
+          speech_capture_complete(ctx);
+        }
+      else
+        {
+          /* 竞态的正常一面：人刚好在这前后自己停了（VAD 抢先收尾）/ 按下按钮
+           * 时还没真正开始说。什么都不做，别把空的一轮塞给状态机。 */
+          printf("[语音] 「提交」：当前没有在累积的语音，忽略这一次\n");
         }
     }
 
@@ -725,6 +801,48 @@ static void stop_audio_listening(void)
 
 #define MIC_RELEASE_DEADLINE_MS  1500
 
+/* ★ 让路**看门狗**（毫秒）：让路请求被认领之后，等这么久还没收到 RECLAIM
+ * （调用方 robot_ui 漏了 / 丢了回收请求，或者它自己卡住了），就**强制收回**：
+ * 恢复"要常听"的意图、按正常路径重开常开麦、清掉"已让出"状态，并打一行
+ * `[让路] 收回请求超时，强制恢复常开麦…`。
+ *
+ * 为什么必须有它：让路期间 stop_audio_listening() 把 g_listen_wanted 一起收掉了
+ * （这正是让监听守护别把麦抢回来的机制），所以**漏一次 reclaim = hello_app 永久
+ * 聋着，而且串口一行日志都没有** —— 外面只知道"老人说话它没反应"。
+ * robot_ui 那条漏 reclaim 的真实路径：voice_mic_release_if_idle() 在"正在出声"
+ * 时不还，归还只压在播放完成回调上，而 audio_play.c/ai_audio.c 里被
+ * audio_play_stop() 打断的播放**不回调** → 那次 reclaim 永远不登记。
+ * 现在这条路的收尾是这行日志 + 10 秒后自动恢复，不再是"永久聋"。
+ *
+ * 为什么取 10000ms（= 一次正常播报的上限 + 余量）：
+ *   - 下限受三件事夹住：调用方等让路的首轮上限 1500ms（REMINDER_YIELD_WAIT_MS）、
+ *     让路推迟上限 YIELD_DEFER_MAX_MS = 3000ms（主正在出声时会先推迟受理）、
+ *     以及让路线程最长两拍 100ms。也就是说"认领"这个动作本身就可能晚到 3 秒多，
+ *     看门狗不能比它短，否则会把**还没轮到受理**的让路误判成超时。
+ *   - 上限由"一次正常让路最长有多长"定，这条比第一条更紧：
+ *       调用方等让路的上限（robot_ui 的 REMINDER_YIELD_WAIT_MS 首轮 1500ms
+ *       + 两次补等 (400+500)×2 = 3300ms，不过正常情况下几百毫秒就让开了）
+ *       + 播报本身（文案「该<标题>了」念两遍，标题最长 20 字时约 5 秒）
+ *     最坏合计 8 秒多。取 10 秒就是在它上面留 1.5~2 秒余量 ——
+ *     **宁可晚 2 秒恢复，也不能把一次正在播的提醒掐掉**
+ *     （本板音频半双工，重开麦就会挤掉那一段）。
+ *   - 再往大取（15s/30s）就是另一种毛病：真漏了 reclaim 时老人要白等那么久，
+ *     "老人喊半天没反应"和"永久聋"只差程度；而且这段时间里监听守护被
+ *     g_mic_hold_active 挡着，谁也救不了。
+ *   - 它也**远小于**监听守护的"忙"上限 LISTEN_SUPERVISE_FORCE_MS(45s)：
+ *     那条路只在"录音不活跃"时兜底，让路期间守护连门都进不去（g_mic_hold_active
+ *     挡着），所以真正的兜底只能是本看门狗。
+ *   - 误判的代价是可控的：超过 10 秒的超长播报会被打断一次，hello_app 重开麦，
+ *     而调用方下次 yield(true) 会重新登记，一切照旧；调用方也可以在一次长播报
+ *     里重复登记 yield(true) 来**续租**（见 mic_hold_tick 里那段，重复登记会把
+ *     这个计时重置）。
+ *
+ * 计时起点是"认领那一刻"（mic_hold_apply 里置），**每次收到新的登记都重置**
+ * （见 mic_hold_tick 里的续租那一段）—— 这就是"别把 robot_ui 正在正常播报
+ * 误判成超时"的机制。 */
+
+#define MIC_HOLD_WATCHDOG_MS     10000
+
 /* 让路线程两拍之间最多等这么久（毫秒）。它就是"让路被受理"的时延上限：
  * 主循环被 ASR/TTS 阻塞几十秒也一样是这个数，所以**不许调大**（原来的做法是
  * 等主循环那一拍，同样 100ms —— 换线程只是把"等"从别处挪到自己身上）。
@@ -746,6 +864,42 @@ static void stop_audio_listening(void)
 
 #define YIELD_DEFER_MAX_MS       3000
 
+/* ★ 让路线程的**存活判据**（毫秒）：它每跑一圈就把时间戳刷新一次
+ * （g_yield_worker_beat_ms），主循环 100ms 看一次，超过这么久没刷新就判它
+ * 卡死/死了，**退回主循环自己处理让路请求**，并把 g_mic_device_busy 清掉。
+ *
+ * 为什么必须换成"心跳"这种判据：g_yield_worker_up 原来是**创建时**置 true、
+ * 只有线程自己正常退出才置 false —— 它记的是"**创建过**"，不是"**还活着**"。
+ * 线程一旦卡在 mic_hold_apply()（→ stop_audio_listening() → audio_record_stop()
+ * → audio_in_stop()）里不返回：g_mic_device_busy 永不归零、g_yield_worker_up
+ * 永远为 true，而 mic_hold_tick() 看到 up 为真就**只 post 信号量**、永远不退回
+ * "主循环自己动手"那条退路 → 请求再也没人受理，永久聋。
+ *
+ * 为什么取 2000ms：正常一圈是 YIELD_WORKER_WAIT_MS = 100ms；一圈里最慢的一段是
+ * 动设备那一手（audio_record_stop 回收录音线程的上限 300ms）+ 等 g_mic_device_lock
+ * （主循环起播那一小段持有，毫秒级）。这些都远小于 2 秒，所以 2 秒没心跳只可能是
+ * "它不回来了"，不是"它忙"。也不能取太小（比如 500ms）：那会把"正卡在
+ * audio_record_stop 那 300ms 里"的正常情况误判掉，主循环和它同时上手同一个设备。 */
+
+#define YIELD_WORKER_STALL_MS    2000
+
+/* ★ 网络回传通道的补连间隔（毫秒）：开机那一次 ai_network_start_shared() 失败
+ * （RNDIS / DNS 还没就绪的常见情况）之后，主循环每隔这么久再试一次，成功即停。
+ *
+ * 为什么必须有它：g_net_started 只在开机成功时置真一次，而 voice_state /
+ * user_said / ai_reply / 报警 这一整排上报全在 `if (!g_net_started) return;`
+ * 之后 —— 开机没连上就是**整场一条都不发**，从外面（MQTT 是唯一的观测通道）
+ * 完全看不出 hello_app 是死是活。
+ *
+ * 为什么取 10 秒：单次尝试本身最长要等 AI_MQTT_SHARED_WAIT_MS = 3000ms
+ * （先等界面的 network_task 把连接建起来，见 ai_network.c），而它跑在**主循环
+ * 这条线程**上 —— 试得太密会把监听守护和让路的退路一起拖慢。10 秒 = 最多 3 秒
+ * 等待 + 7 秒正常干活。失败日志按下面的节流打，不刷屏。 */
+
+#define NET_RETRY_INTERVAL_MS    10000
+#define NET_RETRY_LOG_FIRST      3     /* 前 3 次每次打（开头最需要看见） */
+#define NET_RETRY_LOG_EVERY      6     /* 之后每 6 次（约 1 分钟）一条 */
+
 /* 让路的处理状态。换线程之后写者是**让路线程**（yield_worker_task；让路线程起不
  * 来时才是 main_loop_task 的 mic_hold_tick()），别的线程只读 —— 全 volatile，
  * 给 ai_companion_mic_released() 那条跨 app 的读路径和监听守护用：
@@ -753,22 +907,39 @@ static void stop_audio_listening(void)
  *                                也是"让路期间不许重开麦"的那道闸
  *   g_mic_hold_at             —— 认领那一刻的时间戳（算上面那个 1500ms 用）
  *   g_mic_hold_release_failed —— 兜底已经判过并打过日志了，别重复刷屏
+ *   g_mic_hold_watchdog_at    —— **收回看门狗**的计时起点（认领那一刻置，
+ *                                之后每次收到新的登记都重置 = 续租）
+ *   g_mic_hold_forced         —— 本次让路里看门狗已经强制收回过了（给诊断看的；
+ *                                下一次让路认领时清掉）
  *   g_mic_device_busy         —— 认领者正拿着设备开关（impl 正在跑）。查询函数
  *                                见到它就报"还没让出"（宁可比真的晚一点点，
- *                                也不能让调用方以为设备空了） */
+ *                                也不能让调用方以为设备空了）。
+ *                                让路线程被判死（g_yield_worker_dead）时它会被
+ *                                主循环强制清零 —— 半程标志挂在一条不回来的
+ *                                线程上，只会一直挡着监听守护 */
 
 static volatile bool     g_mic_hold_active;
 static volatile uint32_t g_mic_hold_at;
 static volatile bool     g_mic_hold_release_failed;
 static volatile bool     g_mic_device_busy;
+static volatile uint32_t g_mic_hold_watchdog_at;
+static volatile bool     g_mic_hold_forced;
 
 /* ---- 让路线程的共享量 ----
  *
- * g_yield_worker_up       —— 线程在跑（mic_hold_tick 靠它决定"只唤醒"还是
- *                            "退回老做法自己动手"）。由创建者置 true、线程收尾时置 false
+ * g_yield_worker_up       —— 线程"还在"（mic_hold_tick 靠它决定"只唤醒"还是
+ *                            "退回老做法自己动手"）。由创建者置 true、线程收尾时
+ *                            置 false、**被判卡死时也由主循环置 false**
  * g_yield_worker_created  —— 成功创建过（退出时 join 用；只有 main() 读写）
+ * g_yield_worker_beat_ms  —— 线程的**心跳**（每跑一圈刷新一次）。主循环用它判
+ *                            "还活着"：见 YIELD_WORKER_STALL_MS
+ * g_yield_worker_dead     —— 心跳看门狗判过它卡死，设备动作权已交回主循环。
+ *                            它一旦为真就不再翻回 false（卡死的线程不会复活；
+ *                            真退出了也只是让这个判断失去意义而已）
  * g_mic_req_handled       —— 已经受理过的请求方向（电平语义：和
  *                            ai_companion_mic_request() 比一比就知道是不是新请求）
+ * g_mic_req_seq_seen      —— 上一次看到的请求序号（ai_companion_mic_request_seq()）。
+ *                            变了 = 调用方又登记了一次 → 让路期间算"续租"
  * g_mic_req_pending_at    —— 第一次看到这个请求还没受理的时刻（算推迟上限用）
  * g_mic_play_seen_ms      —— 最近一次看到"主正在出声"的时刻（算收尾余量用）
  * g_mic_hold_defer_logged —— "推迟受理"的日志只打一行，别每 100ms 刷一次 */
@@ -777,7 +948,10 @@ static pthread_t         g_yield_worker;
 static sem_t             g_yield_worker_sem;
 static volatile bool     g_yield_worker_up;
 static bool              g_yield_worker_created;
+static volatile uint32_t g_yield_worker_beat_ms;
+static volatile bool     g_yield_worker_dead;
 static volatile int      g_mic_req_handled = AI_COMPANION_MIC_REQ_NONE;
+static volatile uint32_t g_mic_req_seq_seen;
 static volatile uint32_t g_mic_req_pending_at;
 static uint32_t          g_mic_play_seen_ms;
 static volatile bool     g_mic_hold_defer_logged;
@@ -886,6 +1060,169 @@ int ai_companion_mic_released(void)
   return mic_still_held() ? 0 : 1;
 }
 
+/****************************************************************************
+ * ai_companion_diag_snapshot() 的内部门面（薄壳在 ai_companion_diag.c）
+ *
+ * robot_ui 的 network_task 每 30 秒（心跳里那个 ha 位）和每次
+ * {"action":"diag"} 都会来这里读一次。本函数是整个模块里**唯一**能读到这一堆
+ * static 的地方，它只读、不写、不碰设备、不加锁 —— 那三条纪律的来由写在
+ * ai_companion_diag.h 头上（调用方是 MQTT 收包线程，它一阻塞，唯一的观测通道
+ * 就一起没了）。不能碰设备这一条尤其重要：本文件里所有会动设备的动作都排在
+ * 让路线程和主循环那两条线程上，这里多伸一只手就是那次事故的形状。
+ *
+ * 为什么交出去的是一行 "key=value" 文本、而不是直接拼好 JSON：
+ *   键名和字段口径（哪些写数字、拿不到写什么、缓冲小了怎么截断）归
+ *   ai_companion_diag.c；这里只负责"值"。而 robot_ui 也会 include 那个头文件，
+ *   用文本就省得把 hello_app 的内部类型（甚至一个专用结构体）暴露到 app 外面。
+ *
+ * 为什么在这里读状态是安全的（可能读到慢一拍的值，但不会读到"半截"）：
+ *   一个线程写、其他线程读的这几个量全是 32 位对齐的 bool / int / uint32
+ *   （Cortex-M 上的读写本身就是原子的），把它们加锁反而等于把调用方挂到
+ *   hello_app 的线程上；诊断要的是"现在大概什么形状"，慢一拍正是那点代价。
+ *   唯一要留神的是"让路线程正拿着设备开关"那一小段：那时录音的几个标志本来
+ *   就是半程状态，读出来的组合可能自相矛盾（比如 ract=0 而 recording=1）。
+ *   这不是 bug，报文里有 busy 这个字段专门说明"现在正有人在动设备"。
+ *
+ * 两个时间戳（vad / asr）这里**不写**：本文件里 VAD 回调、ASR 那两条路上
+ * 没有记时刻的地方，硬编一个 -1 出来只会让人以为"记了但是没发生"。
+ * 按 diag.c 的规矩，"没写进来的键 = 取不到"，那边会输出 -1；以后真在这里
+ * 记了时刻，只要按同样的写法加进这一行，报文那侧一个字节都不用改。
+ ****************************************************************************/
+
+void ai_companion_state_snapshot_impl(char *buf, size_t len)
+{
+  int n;
+
+  if (buf == NULL || len == 0)
+    {
+      return;
+    }
+
+  buf[0] = '\0';
+
+  /* 值全部现读，顺序随便（diag.c 是按 key 找的）。run / audio 放最前面是因为
+   * 它们决定"hello_app 在不在"—— 万一将来字段多到快照被截断，这两个也必须
+   * 还在（后面的字段被截掉只会让那几个字段报 -1）。
+   *
+   * 每个量的出处：
+   *   idle / lres / wait / empty —— ai_audio.c 的四个录音观测（那边只由录音
+   *     线程写）；idle 是"距最近一次读到数据多久"，wait 是"此刻等设备等了多久"，
+   *     两个一起看才分得清"没在等"（-1，正常）和"一直在等"（数据流可能死了）；
+   *   hold / want / busy / req —— 让路这套（req 是调用方登记的方向，
+   *     0 无 1 让路 2 收回；want 是"我要常听"的意图，和 start 不是一回事）；
+   *   wd / wdead / nrt —— 2026-09-15 加的三条自愈状态：
+   *     wd = 本次让路里收回看门狗已经强制收回过（说明调用方漏了 / 丢了 RECLAIM，
+   *          配合 hold/want 一起看）；
+   *     wdead = 让路线程的心跳看门狗判过它卡死（设备动作权已交回主循环，
+   *          busy 会被强制清零，req 之后由主循环受理）；
+   *     nrt = 网络回传通道补连尝试过多少次（0 = 开机就连上了，没有自愈动作；
+   *          配合 net 一起看：net=0 而 nrt 在涨 = 一直在补但从没连上）；
+   *   cap / sp —— 语音段累积（"到底有没有听到人说话"的直接证据）；
+   *   kws —— 唤醒词模板条数（0 = 没装模板，唤醒词功能等于没开）。 */
+
+  n = snprintf(buf, len,
+               "run=%d audio=%d start=%d rec=%d ract=%d died=%d exit=%d "
+               "idle=%d lres=%d wait=%d empty=%u hold=%d want=%d busy=%d "
+               "req=%d net=%d wd=%d wdead=%d nrt=%u cap=%d sp=%u kws=%d sm=%s",
+               g_running ? 1 : 0,
+               g_audio_ctx.initialized ? 1 : 0,
+               g_audio_started ? 1 : 0,
+               g_audio_ctx.recording ? 1 : 0,
+               audio_record_is_active(&g_audio_ctx) ? 1 : 0,
+               g_audio_ctx.record_died ? 1 : 0,
+               g_audio_ctx.record_exited ? 1 : 0,
+               audio_record_idle_ms(&g_audio_ctx),
+               audio_record_last_result(&g_audio_ctx),
+               audio_record_wait_ms(&g_audio_ctx),
+               (unsigned)audio_record_empty_reads(&g_audio_ctx),
+               g_mic_hold_active ? 1 : 0,
+               g_listen_wanted ? 1 : 0,
+               g_mic_device_busy ? 1 : 0,
+               ai_companion_mic_request(),
+               g_net_started ? 1 : 0,
+               g_mic_hold_forced ? 1 : 0,
+               g_yield_worker_dead ? 1 : 0,
+               (unsigned)g_net_retry_count,
+               g_speech_capturing ? 1 : 0,
+               (unsigned)g_speech_frames,
+               g_kws_ready,
+               sm_get_state_name(sm_get_state(&g_sm_ctx)));
+
+  if (n < 0 || (size_t)n >= len)
+    {
+      /* 截断了（字段变多到那一行装不下 384 字节才会碰上）。snprintf 已经把
+       * 放得下的部分收好尾了，这里只是再保证一次结尾有 '\0'；调用方按
+       * "后半截的键没写进来"处理，也就是那几个字段报 -1。 */
+
+      buf[len - 1] = '\0';
+    }
+}
+
+/****************************************************************************
+ * 跨 app「提交」请求（薄壳在 ai_companion_yield.c）
+ *
+ * robot_ui 语音聊天**镜像面板**底部那个按钮（用户原话：「下面是关闭按钮，我希望
+ * 换成提交按钮」）点一下 = "我说完了，立刻把这一段送去识别"，不等 VAD 那 3 秒
+ * 静音超时。接口的契约、纪律、为什么非阻塞都写在 ai_companion_yield.h 的声明处；
+ * 这里只补实现上的取舍：
+ *
+ * ★ 为什么本函数可以在这里**读** hello_app 的状态就下结论：
+ *   它只做"看一眼 + 登记"两件事，一个设备都不碰，所以任何线程（现在是 robot_ui
+ *   的 LVGL 线程）都可以调。真正的收尾动作交给录音线程（见 audio_data_callback），
+ *   这里读到的快照**只用来**决定"要不要登记请求"和"怎么回界面" —— 即使快照过了
+ *   一两拍就不准了，收尾那边也有自己的判据（g_speech_capturing）兜着，
+ *   最坏就是"这次提交没提交（人刚好自己停了）"，绝不会把同一段音频送两次。
+ *
+ * ★ 为什么"没有可提交的语音"要分 NONE 和 BUSY 两种回答：
+ *   界面拿它决定要不要说"没听到你说什么"。NONE（真的还没听到人说话）才该提示；
+ *   BUSY（我正把上一句送去识别 / 正在回答）时提示就是误导 —— 面板上本来就写着
+ *   "正在想…/正在说话…"，再插一句"没听到"只会让人以为它坏了。
+ ****************************************************************************/
+
+int ai_companion_voice_submit(void)
+{
+  /* 它没在跑 / 没在常听（开机第一次开麦失败、正在让路把麦克风交给别人）：
+   * 一律报"没听到"，**并且不登记请求** —— 一次性请求不能留在那里等以后有人
+   * 认领（下面 audio_data_callback 的说明写了那会变成"拦腰截断下一句话"）。 */
+
+  if (!g_running || !g_audio_ctx.initialized || !g_audio_started)
+    {
+      printf("[语音] 「提交」：现在没在常听（没起来 / 正在让路），不登记请求\n");
+      return AI_COMPANION_SUBMIT_NONE;
+    }
+
+  /* 正在累积一段语音，而且够长（和 process_ai_dialogue 同一个门槛）：
+   * 登记请求，剩下的交给录音线程下一帧做。 */
+
+  if (g_speech_capturing && g_speech_buf != NULL &&
+      g_speech_frames >= SPEECH_MIN_FRAMES_FOR_ASR)
+    {
+      printf("[语音] 「提交」：已登记，立刻收尾这一段(累积 %zu 帧)\n",
+             g_speech_frames);
+      ai_companion_voice_submit_request();
+      return AI_COMPANION_SUBMIT_ACCEPTED;
+    }
+
+  /* 正忙：送 ASR / 等大模型 / 出声 / 追问流程在跑（它有自己的听说节奏）。
+   * 这一刻插一脚没有意义，界面也不该提示"没听到"。
+   * 注意这条必须排在"正在累积"后面：追问流程限时听回答期间也可能正在累积，
+   * 那种情况要按"可以提交"处理（老人答完点一下「提交」正好提前收尾）。 */
+
+  if (sm_get_state(&g_sm_ctx) == SM_STATE_AI_TALKING ||
+      audio_is_playing(&g_audio_ctx) ||
+      g_ask_phase != ASK_PHASE_IDLE)
+    {
+      printf("[语音] 「提交」：正忙（AI_TALKING / 出声 / 追问），暂不处理\n");
+      return AI_COMPANION_SUBMIT_BUSY;
+    }
+
+  /* 剩下这一种就是"没听到人说话"：没在累积、也没在处理任何一轮。
+   * 界面据此提示一句，这里一个请求都不登记。 */
+
+  printf("[语音] 「提交」：还没听到人说话，不登记请求\n");
+  return AI_COMPANION_SUBMIT_NONE;
+}
+
 void ai_companion_listen_hold_impl(bool hold)
 {
   int ret;
@@ -971,6 +1308,11 @@ void ai_companion_listen_hold_impl(bool hold)
  * 这一小段（起播调用本身）拿同一把锁串起来即可 —— 起播很快（校验 + memcpy +
  * 起线程），让路线程等它一下不心疼。**整段出声**那几十秒不用锁，靠
  * mic_audio_busy() 让让路线程自己推迟。
+ *
+ * 让路线程被判死（g_yield_worker_dead）之后跳过这把锁：那时锁只可能被一条
+ * **不会回来的**线程握着，本线程再拿它就是把主循环（状态机 / 监听守护 / 让路
+ * 退路全在上面）一起锁死；而它不动之后还会动设备的只剩主循环这一条线程，
+ * 本来就没有并发（理由同 mic_hold_apply_serialized 头上那段）。
  */
 
 static int audio_play_start_locked(audio_context_t *ctx, const int16_t *data,
@@ -978,11 +1320,21 @@ static int audio_play_start_locked(audio_context_t *ctx, const int16_t *data,
                                    audio_play_complete_cb_t callback,
                                    void *user_data)
 {
+  bool locked = false;
   int ret;
 
-  pthread_mutex_lock(&g_mic_device_lock);
+  if (!g_yield_worker_dead)
+    {
+      pthread_mutex_lock(&g_mic_device_lock);
+      locked = true;
+    }
+
   ret = audio_play_start(ctx, data, frames, callback, user_data);
-  pthread_mutex_unlock(&g_mic_device_lock);
+
+  if (locked)
+    {
+      pthread_mutex_unlock(&g_mic_device_lock);
+    }
 
   return ret;
 }
@@ -1036,7 +1388,9 @@ static bool mic_audio_busy(uint32_t now)
  *     同时监听守护那边有 g_listen_wanted == false（stop_audio_listening 收掉的）
  *     兜着，让路期间不会有人把麦抢回来；然后停一次常开监听
  *     （stop_audio_listening，等录音线程收摊的上限 300ms）。**只停这一次**，
- *     成没成都不再重复敲设备（有界兜底见 mic_hold_deadline_check）。
+ *     成没成都不再重复敲设备（有界兜底见 mic_hold_deadline_check）；认领的同时
+ *     还给**收回看门狗**上表（g_mic_hold_watchdog_at）—— 万一调用方之后不来收回，
+ *     到点由 mic_hold_watchdog_tick() 强制收回，不让 hello_app 一直聋着。
  *   - RECLAIM：清 g_mic_hold_active，再走 start_audio_listening() 重开（立回
  *     "要常听"的意图、清场、开麦）。重开失败不在这里重试，交给监听守护按退避来。
  *
@@ -1051,11 +1405,12 @@ static bool mic_audio_busy(uint32_t now)
 
 static void mic_hold_apply(int req)
 {
-  /* 日志里标出这一手是谁做的：正常是让路线程，让路线程起不来时退回主循环 ——
-   * 看串口就知道走的是哪条路（验收时要用）。 */
+  /* 日志里标出这一手是谁做的：正常是让路线程；它没起来 / 被判死时退回主循环 ——
+   * 看串口就知道走的是哪条路（验收时要用），所以这三种情况分开写清楚。 */
 
   const char *who = g_yield_worker_up ? "让路线程"
-                                      : "主循环线程：让路线程没起来";
+                    : (g_yield_worker_dead ? "主循环线程：让路线程被判死"
+                                           : "主循环线程：让路线程没起来");
 
   if (req == AI_COMPANION_MIC_REQ_RECLAIM)
     {
@@ -1070,6 +1425,7 @@ static void mic_hold_apply(int req)
 
       g_mic_hold_active = false;
       g_mic_hold_release_failed = false;
+      g_mic_hold_watchdog_at = 0;      /* 收回看门狗解除（下一轮让路重新计时） */
       g_mic_req_handled = req;
 
       printf("[让路] 收到收回请求：恢复\"要常听\"的意图，在【%s】里重开常开监听\n",
@@ -1098,6 +1454,14 @@ static void mic_hold_apply(int req)
   g_mic_hold_active = true;
   g_mic_hold_at = main_now_ms();
   g_mic_hold_release_failed = false;
+  g_mic_hold_forced = false;       /* 新一轮让路：看门狗的"已经强制收回过"作废 */
+
+  /* 收回看门狗从这一刻开始计时（此刻还没到"让出去"就超时的可能：调用方要是
+   * 一直不收回，到点由 mic_hold_watchdog_tick() 强制收回）。
+   * 时间和上面 g_mic_hold_at 取同一个值，省一次时钟调用；两个计时的用途不同
+   * （那个是"让路本身失败了没"，这个是"调用方还管不管这次让路"），别混。 */
+
+  g_mic_hold_watchdog_at = g_mic_hold_at;
   g_mic_req_handled = req;
 
   printf("[让路] 收到让路请求（robot_ui 要出声）：在【%s】里停常开监听"
@@ -1118,17 +1482,32 @@ static void mic_hold_apply(int req)
  *     这道闸，避免"一直推迟"把整个功能拖死，理由见 YIELD_DEFER_MAX_MS）。
  *
  * @param  req   请求方向
- * @param  force true = 不管主在不在出声都动手（推迟上限到了）
+ * @param  force true = 不管主在不在出声都动手（推迟上限到了 / 看门狗到点了）
  * @return true = 已受理（g_mic_req_handled 跟上）；false = 现在不能动设备
- */
+ *
+ * 让路线程被判死（g_yield_worker_dead）之后**跳过这把锁**：那一刻起还会动设备的
+ * 只剩主循环这一条线程（本函数、监听守护、起播都在它上面），本来就不存在并发；
+ * 而判死的线程十有八九正握着这把锁（mic_hold_apply 就是在锁里面调设备接口的），
+ * 继续去等它等于把恢复路径跟一条不回来的线程锁死 —— 那是"永久聋"，
+ * 比"晚一拍恢复"严重得多。 */
 
 static bool mic_hold_apply_serialized(int req, bool force)
 {
-  pthread_mutex_lock(&g_mic_device_lock);
+  bool locked = false;
+
+  if (!g_yield_worker_dead)
+    {
+      pthread_mutex_lock(&g_mic_device_lock);
+      locked = true;
+    }
 
   if (!force && mic_audio_busy(main_now_ms()))
     {
-      pthread_mutex_unlock(&g_mic_device_lock);
+      if (locked)
+        {
+          pthread_mutex_unlock(&g_mic_device_lock);
+        }
+
       return false;
     }
 
@@ -1136,8 +1515,124 @@ static bool mic_hold_apply_serialized(int req, bool force)
   mic_hold_apply(req);
   g_mic_device_busy = false;
 
-  pthread_mutex_unlock(&g_mic_device_lock);
+  if (locked)
+    {
+      pthread_mutex_unlock(&g_mic_device_lock);
+    }
+
   return true;
+}
+
+/**
+ * @brief  收回看门狗：让路太久没收到 RECLAIM 就**强制收回**（见 MIC_HOLD_WATCHDOG_MS）
+ *
+ * 只认三件事：还在让路（g_mic_hold_active）、计时到点、而且这期间调用方没有新的
+ * 登记（有的话 mic_hold_tick 已经把计时重置了 = 续租）。到点就：
+ *   1) 把登记的请求方向改写成"收回"（ai_companion_mic_force_reclaim()）——
+ *      模块内部那几条按电平比较的判据（让路线程、g_mic_req_handled）从此看到的是
+ *      一个自洽的"收回"，不会"请求还是让路、我们却已经收回"来回横跳；
+ *   2) 按**正常路径**受理这一次收回：让路线程还活着就 post 一下交给它做
+ *      （设备动作始终只由一条线程做），它要是已经被判死，就在本线程里动手。
+ *
+ * 这是"漏 reclaim → 永久聋、串口零日志"那条路的收尾。以前这里什么都不做（旧版
+ * mic_hold_deadline_check 明确写着"不再做任何设备动作"），因为当时怕在设备没停
+ * 干净的时候硬来；现在认得是**调用方不会再来了**（不是设备停不下来），
+ * 而"重开麦"这条路本来就有监听守护兜着（重开失败会按退避重试），
+ * 所以恢复动作是安全的、也是必须的。
+ *
+ * 只打一行日志：这条线本来就是异常路径，到点一次就够（下一步的
+ * `[让路] 收到收回请求…` 会跟着打出来，两条一起看就知道是强制收回触发的）。
+ */
+
+static void mic_hold_watchdog_tick(void)
+{
+  uint32_t now;
+
+  if (!g_mic_hold_active || g_mic_hold_forced || !g_running)
+    {
+      return;
+    }
+
+  now = main_now_ms();
+  if ((int32_t)(now - g_mic_hold_watchdog_at) < (int32_t)MIC_HOLD_WATCHDOG_MS)
+    {
+      return;
+    }
+
+  g_mic_hold_forced = true;
+
+  printf("[让路] 收回请求超时，强制恢复常开麦：让路已 %u ms 没收到 RECLAIM"
+         "（调用方漏了 / 丢了回收请求，再让下去 hello_app 就一直聋着）\n",
+         (unsigned)(now - g_mic_hold_watchdog_at));
+
+  ai_companion_mic_force_reclaim();
+
+  if (g_yield_worker_up)
+    {
+      /* 让路线程还在（它只是被卡住的那条是另一回事）：设备动作交给它，
+       * 保证"同一时刻只有一条线程动设备"这条纪律不被看门狗破掉。 */
+
+      (void)sem_post(&g_yield_worker_sem);
+      return;
+    }
+
+  /* 让路线程不在（没起来 / 已经退出 / 被判死）：本线程按正常路径收回。
+   * force = true：期限已经比一次正常播报还长了，还在"忙"多半是那个忙标志自己
+   * 卡住（理由与 YIELD_DEFER_MAX_MS 那一段相同，只是这里的期限更长）。 */
+
+  (void)mic_hold_apply_serialized(AI_COMPANION_MIC_REQ_RECLAIM, true);
+}
+
+/**
+ * @brief  让路线程的存活看门狗：心跳停了就判死，把设备动作权交回主循环
+ *
+ * 判据见 YIELD_WORKER_STALL_MS。判死的动作只有三个，少一个都还是聋：
+ *   1) g_yield_worker_up = false —— 否则 mic_hold_tick() 永远只 post 信号量、
+ *      不退回"主循环自己动手"那条退路（它记的是"创建过"，不是"还活着"）；
+ *   2) g_mic_device_busy = false —— 这是"认领者正拿着设备开关"的半程标志，
+ *      挂在一条不回来的线程上就永远不清，监听守护（listen_supervise_tick）
+ *      见到它就永远不敢开麦；
+ *   3) g_yield_worker_dead = true —— 让 mic_hold_apply_serialized() 和监听守护
+ *      跳过那把被卡死线程握着的 g_mic_device_lock（理由写在那个函数头上）。
+ *
+ * 不清 g_mic_req_handled：请求方向该怎么比还怎么比。要是线程死在"还没受理完"，
+ * 主循环下一拍看到 req != handled 就会自己动手；死在"已经受理完"（hold_active
+ * 已经是 true / 收回已经清了它），也正好是它该有的样子。
+ *
+ * 心跳为 0 = 线程刚创建还没跑到第一圈：yield_worker_start() 里已经先垫了一个
+ * 时间戳，所以这里见到 0 只可能是"还没起来"，按"没卡死"处理。
+ */
+
+static void yield_worker_watchdog_tick(void)
+{
+  uint32_t beat;
+  uint32_t now;
+
+  if (!g_yield_worker_up || g_yield_worker_dead)
+    {
+      return;
+    }
+
+  beat = g_yield_worker_beat_ms;
+  if (beat == 0)
+    {
+      return;
+    }
+
+  now = main_now_ms();
+  if ((int32_t)(now - beat) < (int32_t)YIELD_WORKER_STALL_MS)
+    {
+      return;
+    }
+
+  g_yield_worker_dead = true;
+  g_yield_worker_up = false;
+  g_mic_device_busy = false;
+
+  printf("[让路] 让路线程卡死：%u ms 没有心跳（多半卡在停/开麦那一手："
+         "stop_audio_listening -> audio_record_stop -> audio_in_stop）。"
+         "退回主循环处理让路请求，并清掉\"设备正忙\"标志\n",
+         (unsigned)(now - beat));
 }
 
 /**
@@ -1160,6 +1655,16 @@ static bool mic_hold_apply_serialized(int req, bool force)
  * ASR/TTS 阻塞也不会漏判。g_mic_hold_at / g_mic_hold_active 的写者从主循环换成
  * 了让路线程，读的人是这里和 ai_companion_mic_released()，看到的都是单个
  * volatile 量，语义没变。
+ *
+ * ★ 别和**收回看门狗**（mic_hold_watchdog_tick）搞混，两条线管的是两件事：
+ *   - 这一条：让路**做不下去**（我们想停却没停干净，设备还在手里）→ 只打日志，
+ *     因为那正是"应用层硬来会把残局搅乱"的场景（见上面那条理由），到此为止；
+ *   - 那一条：让路**做完了但没人来收回**（调用方漏了 RECLAIM / 它自己卡住）→
+ *     MIC_HOLD_WATCHDOG_MS（10 秒）后强制收回并重开常开麦，因为那一边不动手
+ *     就是永久聋。
+ *   两条的计时起点虽然都是"认领那一刻"，但用途完全相反：一条是"别再碰设备"，
+ *   一条是"必须把设备拿回来"。g_mic_hold_at 只服务前一条，看门狗用自己的
+ *   g_mic_hold_watchdog_at（还会被"续租"重置）。
  */
 
 static void mic_hold_deadline_check(void)
@@ -1238,6 +1743,14 @@ static void yield_worker_wait(void)
  * 见 mic_audio_busy() 的说明。推迟有上限（YIELD_DEFER_MAX_MS），到点照常处理 —— 
  * 不然万一"正在出声"这个状态卡住了，让路就整个失效（还不如被拖住）。
  *
+ * 每跑一圈先把 g_yield_worker_beat_ms 刷新一次：那是主循环用来判"它还活着"的
+ * 心跳（见 YIELD_WORKER_STALL_MS）。刷新点放在**一圈的开头**，所以这一圈里
+ * 卡在哪一段（等锁、动设备）都会表现为心跳停住 —— 正是要判的那种情况。
+ *
+ * 反过来，**被判死之后本线程立刻退出**（循环开头那一判）：主循环那一刻已经把
+ * 设备动作权收回去了（它按"不再有第二个动设备的人"在干活），本线程要是还接着
+ * 处理请求，就正好变成两条线程抢同一个设备 —— 那正是这套锁要避免的形状。
+ *
  * 线程退出：g_running 被置 0（main() 收尾）后最多 YIELD_WORKER_WAIT_MS 醒一次就
  * 退出；要是正动设备，会先把那一手做完（main() 那边 join 它，见 yield_worker_stop）。
  */
@@ -1251,8 +1764,27 @@ static void *yield_worker_task(void *arg)
 
   while (g_running)
     {
-      int      req = ai_companion_mic_request();
-      uint32_t now = main_now_ms();
+      int      req;
+      uint32_t now;
+
+      /* 已经被主循环的存活看门狗判死（心跳超过 YIELD_WORKER_STALL_MS 没刷新）：
+       * 说明本线程刚才那段停顿长到让主循环以为我不回来了，而它已经把设备动作权
+       * 收回去、开始按"没有第二个动设备的人"干活。所以这里立刻退出 ——
+       * 再接着处理请求就是两条线程抢同一个设备。 */
+
+      if (g_yield_worker_dead)
+        {
+          printf("[让路] 让路线程被主循环判死过，本线程立刻收工"
+                 "（设备动作权已经在主循环那边）\n");
+          break;
+        }
+
+      /* 心跳：主循环的存活看门狗读的就是它（放最前面，见函数头上的说明） */
+
+      g_yield_worker_beat_ms = main_now_ms();
+
+      req = ai_companion_mic_request();
+      now = main_now_ms();
 
       if (req == g_mic_req_handled)
         {
@@ -1325,8 +1857,11 @@ static void *yield_worker_task(void *arg)
  *     一次请求电平，照样受理；
  *   - 请求比这里晚：mic_hold_tick() 已经在"只唤醒"那条路上（g_yield_worker_up
  *     为真），post 一下信号量就够；
- *   两头都不落在缝里，所以不需要"额外再查一次"。反过来说，g_yield_worker_up
- *   一旦为真就不会再有"主循环自己动手"的路径。
+ *   两头都不落在缝里，所以不需要"额外再查一次"。
+ *   （2026-09-15 补：g_yield_worker_up 为真不再等于"它一定在干活"了 —— 它还活着
+ *     这件事由心跳 g_yield_worker_beat_ms 单独判，见 YIELD_WORKER_STALL_MS 和
+ *     yield_worker_watchdog_tick()。心跳垫在创建成功这一刻，所以主循环第一次
+ *     看它时就不是 0。）
  *
  * 失败（sem_init / pthread_create 出错）就如实返回 false 并打日志：
  * mic_hold_tick() 会退回**原来的做法**（在主循环线程里处理请求）。功能不残，
@@ -1354,6 +1889,10 @@ static bool yield_worker_start(void)
       return false;
     }
 
+  /* 心跳先垫一个：线程可能还没来得及跑第一圈，主循环就先看它一眼 ——
+   * 见 yield_worker_watchdog_tick() 里"心跳为 0 = 还没起来"那条。 */
+
+  g_yield_worker_beat_ms = main_now_ms();
   g_yield_worker_created = true;
   g_yield_worker_up = true;
   return true;
@@ -1365,12 +1904,24 @@ static bool yield_worker_start(void)
  * g_running 已经是 0（调用点保证），它最多 YIELD_WORKER_WAIT_MS 就醒过来退出。
  * **必须等它退干净**再走下面的 stop_audio_listening()：万一它正在动录音设备，
  * 两边同时上手就是这次事故的形状（跨线程同时开关同一个设备）。
+ *
+ * 例外：它已经被存活看门狗判死过（g_yield_worker_dead）—— 那种情况下 join 会
+ * **一直等下去**（它卡在设备调用里不返回），整个退出流程就停在这儿。宁可放弃
+ * join、接着把设备收掉，也不能让进程退不出来。
  */
 
 static void yield_worker_stop(void)
 {
   if (!g_yield_worker_created)
     {
+      return;
+    }
+
+  if (g_yield_worker_dead)
+    {
+      printf("[让路] 让路线程已被判死，退出时不再等它（join 会一直卡住）\n");
+      g_yield_worker_created = false;
+      g_yield_worker_up = false;
       return;
     }
 
@@ -1382,20 +1933,46 @@ static void yield_worker_stop(void)
 /**
  * @brief  让路请求心跳（main_loop_task 每 100ms 调一次）
  *
- * ★ 让路线程在跑（正常情况）：本线程**一个设备动作都不做** —— 看到新请求就
- *   post 一下信号量（让路立刻被受理的快路径），然后返回。设备动作全在让路线程
- *   里做，所以主循环被 ASR/TTS 阻塞几十秒也不影响让路。post 丢了也不打紧：
- *   让路线程自己那 100ms 的超时会把请求读到。
+ * 它是让路这套在主循环这一侧的**唯一入口**，按顺序做四件事：
+ *   1) yield_worker_watchdog_tick()：让路线程的心跳停了就判死，把设备动作权
+ *      交回本线程（必须排在最前面 —— 它万一刚被判死，这一拍就得由本线程动手）；
+ *   2) mic_hold_watchdog_tick()：让路太久没收到 RECLAIM 就强制收回（见那边）；
+ *   3) 读一次请求方向和序号：序号变了 = 调用方又登记过一次，让路期间算"续租"，
+ *      把收回看门狗的计时重置（这就是"别把正在正常播报误判成超时"的机制）；
+ *   4) 按方向处理：让路线程还活着就只 post 一下信号量（快路径，本线程一个设备
+ *      动作都不做）；它起不来 / 被杀 / 已经退出，才在本线程里按电平处理
+ *      （mic_hold_apply）+ 有界兜底（mic_hold_deadline_check）。
  *
- * 让路线程起不来（sem_init / pthread_create 失败）：退回**原来的做法** ——
- * 在本线程里按电平处理请求（mic_hold_apply）+ 有界兜底（mic_hold_deadline_check）。
- * 功能一样，只是重新会被主循环的阻塞调用拖住。这里不打日志，理由是启动时
- * yield_worker_start() 已经如实报过"起不来 + 退回主循环"了。
+ * 让路线程活着时 post 丢了也不打紧：它自己那 100ms 的超时会把请求读到。
+ * 线程起不来时这里不打日志，理由是启动时 yield_worker_start() 已经如实报过
+ * "起不来 + 退回主循环"了。
  */
 
 static void mic_hold_tick(void)
 {
-  int req = ai_companion_mic_request();
+  int      req;
+  uint32_t seq;
+
+  yield_worker_watchdog_tick();
+  mic_hold_watchdog_tick();
+
+  req = ai_companion_mic_request();
+  seq = ai_companion_mic_request_seq();
+
+  if (seq != g_mic_req_seq_seen)
+    {
+      g_mic_req_seq_seen = seq;
+
+      /* 让路期间调用方又登记了一次（方向可能压根没变）：这不是"漏了回收"，
+       * 而是"它还在用着麦克风"，所以把收回看门狗的计时往后推。
+       * 只处理"还在让着 + 方向仍是让路"这一种：别的情况下续租没有意义
+       * （收回之后 hold_active 已经是 false，看门狗本来就停了）。 */
+
+      if (g_mic_hold_active && req == AI_COMPANION_MIC_REQ_YIELD)
+        {
+          g_mic_hold_watchdog_at = main_now_ms();
+        }
+    }
 
   if (g_yield_worker_up)
     {
@@ -1498,6 +2075,7 @@ static void listen_supervise_tick(sm_context_t *ctx)
   bool     died;
   bool     stale;
   bool     urgent;
+  bool     locked;
   int ret;
 
   if (!g_running || !g_listen_wanted || g_mic_hold_active || g_mic_device_busy)
@@ -1511,7 +2089,10 @@ static void listen_supervise_tick(sm_context_t *ctx)
        * g_mic_device_busy：让路线程正拿着设备开关（停常开监听 / 重开麦那一手还没
        * 做完）。它重开麦时 g_mic_hold_active 已经被清掉了，光靠上面那条挡不住 ——
        * 两边同时 audio_record_start() 会开出两条录音线程抢一个设备。这一拍先不做，
-       * 下一拍（100ms 后）再来：本函数本来就是"不活跃就重试"的节奏，让一拍不心疼。 */
+       * 下一拍（100ms 后）再来：本函数本来就是"不活跃就重试"的节奏，让一拍不心疼。
+       * （2026-09-15：让路线程被判死时这个标志会被主循环强制清零 —— 挂在一条
+       *   不回来的线程上的半程标志只会一直挡着本函数，见 yield_worker_watchdog_tick。
+       *   同一次判死也让下面那段"抢设备动作权"跳过 g_mic_device_lock。） */
 
       g_listen_dead_since = 0;
       return;
@@ -1642,17 +2223,34 @@ static void listen_supervise_tick(sm_context_t *ctx)
   /* 真开麦之前先抢"设备动作权"：让路线程也会 start/stop 常开录音，两边同时上手
    * 会开出两条录音线程抢同一个设备（它拿到锁时同理不会跟这里撞）。
    * trylock 失败就放弃这一拍 —— 本函数本来就是"录音不活跃就重试"的节奏，
-   * 让一拍不心疼；拿到锁之后再复查一次判定所依赖的量（等锁期间它们可能变了）。 */
+   * 让一拍不心疼；拿到锁之后再复查一次判定所依赖的量（等锁期间它们可能变了）。
+   *
+   * 让路线程被判死（g_yield_worker_dead）时**跳过这把锁**：它十有八九正握着锁
+   * 卡在设备调用里不返回，而它不动了之后"还会动设备的只剩主循环这一条线程"
+   * （本函数就在它上面），本来就不存在并发。继续等这把锁等于让监听守护永远
+   * 开不了麦 —— 那正是"永久聋"，比"跳过一把没人竞争的锁"严重得多
+   * （同一段理由也写在 mic_hold_apply_serialized() 头上）。 */
 
-  if (pthread_mutex_trylock(&g_mic_device_lock) != 0)
+  locked = false;
+
+  if (!g_yield_worker_dead)
     {
-      return;
+      if (pthread_mutex_trylock(&g_mic_device_lock) != 0)
+        {
+          return;
+        }
+
+      locked = true;
     }
 
   if (g_mic_hold_active || !g_listen_wanted || g_mic_device_busy ||
       audio_record_is_active(&g_audio_ctx))
     {
-      pthread_mutex_unlock(&g_mic_device_lock);
+      if (locked)
+        {
+          pthread_mutex_unlock(&g_mic_device_lock);
+        }
+
       return;
     }
 
@@ -1685,7 +2283,10 @@ static void listen_supervise_tick(sm_context_t *ctx)
 
   ret = start_audio_listening(ctx);
 
-  pthread_mutex_unlock(&g_mic_device_lock);
+  if (locked)
+    {
+      pthread_mutex_unlock(&g_mic_device_lock);
+    }
 
   if (ret == OK)
     {
@@ -3166,9 +3767,11 @@ static void process_ai_dialogue(sm_context_t *ctx)
 
   printf("[AI] 开始AI对话处理 (累积 %zu 帧音频)\n", frames);
 
-  /* 如果没有累积到足够的语音数据，跳过 ASR */
+  /* 如果没有累积到足够的语音数据，跳过 ASR。
+   * 门槛（100ms）和 ai_companion_voice_submit() 那边共用同一个宏：两边口径必须
+   * 一致 —— 那边达标才会登记「提交」请求，这里不达标就白白跳过一次识别。 */
 
-  if (g_speech_buf == NULL || frames < 1600)
+  if (g_speech_buf == NULL || frames < SPEECH_MIN_FRAMES_FOR_ASR)
     {
       printf("[AI] 语音数据不足，跳过\n");
 
@@ -3273,6 +3876,94 @@ static void process_ai_dialogue(sm_context_t *ctx)
     }
 }
 
+/****************************************************************************
+ * 网络回传通道自愈（补连）
+ *
+ * g_net_started 只在开机 ai_network_start_shared() 成功那一刻置真一次；开机
+ * 那一刻 RNDIS / DNS 常常还没就绪（真机日志：`MQTT DNS 解析失败` → `Error 101`），
+ * 于是它一直是 false，而 voice_state / user_said / ai_reply / 报警**整排上报**都在
+ * `if (!g_net_started) return;` 之后 —— **整场一条都不发**。MQTT 是这台设备唯一的
+ * 外部观测通道（robot_ui 的心跳 + `{"action":"diag"}` 就在那条连接上），
+ * 所以"发不出去"的后果是：从外面完全看不出 hello_app 是死是活。
+ * 下面这段就是给这条路加的自愈：失败之后按 NET_RETRY_INTERVAL_MS 一直重试，
+ * 成功即停，并把"只在变化时发"的状态补推一次。
+ ****************************************************************************/
+
+/**
+ * @brief  网络回传通道补连（main_loop_task 每 100ms 调一次，10 秒才真动手）
+ *
+ * 重试用的还是 ai_network_start_shared()：它内部先看界面（robot_ui）的
+ * network_task 有没有把 MQTT 连起来，连上了就直接复用（最常见的情况 ——
+ * 界面自己会重连，我们只是补上"那时我还没起来/还没连上"的记账）；
+ * 没人连的时候才自己兜底连一次。所以这条重试既不会开出第二条连接
+ * （同 client_id 的两条连接会被 broker 互踢，见 ai_network.c 的说明），
+ * 也不用等别人。
+ *
+ * 成功之后要做的**不只是置标志**：voice_state 那条路是"只在变化时发"的
+ * （g_voice_state_sent 去重），开机那次失败之后它已经认为"当前状态发过了"，
+ * 不重置的话之后就永远不会补 —— 外面看见的还是"整场没有一条语音状态"。
+ * 所以这里把去重键清掉，让下一拍 voice_state_tick() 重推一次当前状态。
+ *
+ * ⚠️ 本函数跑在主循环线程里，而一次尝试最长要等 3 秒（见
+ * AI_MQTT_SHARED_WAIT_MS），所以间隔取 10 秒、失败日志还要节流 ——
+ * 这条线程同时管着监听守护和让路的退路，不能被网络试连拖住太久。
+ */
+
+static void net_retry_tick(void)
+{
+  uint32_t now;
+  int      ret;
+
+  if (g_net_started || !g_running)
+    {
+      return;
+    }
+
+  now = main_now_ms();
+
+  if (g_net_retry_at == 0)
+    {
+      /* 开机那一次刚试过（main() 里），先等一个间隔再补。 */
+
+      g_net_retry_at = now + NET_RETRY_INTERVAL_MS;
+      return;
+    }
+
+  if ((int32_t)(now - g_net_retry_at) < 0)
+    {
+      return;
+    }
+
+  g_net_retry_at = now + NET_RETRY_INTERVAL_MS;
+  g_net_retry_count++;
+
+  ret = ai_network_start_shared(&g_net_ctx, g_net_client_id);
+  if (ret < 0)
+    {
+      if (g_net_retry_count <= NET_RETRY_LOG_FIRST ||
+          g_net_retry_count % NET_RETRY_LOG_EVERY == 0)
+        {
+          printf("[网络] 补连回传通道第 %u 次失败: %d（%u ms 后再试；"
+                 "本机界面走同进程直调，不受影响）\n",
+                 (unsigned)g_net_retry_count, ret,
+                 (unsigned)NET_RETRY_INTERVAL_MS);
+        }
+
+      return;
+    }
+
+  g_net_started = true;
+
+  /* 去重键清掉：让下一拍的 voice_state_tick() 把**当前**状态重推一次
+   * （否则它认为"早就发过了"，这一整场都不会再补）。 */
+
+  g_voice_state_sent[0] = '\0';
+
+  printf("[网络] 回传通道补连成功（第 %u 次尝试）：主题 zhi_ai/%s/command，"
+         "已补推一次当前语音状态\n",
+         (unsigned)g_net_retry_count, ai_network_get_client_id(&g_net_ctx));
+}
+
 /**
  * @brief  主循环任务
  */
@@ -3321,6 +4012,12 @@ static void *main_loop_task(void *arg)
        *    否则应用会一直跑着但永久听不到声音 */
 
       listen_supervise_tick(ctx);
+
+      /* 6.5 网络回传通道自愈：开机没连上（RNDIS/DNS 还没就绪）就每 10 秒补一次，
+       *     连上了主动补推一次当前状态 —— 否则整场 MQTT 上报一条都发不出去，
+       *     从外面（那是唯一的观测通道）完全看不出 hello_app 是死是活 */
+
+      net_retry_tick();
 
       /* 7. 休眠等待 */
 
@@ -3565,11 +4262,19 @@ int main(int argc, char *argv[])
    * （没人连的时候才兜底连一次），理由写在 ai_network.c 里。 */
 
   printf("[初始化] 正在初始化网络模块...\n");
+
+  /* 记下 client_id 给主循环的补连用（net_retry_tick）：argv 里的字符串在整个
+   * 进程生命周期内都有效，存指针就够。这里是唯一一处拿到它的地方。 */
+
+  g_net_client_id = mqtt_client_id;
+
   ret = ai_network_start_shared(&g_net_ctx, mqtt_client_id);
   if (ret < 0)
     {
       printf("[警告] 网络初始化失败: %d（手机/PC 端收不到回传，本机界面走直调"
              "不受影响）\n", ret);
+      printf("[网络] 回传通道没起来：主循环会每 %u ms 补连一次，连上自动补推状态\n",
+             (unsigned)NET_RETRY_INTERVAL_MS);
     }
   else
     {

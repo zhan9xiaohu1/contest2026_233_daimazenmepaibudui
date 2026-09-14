@@ -48,10 +48,34 @@
  *     ... 自己 audio_play_start() / 等整段真的放完 ...
  *     ai_companion_mic_reclaim();          // 撤回请求，立刻返回（无条件调）
  *
- *   ⚠️ 配对纪律不变：漏一次 reclaim，hello_app 就一直聋着（它"要常听"的意图
- *   被收掉了，监听守护也救不回来），比原来的毛病更糟。所以配对的写法应该还是
+ *   ⚠️ 配对纪律不变：**漏一次 reclaim 仍然要命**，所以配对的写法应该还是
  *   "yield(true) 之后到 reclaim 之间没有任何 return" —— 起播失败、等播放
  *   超时、正常放完，全部落到同一处收尾。
+ *   2026-09-15 补了一道**看门狗兜底**（在 ai_companion_main.c 里，不在本文件）：
+ *   让路被认领之后 MIC_HOLD_WATCHDOG_MS（10 秒，见那边的取值理由）没收到
+ *   RECLAIM —— 不管是漏了、还是调用方自己卡住了 —— hello_app 会**强制收回**
+ *   麦克风（恢复"要常听"、按正常路径重开常开麦），并打一行
+ *   `[让路] 收回请求超时，强制恢复常开麦…`。
+ *   所以"一直聋着"不再是永久状态；但代价是被误判之后那次出声会被打断，
+ *   配对纪律和以前一样必须守。
+ *   由此多了一条**可选的续租**：调用方在让路期间（比如一次很长的播报里）
+ *   再调一次 ai_companion_audio_yield(true)，看门狗会重新计时，不会被误判。
+ *   重复登记同一个方向本来就被允许（幂等），只是现在它多了一层"我还在用"的含义。
+ *   强制收回之后，调用方如果还在轮询 ai_companion_mic_released()，会看到它一直
+ *   报"没让出"（请求已经不算数了）—— 和"让路请求还没被认领"是同一种回答，
+ *   调用方照旧按自己的超时处理即可，不需要为它加任何判断。
+ *
+ * ★ 2026-09-14 任务 C：本文件还承载第二个非阻塞请求 —— 「提交」
+ *   （ai_companion_voice_submit()）：语音聊天镜像面板底部那个按钮，点一下
+ *   = "我说完了，立刻把当前这段录音送去识别"，不等 VAD 的静音超时（3 秒）
+ *   自己收尾。**和让路是两件事**，只是共用"只登记请求、真动作在 hello_app
+ *   自己线程里"这一套写法：
+ *     - 让路是**电平**（方向持续有效，hello_app 每拍读一次）；
+ *     - 提交是**一次性动作**（置一次、认领一次就清，见文件末尾那两行说明）。
+ *   收尾走的是和"VAD 判静音超时"**同一段**代码（ai_companion_main.c 的
+ *   speech_capture_complete()），所以"语音结束"的语义只有一份；触发它的动作
+ *   落在 hello_app 那条**录音线程**上（VAD 判定本身就在那条线程里），不是主
+ *   循环、也不是让路线程 —— 理由见 ai_companion_main.c 的 audio_data_callback()。
  *
  * 为什么单独开一个文件：robot_ui 的 main.c 要 include 它，而 hello_app 这边的
  * 音频状态（g_audio_ctx / g_listen_wanted / g_sm_ctx）全是 ai_companion_main.c
@@ -85,6 +109,7 @@
 #define __AI_COMPANION_YIELD_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 /**
  * @brief  登记一个"请 ai_companion 交出麦克风（yield=true）/ 收回（yield=false）"
@@ -141,6 +166,50 @@ int ai_companion_mic_released(void);
 void ai_companion_mic_reclaim(void);
 
 /****************************************************************************
+ * 「提交」：请 ai_companion 立刻收尾当前这一段录音（非阻塞）
+ *
+ * 界面上的出处：语音聊天的**镜像面板**底部那个大按钮（用户原话：「下面是关闭
+ * 按钮，我希望换成提交按钮」）。语义是"我说完了，立刻把这段录音送去识别"，
+ * 不等 VAD 的静音超时（AUDIO_VAD_SILENCE_TIMEOUT_MS = 3 秒）自己收尾 ——
+ * 老人说完话不用再干等 3 秒。
+ *
+ * 关闭仍然在面板右上角的「×」那一条路上，和这个请求无关。
+ ****************************************************************************/
+
+/* 提交请求的受理结果（ai_companion_voice_submit() 的返回值） */
+typedef enum
+{
+  AI_COMPANION_SUBMIT_NONE = 0,   /* 没在累积语音：什么都没登记，调用方可以提示"没听到" */
+  AI_COMPANION_SUBMIT_ACCEPTED,   /* 请求已登记：hello_app 下一帧就会把这一段送去识别 */
+  AI_COMPANION_SUBMIT_BUSY        /* 它正忙（送识别 / 等大模型 / 出声 / 追问流程）：
+                                   * 这一下不该插一脚，调用方也**不要**提示"没听到" ——
+                                   * 界面上本来就有"正在想…/正在说话…" */
+} ai_companion_submit_result_t;
+
+/**
+ * @brief  请 ai_companion 立刻收尾当前这一段录音。**非阻塞、任何线程可调。**
+ *
+ * @return 见 ai_companion_submit_result_t
+ *
+ * 它只做两件事：**读一次** hello_app 的语音状态（快照，只读，一个设备都不碰），
+ * 有可提交的语音时**登记一个请求标志**（一次性：置一次、被认领一次就清）。
+ * 真正"把这一段结束掉"的动作在 hello_app 自己那条**录音线程**上做 ——
+ * 见 ai_companion_main.c 的 audio_data_callback() 里那段（为什么必须是那条线程：
+ * VAD 判"说完了"本来就在那条线程里，用同一条线程走同一段收尾代码，才不会出现
+ * "两条路同时收尾"；别的线程去触发会把整段 ASR 拽到那条线程上阻塞几十秒，
+ * 让路协议就是为这件事改过一轮）。
+ *
+ * 三条纪律（和让路那两个入口一致）：
+ *   1) 非阻塞，登记完立刻返回；下一次录音帧（≤ 20ms）就会被处理掉；
+ *   2) hello_app 没在跑时安全空转：音频没初始化 / 没在常听 / 正在让路（麦克风
+ *      在别人手里）一律报 NONE，**并且不登记请求** —— 一次性动作不能留在那里
+ *      等"以后有人认领"，那会变成"老人几秒前那一按把后面的句子拦腰截断"；
+ *   3) 调用方拿到 ACCEPTED 只是"请求登记上了"，别把它当成"识别结果马上就来"：
+ *      结果照旧由 voice_state / user_said 那条链路推（robot_ui_bridge）。
+ */
+int ai_companion_voice_submit(void);
+
+/****************************************************************************
  * 内部实现（薄壳在 ai_companion_yield.c，真动作在 ai_companion_main.c）
  *
  * 为什么在 main.c 里留一个薄门面，而不是把这些 static 放开可见性：
@@ -151,6 +220,10 @@ void ai_companion_mic_reclaim(void);
  *   把"谁有权改、什么时候能改"散到两个文件，外面乱调就没人拦得住；加一层门面
  *   代价最小，也保证让路走的是**和监听守护同一段**逻辑，不会各自漂移。
  * （app/robot_ui/robot_ui_bridge.h 的"内部桥接原语"是同一套做法。）
+ *
+ * 「提交」也一样：ai_companion_voice_submit()（读 g_speech_capturing /
+ * g_speech_frames / g_sm_ctx 的那个入口）和下面的认领函数都实现在两个文件里，
+ * 请求标志本身留在本文件的薄壳里（和一个设备都不碰的 g_mic_req 做邻居）。
  ****************************************************************************/
 
 /* 让路请求的方向。薄壳（ai_companion_yield.c）写、hello_app 的让路线程读；
@@ -172,6 +245,30 @@ enum
 int ai_companion_mic_request(void);
 
 /**
+ * @brief  让路请求的**序号**：每登记一次就自增一次（方向变没变都算）
+ *
+ * 电平语义分不出"同一个方向被重复登记了一次"和"早就没人管这次让路了"，而
+ * ai_companion_main.c 里那个**收回看门狗**必须分得出来（连续两次 yield(true)
+ * 说明调用方还在用着麦克风，不该被判成"漏了回收"）。所以这里额外记一个单调
+ * 递增的序号：只要它变了，就说明调用方**又登记了一次**（见上面的"续租"）。
+ *
+ * 回绕是允许的：唯一的判据是"和上一次读到的值不一样"，不做大小比较。
+ */
+uint32_t ai_companion_mic_request_seq(void);
+
+/**
+ * @brief  把登记的请求方向改写成"收回"（只给 ai_companion_main.c 的看门狗用）
+ *
+ * 用在一个很具体的场合：让路被认领之后太久没等到 RECLAIM，hello_app 认定
+ * 调用方已经不管这次让路了，于是**替它**把方向收回来（否则"请求还是让路、
+ * 我们却已经收回"会让模块内部那几条按电平比较的判据来回横跳）。
+ * 序号同样自增一次，等于"模块自己登记了一次收回"。
+ *
+ * 调用方之后再调用任何入口都会照常覆盖它，语义不变。
+ */
+void ai_companion_mic_force_reclaim(void);
+
+/**
  * @brief  真正的"让路 / 收回"设备动作（用 ai_companion_main.c 的 static 干活）
  * @param  hold true = 交出麦克风并停掉常开监听；false = 收回并试着重开
  *
@@ -181,5 +278,26 @@ int ai_companion_mic_request(void);
  * 那次事故。
  */
 void ai_companion_listen_hold_impl(bool hold);
+
+/**
+ * @brief  登记一次「提交」请求（一次性：置一次、被认领一次就清）
+ *
+ * 只给 ai_companion_main.c 的 ai_companion_voice_submit() 用（它先读状态快照，
+ * 确认"真的在累积一段语音"才登记）。
+ *
+ * 为什么是"一次性"而让路那两个是"电平"：提交是**按钮动作**（点一下发生一次），
+ * 不是持续有效的方向。电平语义在这里反而危险 —— 请求一直挂着的话，下一次
+ * 录音帧（可能是几十秒后麦克风回来、老人重新说的另一句话）会被当成"这一下要
+ * 立刻收尾"，把新句子拦腰截断。
+ */
+void ai_companion_voice_submit_request(void);
+
+/**
+ * @brief  认领一次「提交」请求（读走就清，返回"有没有人请求过"）
+ *
+ * 只给 ai_companion_main.c 的 audio_data_callback() 用（录音线程，每帧一次）。
+ * 认领即清，所以一次按钮动作最多被处理一次。
+ */
+bool ai_companion_voice_submit_take(void);
 
 #endif /* __AI_COMPANION_YIELD_H */

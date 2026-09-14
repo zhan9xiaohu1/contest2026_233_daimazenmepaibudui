@@ -66,6 +66,24 @@
 #define AUDIO_VAD_SILENCE_TIMEOUT_MS 3000    /* 静音超时3秒 */
 #define AUDIO_VAD_MIN_SPEECH_MS      300     /* 最小语音长度300ms */
 
+/* "数据流已经死了"的建议判据（给上层的监听守护用，见 audio_record_wait_ms()）：
+ * 录音线程**正阻塞在 audio_in_read() 里等数据**，而这个"等"已经超过这么久，
+ * 就认定设备不再给数据了。
+ *
+ * 8 秒的来历：
+ *   - 下层单次 read 自己有个 5 秒上限（超时返回 0，那条路由 ctx->record_died
+ *     兜着，见 sf32lb52_audio_in.h 的说明），所以"通路正常、只是暂时没数据"
+ *     最坏也就 5 秒；
+ *   - 8 秒 = 5 秒 + 3 秒余量，刚好把"连那 5 秒超时都没回来"这种真卡死和
+ *     "超时正常返回了"分开。别取到 5 秒以下（那个上限一旦抖动就会误判成死）；
+ *     也别取太大 —— 它直接等于"麦克风坏掉之后要多久才有人去救"。
+ *
+ * 注意它是"等待时长"的判据，不是"距上次数据多久"的判据：后者会被正常的
+ * ASR/大模型那段（跑在录音线程的回调里，本来就没有 read）误触发，
+ * 理由见 audio_record_idle_ms() 的注释。 */
+
+#define AUDIO_RECORD_STALL_MS        8000
+
 /* 音量范围（本模块对外口径 0..100）
  * 注意：nuttx/audio/audio.h 里也有个同名宏 AUDIO_VOLUME_MAX，那是驱动侧的
  * 0..1000。同一个文件里同时 include 两个头文件时要 #undef 让位，
@@ -159,7 +177,33 @@ typedef struct
   volatile bool       record_stop;    /* 停止录音标志 */
   bool                record_thread_valid; /* 录音线程需要回收 */
   volatile bool       record_exited;  /* 录音线程已跑完（收尾用，见 audio_record_stop） */
-  volatile bool       record_died;    /* 录音异常中断（不是谁让它停的） */
+  volatile bool       record_died;    /* 录音异常中断（不是谁让它停的；
+                                       * 偶发单次读超时不算，见 ai_audio.c 的容忍上限） */
+
+  /* 数据流活跃度观测：把"线程还活着、设备却已经不出数据了"这种假健康
+   * 变成看得见的东西。
+   *
+   * 为什么需要：上面那四个录音标志（recording / record_thread_valid /
+   * record_stop / record_exited）全都只是"**软件**还在不在录"的证据，没有
+   * 一个能证明"设备还在给数据"。真机上见过的那种死法恰恰是：DMA 再也不产生
+   * 完成中断，audio_in_read() 永远返回不了，录音线程就卡死在这次 read 里 ——
+   * 四个标志全是健康的，监听守护据此判定"没死"、再也不重开麦，用户那边就是
+   * 永久聋，而且一行日志都没有。
+   *
+   * 下面这几个字段记的就是"这一滴真数据 / 这次等待"，只由录音线程写
+   * （record_last_data_ms 另在 audio_record_start() 里种一次）。
+   * 读的人请走 audio_record_* 那几个访问器，别直接看字段：完整的语义
+   * （以及各自的坑）写在头文件下方原型那里的注释里。 */
+
+  volatile uint32_t   record_last_data_ms;  /* 最近一次"数据流有动静"的时刻（uptime 毫秒）；
+                                             * 0 = 从没启动过录音，见 audio_record_idle_ms() */
+  volatile uint32_t   record_read_start_ms; /* 当前这次 audio_in_read() 开始等待的时刻；
+                                             * 0 = 此刻没在等，见 audio_record_wait_ms() */
+  volatile uint32_t   record_empty_reads;   /* 连续"读了却没拿到字节"的次数（读超时会累加，
+                                             * 到上限才算会话死），读到数据就清零，
+                                             * 见 audio_record_empty_reads() */
+  volatile int        record_last_result;   /* 最近一次 read 的结果；0 = 拿到了数据，
+                                             * 见 audio_record_last_result() */
 
   /* 播放相关 */
   bool                playing;        /* 是否正在播放 */
@@ -253,23 +297,129 @@ bool audio_is_recording(audio_context_t *ctx);
  * @return true设备已 START 且录音线程仍在, false线程已退出/正在停/从未启动
  *
  * 给上层的"监听守护"用：audio_is_recording() 只说明 process 认为在录，
- * 录音线程因为驱动 AUDIOIOC_STOP 或下层 5 秒 DMA 超时（audio_in_read
- * 返回 0 / -110）自己跳出循环之后，它同样会（并且只来得及）把
+ * 录音线程因为驱动 AUDIOIOC_STOP 或连续读超时到上限（audio_in_read 返回 0 /
+ * 一直拿不到数据）自己跳出循环之后，它同样会（并且只来得及）把
  * recording 置 false，但线程退出与 record_stop 的中间状态只有本函数能分清。
  * 注意它看不穿驱动：驱动把通路 STOP 掉、而线程还阻塞在 read 里的那一段
- * （最长下层那 5 秒）仍算"活着"。
+ * （最长下层那 5 秒）仍算"活着"；**偶发的单次读超时也不再算死**（线程会跳过
+ * 那一帧接着读，见 ai_audio.c 的 AUDIO_RECORD_TIMEOUT_TOLERANCE）。
  *
  * 配套的 ctx->record_died 回答的是另一个问题："线程为什么退出的"：
  *   - false：线程是被 audio_record_stop() 停的（正常收尾，含放音前的半双工
  *     让路），或者根本没死 —— 上层按退避重开就行；
- *   - true ：没人要求停，read 自己返回了 0 / 负值（驱动 STOP 了通路、DMA
- *     超时、或者设备被别的会话抢走）。这一代录音会话**不会再回来**了，上层
- *     该立刻重开，而不是等状态机 / 守护自己的超时。
+ *   - true ：没人要求停，read 自己返回了 0（EOF：驱动 STOP 了通路 / 设备被别的
+ *     会话抢走）或返回了非超时的负值；也包括"连续读超时超过
+ *     AUDIO_RECORD_TIMEOUT_TOLERANCE 次"（偶发的单次超时会被跳过，不置这个位）。
+ *     这一代录音会话**不会再回来**了，上层该立刻重开，而不是等状态机 /
+ *     守护自己的超时。
  * 它是"一次性事件"标志：由 ai_audio 置位、由**上层认领后自己清掉**
  * （audio_record_start() 起新一代线程时也会清）。
  */
 
 bool audio_record_is_active(const audio_context_t *ctx);
+
+/**
+ * @brief  录音这条链路"安静"了多久：距上一滴数据流动静（或这一代录音开始）多少毫秒
+ * @param  ctx: 音频上下文指针
+ * @return >=0 毫秒；-1 = 从来没启动过录音（没有参照点，谈不上"安静了多久"）
+ *
+ * 两个参照点都写在本模块里：
+ *   - audio_record_start() 起这一代会话的时刻（先种一次）；
+ *   - 录音线程每**成功读到一段数据**的时刻。
+ * 所以它不只是"距上次读到数据"，而是"距这一代录音最后一次有进展"：
+ * "设备 START 好了、线程也起了、却一个字都没读到"同样会随时间增长 ——
+ * 那正是要被抓出来的形态之一。
+ *
+ * ⚠️ 别单独拿它当"死没死"的判据（会误判）：VAD 报"说完了"之后那一整段
+ *    ASR + 大模型 + TTS 是在**录音线程的 VAD 回调里**同步跑的
+ *    （ai_state_machine.c 的 sm_ai_talking_enter 直接调 process_ai_dialogue），
+ *    那期间一次 read 都不会发生，正常对话就能让它涨到几十秒。判"数据流死了"
+ *    请用 audio_record_wait_ms()：它分得清"在等设备"和"没在等"。
+ *
+ * 这个数留给日志和人工排查（重开麦那一行把它打出来，"断了几秒"一眼可见）；
+ * 要拿它当兜底判据的话，阈值必须在正常调用链的最大阻塞时长之上、而且只在
+ * 状态机不忙（非 AI_TALKING、追问相位空闲、扬声器没响）时用。
+ *
+ * 写入者是录音线程（外加 audio_record_start 种的那一次），读的是别的线程：
+ * 不用加锁，靠 volatile + 有符号差值算间隔（uint32 绕一圈约 49 天也不会算反）。
+ */
+
+int audio_record_idle_ms(const audio_context_t *ctx);
+
+/**
+ * @brief  录音线程此刻"等设备给数据"等了多久 —— 判"数据流已死"就看它
+ * @param  ctx: 音频上下文指针
+ * @return >=0 = 线程**正阻塞在 audio_in_read() 里**、已经等了这么多毫秒；
+ *         -1 = 此刻没有人在等（没启动 / 线程正在数据回调里 / 正在收尾）
+ *
+ * 为什么不能只用 audio_record_idle_ms()：录音线程在两次 read 之间会跑数据
+ * 回调，而那个回调里可能同步跑完整个 ASR + 大模型（几十秒，见
+ * ai_state_machine.c 的 sm_ai_talking_enter）。那段时间"没有新数据"是**正常**
+ * 的，拿"距上次数据多久"去判死，每次正常对话之后都会误重开一次麦。本函数把
+ * "线程到底在不在等设备"单独暴露出来，判据就干净了。
+ *
+ * 谁该拿它做什么判断（A2 的落地方式，监听守护在 ai_companion_main.c 的
+ * listen_supervise_tick）：
+ *
+ *   if (audio_record_is_active(&g_audio_ctx) &&           // ① 线程还在
+ *       audio_record_wait_ms(&g_audio_ctx) >= AUDIO_RECORD_STALL_MS)  // ② 在等，且等太久
+ *     → 判定数据流已死。
+ *
+ *   - 两步缺一不可：① 单独成立就是 A2 要防的那种假健康（线程在、数据没了）；
+ *     ② 单独成立可能是"没在录"（返回值 -1）；
+ *   - 真要重开请**先 audio_record_stop()、再 start**：线程还在的时候
+ *     ctx->recording 仍然是 true，直接 audio_record_start() 只会拿到 -EBUSY
+ *     （本模块不会替调用者停一个"看起来还在录"的会话）。stop 顺带把设备
+ *     STOP 掉、唤醒那次卡住的 read，重开的成功率也因此最高。
+ *     别改成本模块自己重启：那是上层的职责（谁开麦谁收麦）。
+ *
+ * 阈值用 AUDIO_RECORD_STALL_MS（8 秒，来历见那个宏的注释）。
+ * ⚠️ -1 **不代表健康**，只代表"现在没人在等"：守护不能用它当"死了"的判据。
+ *
+ * 一个已知的粗边：它说明的是"线程在等数据"，不直接证明设备坏 —— 线程被别人
+ * 喊停的那一瞬（AUDIOIOC_STOP 已经发下去、read 还没返回）同样算"在等"。
+ * 那种情况最多到阈值就被误判成死，代价是一次多余的重开尝试
+ * （stop + start，本来也是无害的收尾动作，而且 stop 正是那种状态下该做的事）。
+ */
+
+int audio_record_wait_ms(const audio_context_t *ctx);
+
+/**
+ * @brief  最近一次录音 read 的结果
+ * @param  ctx: 音频上下文指针
+ * @return 0 = 最近一次 read 真的**拿到了数据**（通路还在给东西）；
+ *         -EINPROGRESS = 这一代录音起来了、但还没有任何一次 read 有结果；
+ *         -ETIMEDOUT = 最近一次 read **分片等待超时**（下层 5 秒没等到 DMA 完成，
+ *                      驱动用这个负值把它区分出来）。注意它**不代表**会话结束 ——
+ *                      录音线程会跳过这一帧接着读，只有连续超时超过
+ *                      ai_audio.c 的 AUDIO_RECORD_TIMEOUT_TOLERANCE(5) 次才收摊；
+ *         -ECANCELED = 最近一次 read 返回 0（EOF：被 AUDIOIOC_STOP 打断 /
+ *                      设备没在跑 / 会话换代），这一代会话到此为止；
+ *         其他负值 = read 原样返回的负值（未 start 的 -EINVAL、fd 失效等）。
+ *
+ * 用途：回答"为什么断了"。守护重开麦的那一行日志把它和 audio_record_idle_ms()
+ * 一起打出来，一眼能分出是设备超时、fd 没了，还是"压根没等到 read 返回"
+ * （那种情况这里还停在 -EINPROGRESS，说明线程连第一次 read 都没出来）。
+ *
+ * 判"健康"仍然用 audio_record_wait_ms()：本函数是**事后**的错误码，
+ * 只说明上一次 read 的结局，不说明现在数据流还在不在。
+ */
+
+int audio_record_last_result(const audio_context_t *ctx);
+
+/**
+ * @brief  连续"读了却没拿到一个字节"的次数
+ * @param  ctx: 音频上下文指针
+ * @return 次数（读到一段数据就清零）
+ *
+ * 这个数现在真的会累加：录音线程对"读超时"是容忍的（跳过这一帧接着读），
+ * 只有**连续**超过 AUDIO_RECORD_TIMEOUT_TOLERANCE(5) 次才按"会话死了"收摊，
+ * 而每读到一次真数据就清零（清零时还会打一行"读已恢复"）。所以它等于
+ * "当前这一段连续超时有多长"，日志里用它看这次抖动连了几拍。
+ * read 返回 0（EOF）和别的负值仍然立刻跳出循环，那两条路上它最多到 1。
+ */
+
+uint32_t audio_record_empty_reads(const audio_context_t *ctx);
 
 /**
  * @brief  开始播放音频数据
@@ -404,6 +554,26 @@ void audio_vad_disable(audio_context_t *ctx);
  */
 
 void audio_vad_set_threshold(audio_context_t *ctx, uint32_t threshold);
+
+/**
+ * @brief  把 VAD 里"正在说一句话"的相位收掉（外部提前收尾时用）
+ * @param  ctx: 音频上下文指针
+ *
+ * 只清 VAD 的内部相位（vad_speech_active / 静音与语音帧计数），**不回调上层**：
+ * 上层的"这一段说完了"由调用方自己走（ai_companion_main.c 的
+ * speech_capture_complete()）。这样"语音结束"这件事在两条路上只有一份语义 ——
+ * 静音超时那条（vad_callback(false)）和外部请求提前收尾这条（镜像面板底部
+ * 「提交」）。
+ *
+ * 为什么外部收尾**必须**调它：相位不复位的话，外面提前收尾之后静音帧计数还在
+ * 累加，3 秒后静音超时会把**同一段音频**再报一次"语音结束"，同一句话会被送去
+ * 识别两次。
+ *
+ * ⚠️ 只能在录音线程里调（现在唯一调用点是录音线程的数据回调，就排在 VAD 判定
+ * 后面几行）：它读改的就是 VAD 那几个字段，别的线程同时调进来就是并发写。
+ */
+
+void audio_vad_end_speech(audio_context_t *ctx);
 
 /**
  * @brief  计算音频帧能量

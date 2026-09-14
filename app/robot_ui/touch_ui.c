@@ -158,9 +158,16 @@ static void *g_voice_submit_user_data = NULL;
 static voice_cancel_cb_t g_voice_cancel_cb = NULL;
 static void *g_voice_cancel_user_data = NULL;
 
+/* 镜像面板底部「提交」：main.c 注册进来的转发（请框架侧 ai_companion 立刻收尾
+ * 这一段录音）。和上面那两组回调的区别：它只针对**镜像面板**（voice_mirror_only），
+ * PTT 弹窗那条路有自己的提交语义，两者不共用，免得互相牵动。 */
+static voice_mirror_submit_cb_t g_voice_mirror_submit_cb = NULL;
+static void *g_voice_mirror_submit_user_data = NULL;
+
 /* 镜像面板模式：面板**只显示**，不开录音、不放提示音（语音入口在框架侧
  * ai_companion）。由 voice_panel_build(true) 置位、touch_ui_hide_voice_chat()
- * 清掉 —— 「关窗那一支」和「提交那一支」都靠它分叉，避免复制两份弹窗代码。 */
+ * 清掉 —— 底部「提交」那支靠它分叉（PTT 走 g_voice_submit_cb 开工作线程，
+ * 镜像面板走 g_voice_mirror_submit_cb 转发给 hello_app），避免复制两份弹窗代码。 */
 static bool voice_mirror_only = false;
 
 /* 设置持久化文件路径 */
@@ -2130,7 +2137,8 @@ static void voice_close_event_handler(lv_event_t *e)
 }
 
 /* 底部大按钮：「提交」（结束录音、交出去）或「再说一次」；
- * 镜像面板上它是「关闭」—— 点了只关窗，绝不去碰音频设备。 */
+ * 镜像面板上它也是「提交」，但含义是"我说完了，立刻把这一段送去识别" ——
+ * 走 g_voice_mirror_submit_cb 转发给框架侧 ai_companion，绝不自己碰音频设备。 */
 static void voice_submit_event_handler(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED || voice_panel == NULL) {
@@ -2140,8 +2148,20 @@ static void voice_submit_event_handler(lv_event_t *e)
     touch_ui_play_sound("click");
 
     if (voice_mirror_only) {
-        printf("[VoiceChat] 镜像面板：关闭\n");
-        touch_ui_hide_voice_chat();
+        /* 镜像面板：请 ai_companion（常开麦那一方）立刻收尾当前这一段录音，
+         * 不等 VAD 那 3 秒静音超时。面板只是显示器，没有录音、也不许碰设备。
+         * "没有可提交的语音"的提示在转发那层做（只有 hello_app 知道有没有听到
+         * 人说话），这里不做判断，也不要在这一支里动状态行。
+         * 关闭仍然走右上角的「×」（voice_close_event_handler）。 */
+        printf("[VoiceChat] 镜像面板：提交\n");
+
+        if (g_voice_mirror_submit_cb != NULL) {
+            g_voice_mirror_submit_cb(g_voice_mirror_submit_user_data);
+        } else {
+            /* 正常接不上：main.c 一定会注册。真走到这说明 main.c 的初始化没跑完，
+             * 提示一句好过让按钮看着像坏了。 */
+            voice_post_text("提交功能未就绪", VOICE_TEXT_STATUS);
+        }
         return;
     }
 
@@ -2239,7 +2259,9 @@ static void voice_state_async(void *arg)
  *   ③ 对话区的内容 —— 镜像面板建"双方发言历史"（先一个占位行，往后按轮加
  *      "你说：…" / "智爱：…"），PTT 弹窗建一整段显示的 label（main.c 送进来的
  *      就是 "我说：…\n\n智爱：…" 一整段）；
- *   ④ 底部大按钮的文字与收尾动作（「关闭」关窗 vs 「提交」开工作线程）。 */
+ *   ④ 底部大按钮点下去做什么（都在 voice_submit_event_handler 里分叉：
+ *      PTT = 结束本机录音、开工作线程跑 ASR；镜像面板 = 转发给框架侧
+ *      ai_companion，请它立刻收尾这一段录音）。两边的文字都是「提交」。 */
 static void voice_panel_build(bool mirror)
 {
     lv_obj_t *header;
@@ -2359,8 +2381,9 @@ static void voice_panel_build(bool mirror)
     }
 
     /* 底部大按钮（≥60px，老人好按；绿色 = style_big_btn）。
-     * PTT 弹窗上是「提交」，镜像面板上是「关闭」—— 都是同一个按钮，
-     * 文字和点击后的动作由 voice_mirror_only 分叉（见各自的 handler）。 */
+     * 两个面板上它都是「提交」（PTT 弹窗上是"结束录音、交出去"，镜像面板上是
+     * "我说完了，立刻送去识别"）；镜像面板那一路点下去走
+     * g_voice_mirror_submit_cb（请 hello_app 立刻收尾这一段），关窗靠右上角「×」。 */
     voice_submit_btn = lv_btn_create(voice_panel);
     lv_obj_set_width(voice_submit_btn, LV_PCT(90));
     lv_obj_set_height(voice_submit_btn, 72);
@@ -2369,7 +2392,7 @@ static void voice_panel_build(bool mirror)
                         LV_EVENT_CLICKED, NULL);
 
     voice_submit_lbl = lv_label_create(voice_submit_btn);
-    lv_label_set_text(voice_submit_lbl, mirror ? "关闭" : "提交");
+    lv_label_set_text(voice_submit_lbl, "提交");
     lv_obj_set_style_text_font(voice_submit_lbl, &lv_font_ui_24, 0);
     lv_obj_center(voice_submit_lbl);
 
@@ -2400,7 +2423,8 @@ void touch_ui_show_voice_chat(void)
     voice_panel_build(false);
 }
 
-/* 打开镜像面板：纯显示，不开麦、不放提示音、不回调 main.c。
+/* 打开镜像面板：纯显示，不开麦、不放提示音、打开时也不回调 main.c
+ * （只有用户点底部「提交」才会经 g_voice_mirror_submit_cb 转发一次）。
  * 走 lv_async_call 投到 LVGL 线程，所以任何线程都能调（MQTT 线程想给老人
  * 弹出来也可以）。
  * 每打开一次，对话历史都是空的（上一轮的 label 随面板一起删了）；想留住
@@ -2462,6 +2486,13 @@ void touch_ui_set_voice_cancel_cb(voice_cancel_cb_t cb, void *user_data)
 {
     g_voice_cancel_cb = cb;
     g_voice_cancel_user_data = user_data;
+}
+
+void touch_ui_set_voice_mirror_submit_cb(voice_mirror_submit_cb_t cb,
+                                         void *user_data)
+{
+    g_voice_mirror_submit_cb = cb;
+    g_voice_mirror_submit_user_data = user_data;
 }
 
 void touch_ui_set_voice_state(touch_voice_state_t state)

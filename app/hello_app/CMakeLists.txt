@@ -26,6 +26,12 @@ if(CONFIG_LVX_USE_CONTEST2026_233_HELLO_APP)
     # 互斥锁，真动作在 ai_companion_main.c（那边的 static 才够得着）。
     # robot_ui 也 include 这个头文件，所以它必须自给自足（不引 LVGL）。
     ai_companion_yield.c
+    # 只读诊断快照的薄壳（robot_ui 的 network_task 靠它把 hello_app 的内部状态
+    # 塞进心跳的 ha 位和 {"action":"diag"} 的报文里，见 ai_companion_diag.h）：
+    # 本文件只认 "key=value" 那一行文本、负责拼 JSON，真读取在
+    # ai_companion_main.c 的 ai_companion_state_snapshot_impl()（那边的 static
+    # 才够得着）。它同样要自给自足 —— robot_ui 也 include 那个头文件。
+    ai_companion_diag.c
   )
 
   set(HELLO_APP_COMPILE_FLAGS "")

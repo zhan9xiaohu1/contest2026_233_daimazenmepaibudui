@@ -329,9 +329,21 @@ ssize_t audio_in_read(FAR void *buf, size_t len)
 
   n = read(fd, buf, len);
 
-  /* 注意 read() 的语义：0 = 被 STOP 打断或下层 5 秒超时，
-   * 不是错误码也不是"读到 0 字节数据"。正数才是读到的字节数。
-   * 负值说明 fd 已失效（比如刚被另一个任务 close 掉）。 */
+  /* 这里是**原样转发**，一个字都不吞：上层的判据全靠这个返回值。
+   *
+   * read() 的语义（本板音频设备 dev/audio/audio0）：
+   *   正数 = 真的读到了这么多字节；
+   *   0    = EOF：被 AUDIOIOC_STOP 打断 / 设备没在跑 / 会话换代 ——
+   *          也就是驱动 sf32lb52_audio_read 里"这一代会话真的结束了"那三个判据；
+   *   负值 = 错误或超时。其中"下层分片等待超时"是驱动特意区分出来的
+   *          （驱动返回 -ETIMEDOUT），别的负值是真错误（没 start、fd 失效等）。
+   *
+   * 注意这里调的是 NuttX 的 POSIX read()：驱动返回的负值会被 libc 那层翻成
+   * -1 并把真正的错误号放进 errno（fs/vfs/fs_read.c 的 readv()：先
+   * set_errno(-ret)、再 return -1）。所以调用方要分"超时"和"别的错误"，
+   * 看的是 errno == ETIMEDOUT，不是返回值本身；而且调用前得先把 errno 清 0，
+   * 否则会读到上一次调用留下的旧值。本函数自己返回 -EINVAL 的那几条路
+   * （没 start / buf 为空 / len 为 0）不碰 errno。 */
 
   return n;
 }

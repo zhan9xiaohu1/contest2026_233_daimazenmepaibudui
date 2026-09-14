@@ -117,8 +117,10 @@ void touch_ui_set_voice_cancel_cb(voice_cancel_cb_t cb, void *user_data);
  *
  * 这个面板和 touch_ui_show_voice_chat() 长得一模一样，区别是：
  *   1) 没有录音计时（那一行根本不创建）；
- *   2) 底部大按钮是「关闭」（点了只关窗），**不会**回调 voice_chat_start_cb_t
- *      —— 那条路是去 audio_record_start() 的，半双工设备上和 ai_companion 抢麦；
+ *   2) 底部大按钮是「**提交**」：请框架侧 ai_companion 立刻收尾当前这一段录音
+ *      送去识别（不等 VAD 那 3 秒静音超时），**不会**回调 voice_chat_start_cb_t
+ *      —— 那条路是去 audio_record_start() 的，半双工设备上和 ai_companion 抢麦。
+ *      关闭在右上角那个「×」上（voice_close_event_handler，本来就有的）；
  *   3) 状态行默认「直接说话就行，我在听」；
  *   4) 对话区是**双方对话历史**：用户的发言（"你说：…"，小一号浅蓝）和智爱的
  *      回复（"智爱：…"，白色）一行行往下排，只保留最近几轮，能往上划回看
@@ -129,6 +131,19 @@ void touch_ui_set_voice_cancel_cb(voice_cancel_cb_t cb, void *user_data);
  * 任何线程也能调这个打开函数（内部投递）。
  */
 void touch_ui_show_voice_mirror(void);
+
+/* 镜像面板底部「提交」：main.c 在这里请框架侧 ai_companion 立刻收尾当前这一段
+ * 录音（它才是常开麦那一方，面板只是显示器）。
+ *
+ * ⚠️ 回调在 **LVGL 线程**里被调，里面**只能登记请求、立刻返回**：音频设备归
+ * hello_app，跨 app 同步动设备出过整组死掉的事故（见
+ * app/hello_app/ai_companion_yield.h 头上那一节）。没有可提交的语音时，由
+ * main.c 在回调里顺手在面板状态行提示一句（touch_ui_set_voice_status()），
+ * 这个分支里什么都不用管。 */
+typedef void (*voice_mirror_submit_cb_t)(void *user_data);
+
+void touch_ui_set_voice_mirror_submit_cb(voice_mirror_submit_cb_t cb,
+                                         void *user_data);
 
 /* 镜像面板状态行的四种状态：听=蓝、想=橙、说=绿、空闲=灰（颜色比字更早看出在干什么） */
 typedef enum {
