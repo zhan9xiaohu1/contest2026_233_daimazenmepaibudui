@@ -33,9 +33,13 @@ static lv_obj_t *scr_main = NULL;      // 主屏幕
 static lv_obj_t *scr_alarm = NULL;     // 报警屏幕
 
 /* 主界面组件 */
-static lv_obj_t *lbl_status = NULL;    // 状态标签
+/* lbl_status / lbl_net：**状态栏里已经不再创建这两个标签**（2026-09-14 用户要求
+ * 删掉"[在线]"和"NET --"，见 create_status_bar() 的注释）。这里保留声明是因为
+ * robot_ui_set_status() / robot_ui_set_net_status() 还在（内部判 NULL 后直接返回），
+ * 这样 main.c 里那十几处调用点不用改。它们恒为 NULL，不会有任何显示。 */
+static lv_obj_t *lbl_status = NULL;    // 状态标签（已不再创建）
 static lv_obj_t *lbl_time = NULL;      // 时间标签
-static lv_obj_t *lbl_net = NULL;       // 网络状态标签（RNDIS/MQTT）
+static lv_obj_t *lbl_net = NULL;       // 网络状态标签（已不再创建）
 static lv_obj_t *lbl_face = NULL;      // 表情标签
 static lv_obj_t *lbl_ai_reply = NULL;  // AI回复标签
 static lv_obj_t *lbl_reminder = NULL;  // 提醒标签
@@ -204,31 +208,44 @@ static void menu_button_event_handler(lv_event_t *e)
 
 static void create_status_bar(lv_obj_t *parent)
 {
-    /* 状态栏容器 */
+    /* 状态栏容器。**现在只放两样：时钟 + 「菜单」按钮。**
+     *
+     * 2026-09-14 用户要求删掉原来那三样：「[在线]」状态、「WiFi 100%」、「NET --」——
+     * 对老人没有任何用处（电量/信号本来就是写死的假值，网络状态只会让人困惑），
+     * 挤在 40px 高的栏里还占地方。删掉之后：
+     *   - 时间保留（它是真的，联网自动对时之后是准的）；
+     *   - 「菜单」按钮**做大**（130×40，占满整栏高度）—— 它是手势失灵时进主菜单
+     *     唯一的保底入口，老人手指粗，越大越好按。
+     *
+     * 注意：`robot_ui_set_status()` / `robot_ui_set_net_status()` 两个 setter
+     * **保留**了（对应标签不再创建、恒为 NULL，它们内部都有 NULL 检查）——
+     * 这样 main.c 里那十几处调用点一行都不用改，只是不再有任何显示效果。 */
     lv_obj_t *bar = lv_obj_create(parent);
-    lv_obj_set_size(bar, LV_PCT(100), 40);
+    /* 高度 40 → **64**：菜单按钮要做到 52 高才够好点（40 的栏里塞不下），
+     * 顺便让整块状态栏不那么挤。 */
+    lv_obj_set_size(bar, LV_PCT(100), 64);
     lv_obj_align(bar, LV_ALIGN_TOP_MID, 0, 0);
     lv_obj_set_style_bg_color(bar, lv_color_hex(0x2D2D44), 0);
     lv_obj_set_style_border_width(bar, 0, 0);
     lv_obj_set_style_radius(bar, 0, 0);
-    lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(bar, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(bar, 0, 0);
+    lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+    /* ⚠️ 这块屏是 **390×450 的圆角屏**：四个角是物理圆角，贴边的控件既会被
+     * 视觉裁掉、也不好点按（用户反馈"菜单栏不好点"就是这个原因）。
+     * 所以这里**不用 flex 排布**，改成两个子对象各自对齐：
+     *   时间  -> 居中（用户要求）
+     *   按钮  -> 右对齐 + 内缩 28px（躲开右上圆角）
+     * 圆角半径大约 20~30px，取 28 作为安全内缩。 */
 
-    /* 状态文本 */
-    lbl_status = lv_label_create(bar);
-    lv_label_set_text(lbl_status, "[在线]");
-    lv_obj_set_style_text_color(lbl_status, lv_color_hex(0x4CAF50), 0);
-    lv_obj_set_style_text_font(lbl_status, &lv_font_ui_24, 0);
-
-    /* 时间标签：从系统时钟（硬件 RTC）读真实时间，并定时刷新。
+    /* 时间标签（居中）：从系统时钟（硬件 RTC）读真实时间，并定时刷新。
      *
      * 原来这里是写死的 lv_label_set_text(lbl_time, "12:00")，所以主页面顶上
      * **永远显示 12:00**，跟板子时间毫无关系。
      *
      * 数据源用 time(NULL)：NuttX 启动时用 RTC 初始化系统时钟，
      * 而 RTC_SET_TIME（含 NSH 的 `date -s`）会同步系统时钟，所以它就是板子的时间。
-     * 板上没有 RTC 备份电池，掉电后时间会丢，要在 NSH 里重新对时：
-     *     date -s "Sep 13 12:00:00 2026"
+     * 板上没有 RTC 备份电池，掉电后时间会丢，开机后靠联网自动对时校正
+     * （见 time_sync.c）；也可以手动：date -s "Sep 13 12:00:00 2026"
      *
      * 注意：本构建没开 CONFIG_LIBC_LOCALTIME，`localtime` 实际就是 `gmtime`，
      * 所以**显示的是 UTC**，比北京时间少 8 小时。要显示本地时间得自己加偏移
@@ -236,27 +253,17 @@ static void create_status_bar(lv_obj_t *parent)
     lbl_time = lv_label_create(bar);
     lv_obj_set_style_text_color(lbl_time, lv_color_hex(0xFFFFFF), 0);
     lv_obj_set_style_text_font(lbl_time, &lv_font_ui_24, 0);
+    lv_obj_align(lbl_time, LV_ALIGN_CENTER, 0, 0);           /* 时间居中 */
     ui_clock_refresh();                                      /* 先立刻显示一次 */
     clock_timer = lv_timer_create(ui_clock_timer_cb, 10000, NULL);  /* 每 10 秒刷一次 */
 
-    /* 电量/网络图标（简化为文字） */
-    lv_obj_t *lbl_signal = lv_label_create(bar);
-    lv_label_set_text(lbl_signal, "WiFi 100%");
-    lv_obj_set_style_text_color(lbl_signal, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(lbl_signal, &lv_font_ui_24, 0);
-
-    /* 网络状态:由 main 的主循环轮询 network_is_connected() 后刷新，
-     * 不在 network_task 里直接改，避免跨任务操作 LVGL。
-     * 这里显示的是 network_task 给的 ASCII 状态串（NET OK / NET --）。
-     */
-    lbl_net = lv_label_create(bar);
-    lv_label_set_text(lbl_net, "NET --");
-    lv_obj_set_style_text_color(lbl_net, lv_color_hex(0xFFC107), 0);
-    lv_obj_set_style_text_font(lbl_net, &lv_font_ui_24, 0);
-
-    /* 「菜单」按钮：主菜单的保底入口（手势不灵时也能进）。 */
+    /* 「菜单」按钮：主菜单的保底入口（手势不灵时也能进）。
+     * 120×52 = 比原来的 LV_SIZE_CONTENT×36 大得多（宽度几乎翻倍、高度 +44%），
+     * 而且**从右上圆角里挪出来**（右移 -28px）—— 之前贴在屏幕角上，
+     * 圆角把可点区域切掉一块，所以"不好点"。 */
     lv_obj_t *btn_menu = lv_btn_create(bar);
-    lv_obj_set_size(btn_menu, LV_SIZE_CONTENT, 36);
+    lv_obj_set_size(btn_menu, 120, 52);
+    lv_obj_align(btn_menu, LV_ALIGN_RIGHT_MID, -28, 0);
     lv_obj_add_style(btn_menu, &style_btn, 0);
     lv_obj_add_event_cb(btn_menu, menu_button_event_handler,
                         LV_EVENT_CLICKED, NULL);
@@ -357,11 +364,17 @@ static void create_ai_reply_area(lv_obj_t *parent)
 static void create_bottom_buttons(lv_obj_t *parent)
 {
     /* 按钮容器 */
+    /* ⚠️ 这块屏是圆角屏（390×450）：容器铺满 100% 宽的话，最左/最右那个按钮
+     * 会压在**左下/右下圆角**上 —— 视觉被切一块，触摸也可能点不到。
+     * 所以左右各内缩 28px，三个按钮整体往里收（用户反馈"不好点"）。 */
     lv_obj_t *container = lv_obj_create(parent);
     lv_obj_set_size(container, LV_PCT(100), 80);
     lv_obj_align(container, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_opa(container, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(container, 0, 0);
+    lv_obj_set_style_pad_left(container, 28, 0);
+    lv_obj_set_style_pad_right(container, 28, 0);
+    lv_obj_set_style_pad_bottom(container, 6, 0);
     lv_obj_set_flex_flow(container, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(container, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
@@ -371,7 +384,9 @@ static void create_bottom_buttons(lv_obj_t *parent)
     lv_obj_add_style(btn_remind, &style_btn, 0);
     lv_obj_add_event_cb(btn_remind, btn_event_handler, LV_EVENT_CLICKED, (void *)UI_VIEW_REMIND);
     lv_obj_t *lbl_btn1 = lv_label_create(btn_remind);
-    lv_label_set_text(lbl_btn1, "Remind");
+    /* 中文标签（字库已经是 GB2312 全集，"提醒"两个字有字形）——
+     * 原来写的 "Remind"，主屏其它按钮（报警）都是中文，统一一下更认得出。 */
+    lv_label_set_text(lbl_btn1, "提醒");
     lv_obj_set_style_text_font(lbl_btn1, &lv_font_ui_24, 0);
     lv_obj_center(lbl_btn1);
 
@@ -405,7 +420,11 @@ static void btn_event_handler(lv_event_t *e)
     if (code == LV_EVENT_CLICKED) {
         switch (view) {
             case UI_VIEW_REMIND:
-                robot_ui_show_reminder("Health", "Time to take medicine!");
+                /* 主屏左下角这个按钮以前只弹一句写死的英文示例（"Time to take
+                 * medicine!"），和真正的提醒列表毫无关系。现在直接走**主菜单
+                 * 「查看提醒」同一个入口** —— 多一个冗余入口，老人不用先点开主菜单。 */
+                touch_ui_play_sound("click");
+                touch_ui_show_menu(MENU_TYPE_REMIND);
                 break;
             case UI_VIEW_SETTING:
                 touch_ui_show_menu(MENU_TYPE_SETTING);
@@ -592,6 +611,87 @@ void robot_ui_show_reminder(const char *title, const char *content)
      * 它会画成方块。这里统一成 build 里真正的三档字库之一，和 touch_ui 的
      * 弹窗一致（20px：比 24px 少占地方，长一点的提醒语不容易顶出屏幕）。 */
     lv_obj_set_style_text_font(mbox, &lv_font_ui_20, 0);
+}
+
+/* ==================== 报错提示页 ==================== */
+/*
+ * 为什么单独做一页：以前网络不通/请求失败时，界面只是"没反应"或者停在
+ * "处理中…"，用户根本不知道出了什么事（现场原话："卡死不好看"）。
+ * 这一页是**顶层覆盖**（建在当前活动屏上，不切屏、不动报警页），
+ * 一个大按钮，点一下就关。
+ *
+ * ⚠️ 只能在 LVGL 线程里调；别的线程（语音工作线程 / MQTT 线程 / 播放线程）
+ * 要弹它请用 main.c 的 ui_post_error()，那条路会 lv_async_call 投过来。
+ */
+
+static lv_obj_t *err_panel = NULL;
+
+static void err_close_event_handler(lv_event_t *e)
+{
+    (void)e;
+
+    if (err_panel != NULL) {
+        lv_obj_del(err_panel);
+        err_panel = NULL;
+    }
+
+    touch_ui_play_sound("back");
+}
+
+void robot_ui_show_error(const char *title, const char *content)
+{
+    lv_obj_t *scr = lv_scr_act();
+
+    if (scr == NULL) {
+        return;
+    }
+
+    /* 同一时刻只留一页：又报错了就换内容，不叠罗汉 */
+
+    if (err_panel != NULL) {
+        lv_obj_del(err_panel);
+        err_panel = NULL;
+    }
+
+    err_panel = lv_obj_create(scr);
+    lv_obj_set_size(err_panel, LV_PCT(92), LV_PCT(78));
+    lv_obj_center(err_panel);
+    lv_obj_set_style_bg_color(err_panel, lv_color_hex(0x3A1F1F), 0);
+    lv_obj_set_style_bg_opa(err_panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(err_panel, 3, 0);
+    lv_obj_set_style_border_color(err_panel, lv_color_hex(0xE53935), 0);
+    lv_obj_set_style_radius(err_panel, 20, 0);
+    lv_obj_set_flex_flow(err_panel, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(err_panel, LV_FLEX_ALIGN_SPACE_EVENLY,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_remove_flag(err_panel, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *t = lv_label_create(err_panel);
+    lv_label_set_text(t, (title != NULL && title[0] != '\0') ? title : "出错了");
+    lv_obj_set_style_text_font(t, &lv_font_ui_24, 0);
+    lv_obj_set_style_text_color(t, lv_color_hex(0xFFCDD2), 0);
+
+    lv_obj_t *c = lv_label_create(err_panel);
+    lv_label_set_text(c, (content != NULL) ? content : "");
+    lv_obj_set_style_text_font(c, &lv_font_ui_20, 0);
+    lv_obj_set_style_text_color(c, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_width(c, LV_PCT(95));
+    lv_label_set_long_mode(c, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(c, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_obj_t *btn = lv_btn_create(err_panel);
+    lv_obj_set_size(btn, LV_PCT(70), 70);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0xE53935), 0);
+    lv_obj_set_style_radius(btn, 16, 0);
+    lv_obj_add_event_cb(btn, err_close_event_handler, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *bl = lv_label_create(btn);
+    lv_label_set_text(bl, "知道了");
+    lv_obj_set_style_text_font(bl, &lv_font_ui_24, 0);
+    lv_obj_center(bl);
+
+    printf("[UI] 报错页: %s | %s\n",
+           (title != NULL) ? title : "", (content != NULL) ? content : "");
 }
 
 /* ==================== 显示报警 ==================== */

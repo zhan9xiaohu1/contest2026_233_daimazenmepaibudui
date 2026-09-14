@@ -18,6 +18,13 @@
  * 不再自己存一份（以前那份 static reminder_t reminders[] 只会显示、到点不响）。 */
 #include "reminder_sched.h"
 
+/* 跨线程投递口（app/robot_ui/ui_async.c）。本文件里所有"投到 LVGL 线程"的
+ * 动作都走它，不直接调 lv_async_call() —— 原因见 ui_async.h 开头：
+ * lv_async_call() 内部往 LVGL 的全局定时器链表插节点，而那次插入在 LVGL
+ * 9.1 里没有任何锁，多个工作线程同时插会把链表插坏，撞上 LVGL 线程的遍历
+ * 就是跳到垃圾地址（整机硬故障）。 */
+#include "ui_async.h"
+
 /* 中文字库（实现在 lv_font_ui_16/20/24.c，见 CMakeLists.txt 的 SRCS）。
  * 字符集是常用汉字全集（GB2312 6763 字 + ASCII + CJK 标点 + 全角），
  * 按改动前 montserrat 的字号分三档：
@@ -102,12 +109,27 @@ static void *g_volume_user_data = NULL;
 static lv_obj_t *voice_panel = NULL;
 static lv_obj_t *voice_timer_lbl = NULL;
 static lv_obj_t *voice_status_lbl = NULL;
-static lv_obj_t *voice_reply_box = NULL;
+static lv_obj_t *voice_chat_box = NULL;
 static lv_obj_t *voice_reply_lbl = NULL;
 static lv_obj_t *voice_submit_btn = NULL;
 static lv_obj_t *voice_submit_lbl = NULL;
 static lv_timer_t *voice_tick_timer = NULL;
 static uint32_t voice_start_tick = 0;
+
+/* 镜像面板的"双方对话"历史（PTT 弹窗不走这里，原因见 voice_text_async 的注释）。
+ *
+ * 为什么是固定槽位而不是一条长字符串：用户的要求是"两边的对话都要看得见、
+ * 还能往上翻一眼"，一条长字符串没法只丢掉最老的那一轮，聊十句就把面板内容
+ * 撑到几千像素高。这里固定 VOICE_HISTORY_ROUNDS 轮，写满一轮就把最老的整个
+ * 删掉重建，所以行数和内存都有上限，面板不会被撑破。
+ * 每轮两个 label（voice_hist_user / voice_hist_ai）：字号和颜色不同，
+ * 老人不用细读也能扫一眼分出哪句是自己说的。 */
+#define VOICE_HISTORY_ROUNDS 3
+static lv_obj_t *voice_hist_hint = NULL;                    /* 还没说话时的占位行 */
+static lv_obj_t *voice_hist_user[VOICE_HISTORY_ROUNDS];     /* 每轮的"你说：…" */
+static lv_obj_t *voice_hist_ai[VOICE_HISTORY_ROUNDS];       /* 每轮的"智爱：…" */
+static int voice_hist_next = 0;         /* 环形缓冲：下一个要覆盖的槽位 */
+static int voice_hist_pending = -1;     /* 写了"你说"、还等着写"智爱"的槽位，-1=没有 */
 
 /* 提交按钮的三态：可提交 -> 处理中(禁用) -> 可再来一轮 */
 typedef enum {
@@ -116,6 +138,15 @@ typedef enum {
     VOICE_BTN_RETRY
 } voice_btn_state_t;
 static voice_btn_state_t voice_btn_state = VOICE_BTN_SUBMIT;
+
+/* 投到弹窗里的一段文字是哪一类（决定它写状态行还是进对话历史）。
+ * 放在这里而不是紧接着 voice_post_text()：它要出现在文件上半的
+ * "语音聊天弹窗内部函数"前置声明之前，否则那行声明里认不出这个类型。 */
+typedef enum {
+    VOICE_TEXT_STATUS = 0,   /* 状态行：写一句话进去，不参与对话历史 */
+    VOICE_TEXT_USER,         /* 用户发言（ASR 原文）：开一轮新的"你说：…" */
+    VOICE_TEXT_REPLY         /* 智爱回复：收尾当前这一轮，写"智爱：…" */
+} voice_text_kind_t;
 
 /* 会话世代号：开窗 /「再说一次」/ 关窗都 +1。
  * 工作线程在途的结果回来后一比对就知道该不该丢弃，不需要去 join 它，
@@ -126,6 +157,11 @@ static voice_submit_cb_t g_voice_submit_cb = NULL;
 static void *g_voice_submit_user_data = NULL;
 static voice_cancel_cb_t g_voice_cancel_cb = NULL;
 static void *g_voice_cancel_user_data = NULL;
+
+/* 镜像面板模式：面板**只显示**，不开录音、不放提示音（语音入口在框架侧
+ * ai_companion）。由 voice_panel_build(true) 置位、touch_ui_hide_voice_chat()
+ * 清掉 —— 「关窗那一支」和「提交那一支」都靠它分叉，避免复制两份弹窗代码。 */
+static bool voice_mirror_only = false;
 
 /* 设置持久化文件路径 */
 #define SETTINGS_FILE_PATH "/data/zhi_ai_settings.dat"
@@ -195,7 +231,7 @@ static void voice_set_btn_state(voice_btn_state_t state);
 static void voice_begin_round(void);
 static void voice_start_timer(void);
 static void voice_stop_timer(void);
-static void voice_post_text(const char *text, bool is_reply);
+static void voice_post_text(const char *text, voice_text_kind_t kind);
 static void voice_round_done_async(void *arg);
 
 /* ==================== 初始化老人友好样式 ==================== */
@@ -281,13 +317,21 @@ void touch_ui_init(void)
     voice_panel = NULL;
     voice_timer_lbl = NULL;
     voice_status_lbl = NULL;
-    voice_reply_box = NULL;
+    voice_chat_box = NULL;
     voice_reply_lbl = NULL;
+    voice_hist_hint = NULL;
+    for (int i = 0; i < VOICE_HISTORY_ROUNDS; i++) {
+        voice_hist_user[i] = NULL;
+        voice_hist_ai[i] = NULL;
+    }
+    voice_hist_next = 0;
+    voice_hist_pending = -1;
     voice_submit_btn = NULL;
     voice_submit_lbl = NULL;
     voice_tick_timer = NULL;
     voice_btn_state = VOICE_BTN_SUBMIT;
     voice_generation = 0;
+    voice_mirror_only = false;
 
     /* 获取当前活动屏幕 */
     current_screen = lv_scr_act();
@@ -1132,11 +1176,17 @@ static void menu_item_event_handler(lv_event_t *e)
     touch_ui_play_sound("click");
 
     switch (index) {
-        case 0: // 语音聊天
-            /* 走新弹窗（touch_ui_show_voice_chat 内部会回调 g_voice_chat_cb
-             * 让 main.c 开始录音）。旧的 touch_ui_show_setting_detail 入口已去掉。 */
-            touch_ui_set_mode(MODE_LISTENING);
-            touch_ui_show_voice_chat();
+        case 0: // 语音聊天：开「语音镜像面板」（纯显示，不开麦）
+            /* 2026-09-14 用户决定：语音入口统一交给 openvela 框架侧
+             * （hello_app 的 ai_companion，已开机自启），robot_ui 不再开麦。
+             * 所以这里开的不是 PTT 弹窗，而是 touch_ui_show_voice_mirror()：
+             * 和原来长得一样，但没有录音计时和「提交」，只把"在不在听、
+             * 什么时候回答"显示出来 —— 用户原话「我怎么知道他在听他什么时候回复」。
+             *
+             * ⚠️ 这条路径不碰任何音频设备：不开麦、不放提示音（touch_ui_play_sound
+             * 目前是空实现，只有一行 printf）。ai_companion 常开着麦克风，半双工
+             * 设备上 robot_ui 一动音频通路就会互相打断（audio_in_start 直接 -EBUSY）。 */
+            touch_ui_show_voice_mirror();
             break;
         case 1: // 查看提醒
             touch_ui_show_menu(MENU_TYPE_REMIND);
@@ -1525,7 +1575,7 @@ static void reminders_changed_async(void *unused);
 
 void touch_ui_notify_reminders_changed(void)
 {
-    if (lv_async_call(reminders_changed_async, NULL) != LV_RESULT_OK) {
+    if (ui_async_call(reminders_changed_async, NULL) != LV_RESULT_OK) {
         /* 投递失败（内存紧）：列表下次打开时本来就是重新读的，不刷也不会错 */
         printf("[Reminder] 列表刷新投递失败，稍后打开菜单时自然是最新的\n");
     }
@@ -1668,18 +1718,236 @@ static void settings_load_from_file(void)
  *   - 控件只在 LVGL 线程（事件回调 / 主循环里的 lv_timer_handler）里创建、
  *     删除、写字。CONFIG_LV_USE_OS=0，LVGL 自己没有锁，别的线程碰控件必崩。
  *   - ASR/LLM/TTS 在工作线程里跑，回结果只走 touch_ui_set_voice_status() /
- *     touch_ui_set_voice_reply() / touch_ui_voice_chat_round_done()，它们用
+ *     touch_ui_set_voice_user_text() / touch_ui_set_voice_reply() /
+ *     touch_ui_voice_chat_round_done()，它们用
  *     lv_async_call 把消息投回 LVGL 线程，并带上投递时刻的世代号。
  *   - 世代号对不上（用户已关窗、或点了「再说一次」）的消息整条丢弃，既不会
  *     写到已删除的控件上，关窗时也不需要去 join 在工作的工作线程。
+ *   - 镜像面板和 PTT 弹窗的对话区是两条路：镜像面板要把双方发言分开、按轮
+ *     堆成历史（框架侧 ai_companion 分两次报，先 ASR 原文后大模型回复），
+ *     PTT 弹窗那边 main.c 把 "我说：…\n\n智爱：…" 拼成一整段送进来，照旧整段
+ *     显示。分叉在 voice_text_async 里，靠 voice_mirror_only 判。
  */
 
 /* 投递到 LVGL 线程的一段文字（堆上分配，回调里释放） */
 typedef struct {
     char *text;
     uint32_t gen;
-    bool is_reply;
+    voice_text_kind_t kind;
 } voice_text_msg_t;
+
+/* 一条贴进 label 的话最多多少字节（UTF-8）。
+ * AI 回复可能很长，不设上限的话一个 label 能撑出几千像素高 —— 对话区虽然有
+ * 滚动条，但"一屏只有一句"就不像对话了。main.c 送显示前用的也是 256 上下的
+ * 缓冲，这里按同一个量级截，截断处补一个"…"（U+2026，字库里有这个字形）。 */
+#define VOICE_TEXT_MAX 240
+
+/* 把要显示的一段文字规整进定长缓冲（保证不出界、不留半个汉字）：
+ *   - 丢掉控制字符（\r 会让 LVGL 的断行算错，响铃/退格之类更是乱码来源），
+ *     制表符换成空格（label 里没有制表位），**换行保留** —— 那是分段用的；
+ *   - 落单的 UTF-8 续字节/非法引导字节丢掉，别把乱码送进 label；
+ *   - 超过上限就在字符边界上截断并补"…"。
+ *
+ * ⚠️ 这里**只**管长度和控制字符，不管字形：字库里没有的码点（emoji、装饰符）
+ *    必须由调用方在进来之前过一遍 main.c 的 sanitize_for_display()。
+ *    约定：touch_ui_set_voice_user_text() / touch_ui_set_voice_reply() 的入参
+ *    都是"已经清洗过的显示文本"（main.c 的 ai_reply / device_state 分支就是
+ *    这么送的）；sanitize_for_display() 是 main.c 里的 static，touch_ui.c 够不到，
+ *    字形过滤这一层只能在调用方做，这里不做第二遍。 */
+static void voice_text_fit(const char *in, char *out, size_t cap)
+{
+    size_t len;
+    size_t i = 0;
+    size_t o = 0;
+    size_t limit;
+    bool truncated = false;
+
+    if (out == NULL || cap == 0) {
+        return;
+    }
+
+    out[0] = '\0';
+
+    if (in == NULL) {
+        return;
+    }
+
+    len = strlen(in);
+    limit = (cap > 4) ? (cap - 4) : 0;         /* 留 3 字节补"…"、1 字节收尾 */
+
+    while (i < len) {
+        unsigned char c = (unsigned char)in[i];
+        size_t n;
+
+        if (c == '\r') {                       /* CRLF 归一成 LF，孤立的 \r 丢掉 */
+            i++;
+            continue;
+        }
+
+        if (c == '\t') {
+            c = ' ';
+            n = 1;
+        } else if (c < 0x20 && c != '\n') {    /* 其余控制字符：直接丢 */
+            i++;
+            continue;
+        } else if (c < 0x80) {
+            n = 1;
+        } else if ((c & 0xe0) == 0xc0) {
+            n = 2;
+        } else if ((c & 0xf0) == 0xe0) {
+            n = 3;
+        } else if ((c & 0xf8) == 0xf0) {
+            n = 4;
+        } else {
+            i++;                               /* 落单的续字节：丢掉 */
+            continue;
+        }
+
+        if (i + n > len || o + n > limit) {    /* 尾巴上少了一半，或者放不下了 */
+            truncated = true;
+            break;
+        }
+
+        if (n == 1) {
+            out[o++] = (char)c;
+        } else {
+            memcpy(out + o, in + i, n);
+            o += n;
+        }
+
+        i += n;
+    }
+
+    if (truncated && o + 4 <= cap) {           /* 缓冲太小时只截断、不补"…" */
+        memcpy(out + o, "\xe2\x80\xa6", 3);    /* "…" = U+2026 */
+        o += 3;
+    }
+
+    out[o] = '\0';
+}
+
+/* 对话区里有内容了：收掉占位行、滚到最新一条（老人不用自己往下划）。
+ * 必须先把 layout 更新一遍 —— 刚创建的 label 还没参与 flex 排版，
+ * 内容高度还是上一轮的，直接滚会停在半路。 */
+static void voice_chat_box_show_latest(void)
+{
+    if (voice_hist_hint != NULL) {
+        lv_obj_add_flag(voice_hist_hint, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (voice_chat_box != NULL) {
+        lv_obj_update_layout(voice_chat_box);
+        lv_obj_scroll_to_y(voice_chat_box, LV_COORD_MAX, LV_ANIM_OFF);
+    }
+}
+
+/* 清掉一个历史槽位的两行。删控件前先把自己的句柄置空，别留野指针 */
+static void voice_hist_clear_slot(int slot)
+{
+    if (slot < 0 || slot >= VOICE_HISTORY_ROUNDS) {
+        return;
+    }
+
+    if (voice_hist_user[slot] != NULL) {
+        lv_obj_del(voice_hist_user[slot]);
+        voice_hist_user[slot] = NULL;
+    }
+
+    if (voice_hist_ai[slot] != NULL) {
+        lv_obj_del(voice_hist_ai[slot]);
+        voice_hist_ai[slot] = NULL;
+    }
+}
+
+/* 在对话区里造一行。字号/颜色由调用方给：用户那行小一号、浅蓝（0x90CAF9），
+ * 智爱那行大一号、白色 —— 老人不用细读，扫一眼颜色就知道哪句是自己说的。
+ * pad_top 用间距把相邻两轮分开，不然两轮的四行字会挤成一坨。 */
+static lv_obj_t *voice_hist_new_label(const lv_font_t *font, uint32_t color,
+                                      int32_t pad_top)
+{
+    lv_obj_t *lbl = lv_label_create(voice_chat_box);
+
+    lv_obj_set_width(lbl, LV_PCT(100));
+    lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(lbl, font, 0);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(color), 0);
+    lv_obj_set_style_pad_top(lbl, pad_top, 0);
+
+    return lbl;
+}
+
+/* 前缀 + 正文一起进 label（正文已经 voice_text_fit 过，"前缀 + 正文"整体封顶） */
+static void voice_hist_set_line(lv_obj_t *lbl, const char *prefix, const char *text)
+{
+    char line[VOICE_TEXT_MAX + 16];
+
+    if (lbl == NULL) {
+        return;
+    }
+
+    snprintf(line, sizeof(line), "%s%s", prefix, (text != NULL) ? text : "");
+    lv_label_set_text(lbl, line);
+}
+
+/* 用户发言：开一轮新的（"你说：…"），并把这一轮标成"等着智爱收尾" */
+static void voice_hist_push_user(const char *text)
+{
+    int slot = voice_hist_next;
+
+    if (voice_chat_box == NULL) {
+        return;
+    }
+
+    voice_hist_clear_slot(slot);
+    voice_hist_user[slot] = voice_hist_new_label(&lv_font_ui_16, 0x90CAF9, 8);
+    voice_hist_set_line(voice_hist_user[slot], "你说：", text);
+
+    voice_hist_next = (slot + 1) % VOICE_HISTORY_ROUNDS;
+    voice_hist_pending = slot;
+
+    voice_chat_box_show_latest();
+}
+
+/* 智爱回复：收尾上面那一轮（填进同一个槽位的第二行）。
+ * 没有等着收尾的轮（例如 robot_ui 老路径只报回复、没有用户发言）就自己开一轮，
+ * 只放智爱这一行，语义上就是"这句话是它主动说的"。 */
+static void voice_hist_push_ai(const char *text)
+{
+    int slot = voice_hist_pending;
+
+    if (voice_chat_box == NULL) {
+        return;
+    }
+
+    if (slot < 0) {
+        slot = voice_hist_next;
+        voice_hist_clear_slot(slot);           /* 覆盖最老一轮前先整个清掉 */
+        voice_hist_next = (slot + 1) % VOICE_HISTORY_ROUNDS;
+    }
+
+    voice_hist_ai[slot] = voice_hist_new_label(&lv_font_ui_20, 0xFFFFFF, 2);
+    voice_hist_set_line(voice_hist_ai[slot], "智爱：", text);
+
+    voice_hist_pending = -1;
+
+    voice_chat_box_show_latest();
+}
+
+/* 忘掉整个历史（只在面板已经删掉之后调）。
+ * 这些 label 都是面板的子对象，跟着面板一起没了，所以只能清句柄、**不能** del ——
+ * 这里再 del 一次就是删已失效的对象。 */
+static void voice_hist_forget(void)
+{
+    int i;
+
+    for (i = 0; i < VOICE_HISTORY_ROUNDS; i++) {
+        voice_hist_user[i] = NULL;
+        voice_hist_ai[i] = NULL;
+    }
+
+    voice_hist_next = 0;
+    voice_hist_pending = -1;
+}
 
 static void voice_text_async(void *arg)
 {
@@ -1687,15 +1955,32 @@ static void voice_text_async(void *arg)
 
     /* 世代对不上 = 弹窗已经关了或者又开了一轮，这条消息作废 */
     if (msg->gen == voice_generation && voice_panel != NULL) {
-        lv_obj_t *lbl = msg->is_reply ? voice_reply_lbl : voice_status_lbl;
+        if (msg->kind == VOICE_TEXT_STATUS) {
+            if (voice_status_lbl != NULL) {
+                lv_label_set_text(voice_status_lbl, msg->text);
+            }
+        } else if (voice_mirror_only) {
+            /* 镜像面板：双方发言各占一行、按轮堆成历史 —— 框架侧 ai_companion
+             * 是分两次报来的（先 ASR 原文，后大模型回复），正好一轮两行 */
+            char line[VOICE_TEXT_MAX];
 
-        if (lbl != NULL) {
-            lv_label_set_text(lbl, msg->text);
-        }
+            voice_text_fit(msg->text, line, sizeof(line));
 
-        /* 对话区有新内容就滚到最新一行，老人不用手动划 */
-        if (msg->is_reply && voice_reply_box != NULL) {
-            lv_obj_scroll_to_y(voice_reply_box, LV_COORD_MAX, LV_ANIM_OFF);
+            /* 清洗完是空的（ASR 没听清、回复是空的）就不占行：面板上冒出
+             * 一句孤零零的"你说："或"智爱："只会让人以为它坏了 */
+            if (line[0] != '\0') {
+                if (msg->kind == VOICE_TEXT_USER) {
+                    voice_hist_push_user(line);
+                } else {
+                    voice_hist_push_ai(line);
+                }
+            }
+        } else if (voice_reply_lbl != NULL) {
+            /* PTT 弹窗：main.c 那边把 "我说：…\n\n智爱：…" 拼成一整段送进来
+             * （voice_task_show -> touch_ui_set_voice_reply），这边照旧整段写进
+             * 一个 label、不加前缀也不分轮 —— 否则会叠成"智爱：我说：…" */
+            lv_label_set_text(voice_reply_lbl, msg->text);
+            voice_chat_box_show_latest();
         }
     }
 
@@ -1703,12 +1988,13 @@ static void voice_text_async(void *arg)
     free(msg);
 }
 
-/* 把一段文字投到弹窗里（状态行或对话区）。任何线程都能调。 */
-static void voice_post_text(const char *text, bool is_reply)
+/* 把一段文字投到弹窗里（状态行 / 用户发言 / 智爱回复）。任何线程都能调。 */
+static void voice_post_text(const char *text, voice_text_kind_t kind)
 {
     voice_text_msg_t *msg;
     char *copy;
 
+    /* 面板没开着：直接丢掉（连 lv_async_call 都不用投，省一次调度） */
     if (text == NULL || voice_panel == NULL) {
         return;
     }
@@ -1724,9 +2010,9 @@ static void voice_post_text(const char *text, bool is_reply)
     strcpy(copy, text);
     msg->text = copy;
     msg->gen = voice_generation;
-    msg->is_reply = is_reply;
+    msg->kind = kind;
 
-    if (lv_async_call(voice_text_async, msg) != LV_RESULT_OK) {
+    if (ui_async_call(voice_text_async, msg) != LV_RESULT_OK) {
         free(copy);
         free(msg);
     }
@@ -1790,7 +2076,10 @@ static void voice_set_btn_state(voice_btn_state_t state)
 }
 
 /* 开一轮新的说话：世代 +1（上一轮在途的结果就此作废），界面归零，计时重开。
- * 录音本身不在这里启动 —— main.c 的 g_voice_chat_cb 负责。 */
+ * 录音本身不在这里启动 —— main.c 的 g_voice_chat_cb 负责。
+ * 只清空那块整段显示的 label（PTT 弹窗专用），不清镜像面板的历史 —— 这里
+ * 压根跑不到镜像面板（它不开麦、不建计时），而 PTT 的一轮结束后历史本来
+ * 就只有那一整段。 */
 static void voice_begin_round(void)
 {
     voice_generation++;
@@ -1803,8 +2092,8 @@ static void voice_begin_round(void)
     if (voice_status_lbl != NULL) {
         lv_label_set_text(voice_status_lbl, "正在录音…\n说完点「提交」");
     }
-    if (voice_reply_box != NULL) {
-        lv_obj_scroll_to_y(voice_reply_box, 0, LV_ANIM_OFF);
+    if (voice_chat_box != NULL) {
+        lv_obj_scroll_to_y(voice_chat_box, 0, LV_ANIM_OFF);
     }
     if (voice_timer_lbl != NULL) {
         lv_label_set_text(voice_timer_lbl, "00:00");
@@ -1821,6 +2110,14 @@ static void voice_close_event_handler(lv_event_t *e)
     }
 
     touch_ui_play_sound("click");
+
+    /* 镜像面板：本来就没录音，不用（也不能）通知 main.c 去停录音 */
+    if (voice_mirror_only) {
+        printf("[VoiceChat] 关闭镜像面板\n");
+        touch_ui_hide_voice_chat();
+        return;
+    }
+
     printf("[VoiceChat] 关闭弹窗，丢弃这一轮\n");
 
     /* 先让 main.c 停录音、丢缓冲，再关窗：关窗会把世代号推进，
@@ -1832,7 +2129,8 @@ static void voice_close_event_handler(lv_event_t *e)
     touch_ui_hide_voice_chat();
 }
 
-/* 底部大按钮：「提交」（结束录音、交出去）或「再说一次」 */
+/* 底部大按钮：「提交」（结束录音、交出去）或「再说一次」；
+ * 镜像面板上它是「关闭」—— 点了只关窗，绝不去碰音频设备。 */
 static void voice_submit_event_handler(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED || voice_panel == NULL) {
@@ -1841,6 +2139,12 @@ static void voice_submit_event_handler(lv_event_t *e)
 
     touch_ui_play_sound("click");
 
+    if (voice_mirror_only) {
+        printf("[VoiceChat] 镜像面板：关闭\n");
+        touch_ui_hide_voice_chat();
+        return;
+    }
+
     if (voice_btn_state == VOICE_BTN_RETRY) {
         printf("[VoiceChat] 再说一次\n");
         voice_begin_round();
@@ -1848,7 +2152,7 @@ static void voice_submit_event_handler(lv_event_t *e)
         if (g_voice_chat_cb != NULL) {
             g_voice_chat_cb(g_voice_chat_user_data);
         } else {
-            voice_post_text("录音功能未就绪", false);
+            voice_post_text("录音功能未就绪", VOICE_TEXT_STATUS);
             voice_stop_timer();
             voice_set_btn_state(VOICE_BTN_RETRY);
         }
@@ -1868,7 +2172,7 @@ static void voice_submit_event_handler(lv_event_t *e)
     if (g_voice_submit_cb != NULL) {
         g_voice_submit_cb(g_voice_submit_user_data);
     } else {
-        voice_post_text("语音功能未就绪", false);
+        voice_post_text("语音功能未就绪", VOICE_TEXT_STATUS);
         voice_set_btn_state(VOICE_BTN_RETRY);
     }
 }
@@ -1888,16 +2192,65 @@ static void voice_round_done_async(void *arg)
 
 /* ==================== 语音聊天弹窗：公共接口 ==================== */
 
-/* 打开弹窗，并回调 g_voice_chat_cb 让 main.c 开始录音 */
-void touch_ui_show_voice_chat(void)
+/* 状态行的四种文字：老人一眼能看懂的短句，不是技术术语 */
+static const char *voice_state_text(touch_voice_state_t state)
+{
+    switch (state) {
+        case TOUCH_VOICE_STATE_LISTENING: return "我在听…";
+        case TOUCH_VOICE_STATE_THINKING:  return "正在想…";
+        case TOUCH_VOICE_STATE_SPEAKING:  return "正在说话…";
+        case TOUCH_VOICE_STATE_IDLE:
+        default:                          return "直接说话就行，我在听";
+    }
+}
+
+/* 状态行的颜色：听=蓝、想=橙、说=绿、空闲=灰。
+ * 老人看不大清小字，颜色 + 大字一起给，扫一眼就知道它在干什么。 */
+static lv_color_t voice_state_color(touch_voice_state_t state)
+{
+    switch (state) {
+        case TOUCH_VOICE_STATE_LISTENING: return lv_color_hex(0x42A5F5);   /* 蓝 */
+        case TOUCH_VOICE_STATE_THINKING:  return lv_color_hex(0xFFA726);   /* 橙 */
+        case TOUCH_VOICE_STATE_SPEAKING:  return lv_color_hex(0x66BB6A);   /* 绿 */
+        case TOUCH_VOICE_STATE_IDLE:
+        default:                          return lv_color_hex(0xBDBDBD);   /* 灰 */
+    }
+}
+
+/* 改状态行（只在 LVGL 线程跑） */
+static void voice_state_async(void *arg)
+{
+    touch_voice_state_t state = (touch_voice_state_t)(uintptr_t)arg;
+
+    /* 面板没开着：什么都不做（下次打开时自然是"直接说话就行，我在听"） */
+    if (voice_panel == NULL || voice_status_lbl == NULL) {
+        return;
+    }
+
+    lv_label_set_text(voice_status_lbl, voice_state_text(state));
+    lv_obj_set_style_text_color(voice_status_lbl, voice_state_color(state), 0);
+}
+
+/* 搭面板。mirror = true 是镜像面板（纯显示，不开麦、不回调 main.c）；
+ * mirror = false 是原来的 PTT 弹窗（开麦录音、提交）。
+ * 两边的控件、尺寸、间距全部共用，只有下面几处按 mirror 分叉：
+ *   ① 录音计时那行 —— 镜像面板根本不建（没有录音，建了只会一直停在 00:00）；
+ *   ② 状态行的默认文字/颜色；
+ *   ③ 对话区的内容 —— 镜像面板建"双方发言历史"（先一个占位行，往后按轮加
+ *      "你说：…" / "智爱：…"），PTT 弹窗建一整段显示的 label（main.c 送进来的
+ *      就是 "我说：…\n\n智爱：…" 一整段）；
+ *   ④ 底部大按钮的文字与收尾动作（「关闭」关窗 vs 「提交」开工作线程）。 */
+static void voice_panel_build(bool mirror)
 {
     lv_obj_t *header;
     lv_obj_t *title;
     lv_obj_t *btn_close;
     lv_obj_t *lbl_close;
 
-    /* 重复打开：先把上一轮的控件和定时器收干净，免得对象/lv_timer 泄漏 */
+    /* 重复打开：先把上一轮的控件和定时器收干净，免得对象/lv_timer 泄漏。
+     * 注意顺序 —— hide() 会把 voice_mirror_only 清掉，所以它必须在置位之前。 */
     touch_ui_hide_voice_chat();
+    voice_mirror_only = mirror;
 
     voice_panel = lv_obj_create(current_screen);
     lv_obj_set_size(voice_panel, LV_PCT(92), LV_PCT(92));
@@ -1943,43 +2296,71 @@ void touch_ui_show_voice_chat(void)
     lv_obj_set_style_text_font(lbl_close, &lv_font_ui_24, 0);
     lv_obj_center(lbl_close);
 
-    /* 录音计时（mm:ss，voice_tick_timer_cb 每秒刷新） */
-    voice_timer_lbl = lv_label_create(voice_panel);
-    lv_label_set_text(voice_timer_lbl, "00:00");
-    lv_obj_set_style_text_font(voice_timer_lbl, &lv_font_ui_24, 0);
-    lv_obj_set_style_text_color(voice_timer_lbl, lv_color_hex(0x4CAF50), 0);
+    /* 录音计时（mm:ss，voice_tick_timer_cb 每秒刷新）。
+     * 镜像面板没有录音，这一行不建 —— 建了只会一直停在 00:00，反而让人以为坏了。 */
+    if (!mirror) {
+        voice_timer_lbl = lv_label_create(voice_panel);
+        lv_label_set_text(voice_timer_lbl, "00:00");
+        lv_obj_set_style_text_font(voice_timer_lbl, &lv_font_ui_24, 0);
+        lv_obj_set_style_text_color(voice_timer_lbl, lv_color_hex(0x4CAF50), 0);
+    }
 
-    /* 状态行 */
+    /* 状态行：本面板最醒目的一行（24 号字 + 随状态变色） */
     voice_status_lbl = lv_label_create(voice_panel);
-    lv_label_set_text(voice_status_lbl, "正在录音…\n说完点「提交」");
+    lv_label_set_text(voice_status_lbl,
+                      mirror ? voice_state_text(TOUCH_VOICE_STATE_IDLE)
+                             : "正在录音…\n说完点「提交」");
     lv_obj_set_width(voice_status_lbl, LV_PCT(100));
     lv_label_set_long_mode(voice_status_lbl, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(voice_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_font(voice_status_lbl, &lv_font_ui_20, 0);
-    lv_obj_set_style_text_color(voice_status_lbl, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_text_font(voice_status_lbl, &lv_font_ui_24, 0);
+    lv_obj_set_style_text_color(voice_status_lbl,
+                                mirror ? voice_state_color(TOUCH_VOICE_STATE_IDLE)
+                                       : lv_color_hex(0xCCCCCC), 0);
 
-    /* 对话区：识别文字 + AI 回复，能换行、能滚动 */
-    voice_reply_box = lv_obj_create(voice_panel);
-    lv_obj_set_width(voice_reply_box, LV_PCT(100));
-    lv_obj_set_flex_grow(voice_reply_box, 1);
-    lv_obj_set_style_bg_color(voice_reply_box, lv_color_hex(0x101020), 0);
-    lv_obj_set_style_bg_opa(voice_reply_box, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(voice_reply_box, 1, 0);
-    lv_obj_set_style_border_color(voice_reply_box, lv_color_hex(0x37474F), 0);
-    lv_obj_set_style_radius(voice_reply_box, 12, 0);
-    lv_obj_set_style_pad_all(voice_reply_box, 10, 0);
-    lv_obj_set_flex_flow(voice_reply_box, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(voice_reply_box, LV_FLEX_ALIGN_START,
+    /* 对话区：能换行、能滚动的对话历史（双方都看得见）。
+     * 只开纵向滚动 —— 横向滚动会让整行文字被推着跑，反而看不全。 */
+    voice_chat_box = lv_obj_create(voice_panel);
+    lv_obj_set_width(voice_chat_box, LV_PCT(100));
+    lv_obj_set_flex_grow(voice_chat_box, 1);
+    lv_obj_set_style_bg_color(voice_chat_box, lv_color_hex(0x101020), 0);
+    lv_obj_set_style_bg_opa(voice_chat_box, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(voice_chat_box, 1, 0);
+    lv_obj_set_style_border_color(voice_chat_box, lv_color_hex(0x37474F), 0);
+    lv_obj_set_style_radius(voice_chat_box, 12, 0);
+    lv_obj_set_style_pad_all(voice_chat_box, 10, 0);
+    lv_obj_set_style_pad_row(voice_chat_box, 4, 0);
+    lv_obj_set_flex_flow(voice_chat_box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(voice_chat_box, LV_FLEX_ALIGN_START,
                           LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_scroll_dir(voice_chat_box, LV_DIR_VER);
 
-    voice_reply_lbl = lv_label_create(voice_reply_box);
-    lv_label_set_text(voice_reply_lbl, "");
-    lv_obj_set_width(voice_reply_lbl, LV_PCT(100));
-    lv_label_set_long_mode(voice_reply_lbl, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_font(voice_reply_lbl, &lv_font_ui_20, 0);
-    lv_obj_set_style_text_color(voice_reply_lbl, lv_color_hex(0xFFFFFF), 0);
+    if (mirror) {
+        /* 镜像面板：历史是一行行 label（"你说：…" / "智爱：…"，见
+         * voice_hist_push_user / voice_hist_push_ai），所以这里先只放一个
+         * 占位行 —— 空盒子看着像"坏了"。第一条内容进来时它会被藏起来；
+         * 它不占历史槽位，覆盖/清空历史时都不用管它。 */
+        voice_hist_hint = lv_label_create(voice_chat_box);
+        lv_label_set_text(voice_hist_hint, "你说的话和智爱的回复\n会显示在这里");
+        lv_obj_set_width(voice_hist_hint, LV_PCT(100));
+        lv_label_set_long_mode(voice_hist_hint, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_font(voice_hist_hint, &lv_font_ui_16, 0);
+        lv_obj_set_style_text_color(voice_hist_hint, lv_color_hex(0x78909C), 0);
+    } else {
+        /* PTT 弹窗：main.c 送进来的是一整段 "我说：…\n\n智爱：…"
+         * （voice_task_show -> touch_ui_set_voice_reply），沿用以前那块
+         * 整段显示的 label，不前缀、不分轮 */
+        voice_reply_lbl = lv_label_create(voice_chat_box);
+        lv_label_set_text(voice_reply_lbl, "");
+        lv_obj_set_width(voice_reply_lbl, LV_PCT(100));
+        lv_label_set_long_mode(voice_reply_lbl, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_font(voice_reply_lbl, &lv_font_ui_20, 0);
+        lv_obj_set_style_text_color(voice_reply_lbl, lv_color_hex(0xFFFFFF), 0);
+    }
 
-    /* 大号提交按钮（≥60px，老人好按；绿色 = style_big_btn） */
+    /* 底部大按钮（≥60px，老人好按；绿色 = style_big_btn）。
+     * PTT 弹窗上是「提交」，镜像面板上是「关闭」—— 都是同一个按钮，
+     * 文字和点击后的动作由 voice_mirror_only 分叉（见各自的 handler）。 */
     voice_submit_btn = lv_btn_create(voice_panel);
     lv_obj_set_width(voice_submit_btn, LV_PCT(90));
     lv_obj_set_height(voice_submit_btn, 72);
@@ -1988,9 +2369,17 @@ void touch_ui_show_voice_chat(void)
                         LV_EVENT_CLICKED, NULL);
 
     voice_submit_lbl = lv_label_create(voice_submit_btn);
-    lv_label_set_text(voice_submit_lbl, "提交");
+    lv_label_set_text(voice_submit_lbl, mirror ? "关闭" : "提交");
     lv_obj_set_style_text_font(voice_submit_lbl, &lv_font_ui_24, 0);
     lv_obj_center(voice_submit_lbl);
+
+    /* 镜像面板到这里就搭完了：不 voice_begin_round()（没有录音，也没有计时），
+     * 更不回调 g_voice_chat_cb —— 它会去 audio_record_start()，
+     * 而麦克风现在归框架侧的 ai_companion（半双工，抢麦会 -EBUSY）。 */
+    if (mirror) {
+        printf("[VoiceChat] 镜像面板已打开（纯显示，不开麦）\n");
+        return;
+    }
 
     voice_begin_round();
 
@@ -1999,9 +2388,33 @@ void touch_ui_show_voice_chat(void)
     if (g_voice_chat_cb != NULL) {
         g_voice_chat_cb(g_voice_chat_user_data);   /* main.c: audio_record_start() */
     } else {
-        voice_post_text("录音功能未就绪", false);
+        voice_post_text("录音功能未就绪", VOICE_TEXT_STATUS);
         voice_stop_timer();
         voice_set_btn_state(VOICE_BTN_RETRY);
+    }
+}
+
+/* 打开 PTT 弹窗（会开麦录音），并回调 g_voice_chat_cb 让 main.c 开始录音 */
+void touch_ui_show_voice_chat(void)
+{
+    voice_panel_build(false);
+}
+
+/* 打开镜像面板：纯显示，不开麦、不放提示音、不回调 main.c。
+ * 走 lv_async_call 投到 LVGL 线程，所以任何线程都能调（MQTT 线程想给老人
+ * 弹出来也可以）。
+ * 每打开一次，对话历史都是空的（上一轮的 label 随面板一起删了）；想留住
+ * 上一轮的内容就别关窗，直接接着说话。 */
+static void voice_show_mirror_async(void *arg)
+{
+    (void)arg;
+    voice_panel_build(true);
+}
+
+void touch_ui_show_voice_mirror(void)
+{
+    if (ui_async_call(voice_show_mirror_async, NULL) != LV_RESULT_OK) {
+        printf("[VoiceChat] 镜像面板打开投递失败\n");
     }
 }
 
@@ -2019,11 +2432,14 @@ void touch_ui_hide_voice_chat(void)
 
     voice_timer_lbl = NULL;
     voice_status_lbl = NULL;
-    voice_reply_box = NULL;
+    voice_chat_box = NULL;
     voice_reply_lbl = NULL;
+    voice_hist_hint = NULL;
+    voice_hist_forget();       /* 历史里的 label 是面板的子对象，已经跟着没了 */
     voice_submit_btn = NULL;
     voice_submit_lbl = NULL;
     voice_btn_state = VOICE_BTN_SUBMIT;
+    voice_mirror_only = false;
 }
 
 bool touch_ui_voice_chat_active(void)
@@ -2048,19 +2464,42 @@ void touch_ui_set_voice_cancel_cb(voice_cancel_cb_t cb, void *user_data)
     g_voice_cancel_user_data = user_data;
 }
 
+void touch_ui_set_voice_state(touch_voice_state_t state)
+{
+    int s = (int)state;   /* 转成有符号再判，免得枚举是无符号时比较被优化掉 */
+
+    if (s < 0 || s > (int)TOUCH_VOICE_STATE_SPEAKING) {
+        return;
+    }
+
+    if (ui_async_call(voice_state_async, (void *)(uintptr_t)state) != LV_RESULT_OK) {
+        printf("[VoiceChat] 语音状态投递失败，丢弃一次\n");
+    }
+}
+
 void touch_ui_set_voice_status(const char *text)
 {
-    voice_post_text(text, false);
+    voice_post_text(text, VOICE_TEXT_STATUS);
+}
+
+/* 用户刚才说的话（ASR 原文）：开一轮新的"你说：…"。
+ * 随后的 touch_ui_set_voice_reply() 会把"智爱：…"收尾到同一个槽位里，
+ * 一轮一轮往下堆成历史（只保留最近 VOICE_HISTORY_ROUNDS 轮）。
+ * 面板没开着时空操作；任何线程可调（内部 lv_async_call 投到 LVGL 线程）。
+ * 入参约定：已经过 main.c 的 sanitize_for_display() 清洗的显示文本。 */
+void touch_ui_set_voice_user_text(const char *text)
+{
+    voice_post_text(text, VOICE_TEXT_USER);
 }
 
 void touch_ui_set_voice_reply(const char *text)
 {
-    voice_post_text(text, true);
+    voice_post_text(text, VOICE_TEXT_REPLY);
 }
 
 void touch_ui_voice_chat_round_done(void)
 {
-    lv_async_call(voice_round_done_async, (void *)(uintptr_t)voice_generation);
+    ui_async_call(voice_round_done_async, (void *)(uintptr_t)voice_generation);
 }
 
 void touch_ui_voice_chat_stop_timer(void)
@@ -2215,7 +2654,7 @@ static void update_checkin_state_async(void *state_ptr)
 
 void touch_ui_update_checkin_state(touch_checkin_state_t state)
 {
-    lv_async_call(update_checkin_state_async, (void *)(intptr_t)state);
+    ui_async_call(update_checkin_state_async, (void *)(intptr_t)state);
 }
 
 /* 隐藏关怀确认面板 */

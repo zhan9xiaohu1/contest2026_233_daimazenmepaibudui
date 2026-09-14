@@ -58,6 +58,13 @@ void robot_ui_set_net_status(const char *text);
 /* 显示提醒 */
 void robot_ui_show_reminder(const char *title, const char *content);
 
+/* 报错提示页（顶层覆盖，一个大按钮点掉）。
+ * ⚠️ 只能在 LVGL 线程里调：别的线程（语音工作线程 / MQTT 线程 / 播放线程）
+ * 用 main.c 的 ui_post_error()，内部 lv_async_call 投过来 —— 直接跨线程碰
+ * LVGL 会踩 "_lv_inv_area: Invalidate area is not allowed during rendering"
+ * 断言，把整个 app 打死（2026-09-14 实测）。 */
+void robot_ui_show_error(const char *title, const char *content);
+
 /* 显示报警 */
 void robot_ui_show_alarm(const char *content);
 

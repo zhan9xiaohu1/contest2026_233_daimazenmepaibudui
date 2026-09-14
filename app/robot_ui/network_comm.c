@@ -22,6 +22,13 @@
 #include <arpa/inet.h>
 #include <netdb.h> /* gethostbyname / struct hostent（DNS 解析） */
 #include <unistd.h>
+#include <syslog.h> /* syslog()：把"这一轮实际连上的 broker"打进系统日志（串口） */
+
+/* 配置读取（claw_config_get()）。和 ai_agent / time_sync.c / ambient_listen.c 用的是
+ * 同一份键值存储：开机时板级代码把 /etc/assets/agent_config.json 拷到
+ * /data/ai_agent/config/config.json。本文件只用它读 mqtt_broker 这一个键，
+ * 见 mqtt_load_broker_config()。 */
+#include "infra/config_store.h"
 
 /* 板级外设状态（board/contest_board/src/sf32lb52_status.h）：
  * 这里只负责把 MQTT 连接状态喂进去，供 hw_test status / UI 统一查询。 */
@@ -72,11 +79,75 @@ static const char *g_mqtt_broker_list[] = {
 };
 #define MQTT_NBROKERS ((int)(sizeof(g_mqtt_broker_list) / sizeof(g_mqtt_broker_list[0])))
 
+/* 配置键 mqtt_broker：值形如 "host" 或 "host:port"。
+ *
+ * 键名和 ai_agent 自带 MQTT 通道用的是同一个
+ * （packages/ai_agent/include/agent_config.h 的 AGENT_CFG_KEY_MQTT_BROKER
+ * 就是字面量 "mqtt_broker"，mqtt_channel.c 也按 host:port 解析），
+ * 所以现场只要在 agent_config.json 里加一行 mqtt_broker 就能钉住 broker。
+ *
+ * 空 / 没有这个键 -> g_mqtt_broker_pinned 保持 false，broker 仍是
+ * "broker.emqx.io + 失败 5 次降级到下一台"的老行为（报警推送那条链路
+ * 就是靠这个行为跑通的，别动）。
+ */
+#define MQTT_CFG_KEY_BROKER "mqtt_broker"
+
+static bool g_mqtt_broker_pinned = false;
+
+/* 把配置里的 mqtt_broker 应用到 mqtt_config。没配就什么都不做。
+ *
+ * 为什么配上之后要"钉住"（不降级）：演示现场队友的智能灯挂在
+ * test.mosquitto.org 上，如果板子在失败几次后自己漂到 emqx/hivemq，
+ * 表面上"MQTT 已连接"、实际上永远收不到灯的状态，最难查。
+ * 所以配置一旦给了 broker，就只用这一台，失败也只重试它。
+ * 内置三台的默认行为完全不变（没配 = 走老路）。 */
+static void mqtt_load_broker_config(void)
+{
+    char cfg[sizeof(mqtt_config.broker)];
+    const char *colon;
+    size_t host_len;
+    long port;
+
+    cfg[0] = '\0';
+    if (claw_config_get(MQTT_CFG_KEY_BROKER, cfg, sizeof(cfg)) != OK ||
+        cfg[0] == '\0') {
+        printf("MQTT broker: 配置里没有 %s，用内置默认 %s\n",
+               MQTT_CFG_KEY_BROKER, mqtt_config.broker);
+        return;
+    }
+
+    /* 解析 host[:port]：最后一个 ':' 才是端口分隔（IP 里也有 ':' 就交给
+     * 后面 gethostbyname 当主机名处理，这里不做 IPv6 字面量支持）。 */
+    colon = strrchr(cfg, ':');
+    if (colon != NULL && colon != cfg) {
+        host_len = (size_t)(colon - cfg);
+        port = atol(colon + 1);
+    } else {
+        host_len = strlen(cfg);
+        port = 0;
+    }
+
+    if (host_len >= sizeof(mqtt_config.broker)) {
+        host_len = sizeof(mqtt_config.broker) - 1;
+    }
+    memcpy(mqtt_config.broker, cfg, host_len);
+    mqtt_config.broker[host_len] = '\0';
+
+    if (port > 0 && port <= 65535) {
+        mqtt_config.port = (uint16_t)port;
+    }
+
+    g_mqtt_broker_pinned = true;
+    printf("MQTT broker: 配置 %s=%s -> %s:%u（固定使用，不再降级）\n",
+           MQTT_CFG_KEY_BROKER, cfg, mqtt_config.broker, (unsigned)mqtt_config.port);
+}
+
 /* ==================== 内部函数声明 ==================== */
 static int create_tcp_socket(const char *host, uint16_t port);
 static int mqtt_send_connect(void);
 static int mqtt_send_subscribe(const char *topic, int qos);
 static int mqtt_send_publish(const char *topic, const char *payload, int qos, bool retain);
+static int mqtt_send_puback(uint16_t packet_id);
 static int mqtt_send_pingreq(void);
 static int mqtt_send_disconnect(void);
 static int mqtt_parse_packet(void);
@@ -111,6 +182,9 @@ int network_comm_init(void)
     strncpy(mqtt_config.broker, "broker.emqx.io", sizeof(mqtt_config.broker) - 1);
     mqtt_config.port = 1883;
     strncpy(mqtt_config.client_id, "zhi_ai_001", sizeof(mqtt_config.client_id) - 1);
+
+    /* 配置里给了 mqtt_broker 就覆盖上面这两项（没配则行为不变） */
+    mqtt_load_broker_config();
 
     printf("network_comm init done\n");
     return 0;
@@ -303,10 +377,36 @@ int mqtt_connect(const char *broker, uint16_t port,
     board_status_set_mqtt(true);   /* 喂给统一状态查询 */
     printf("MQTT connected\n");
 
+    /* 串口上明确打出"这一轮实际连上的是哪台 broker"。
+     * 光有上面那句 "MQTT connected" 分不清落在哪台：network_task 里的降级逻辑
+     * 会在连续失败后自己换台（broker.emqx.io -> test.mosquitto.org -> hivemq），
+     * 现场"板子显示已连接、却收不到设备状态"十有八九就是两台不在同一台上。 */
+    syslog(LOG_INFO, "[MQTT] connected broker=%s:%u source=%s\n",
+           broker, (unsigned)port,
+           g_mqtt_broker_pinned ? "config:" MQTT_CFG_KEY_BROKER
+                                : "built-in default/degraded");
+
     /* 订阅命令主题 */
     char topic[128];
     snprintf(topic, sizeof(topic), "zhi_ai/%s/command", client_id);
     mqtt_subscribe(topic, 1);
+
+    /* 设备状态主题（智能灯那类子设备执行完命令后的回执）。
+     * 队友在 PC 上模拟的灯收到 device_cmd 后会往
+     * zhi_ai/<client_id>/device_state 发
+     * {"type":"device_state","device_id":...,"state":"on"/"off",
+     *  "success":true,"message":...,"timestamp":...}（QoS1 发布）。
+     *
+     * 这里**故意订 QoS0**：MQTT 的投递 QoS = min(发布 QoS, 订阅 QoS)，
+     * 队友发 QoS1、我们订 QoS0，broker 就以 QoS0 投给我们——没有 Packet
+     * Identifier，正好绕开 mqtt_parse_packet() 之前那段"把 QoS>0 的 2 字节
+     * 包 ID 当 payload 头"的解析 bug（bug 已一并修好，但订阅端保持 QoS0
+     * 更稳：设备状态是周期性/幂等的上报，丢一条无所谓，也不需要 PUBACK 往返）。
+     *
+     * 收上来的 payload 会走唯一回调 mqtt_msg_callback(topic, payload)
+     * （main.c 注册的 on_mqtt_message_received）。 */
+    snprintf(topic, sizeof(topic), "zhi_ai/%s/device_state", client_id);
+    mqtt_subscribe(topic, 0);
 
     return 0;
 }
@@ -1640,6 +1740,31 @@ static int mqtt_send_disconnect(void)
     return send(mqtt_socket, packet, 2, 0);
 }
 
+/* 发送 MQTT PUBACK（确认一条 QoS1 的入站 PUBLISH）
+ *
+ * 不回的后果：broker 认为客户端没收到，会按它自己的策略重投（有的公共
+ * broker 几秒一次），同一条控制命令会被执行多遍——灯被闪来闪去、或者
+ * 状态消息刷屏。报文格式很固定：固定头 0x40 + 剩余长度 0x02 + 2 字节包 ID。
+ *
+ * 安全性：只被 mqtt_parse_packet() 调用，而它只跑在 network_task 里，
+ * 也就是 mqtt_socket 的属主任务。所以这里的 send() 不会和其他任务抢同一个
+ * fd（跨任务 close/send 会把整机打复位，见 mqtt_publish() 里那段注释），
+ * 不需要额外的锁或状态机。
+ *
+ * QoS2 不在这里处理：协议上要回的是 PUBREC + 等 PUBREL 再 PUBCOMP，
+ * 拿 PUBACK 回给 QoS2 反而是协议错误。目前没有任何对端用 QoS2 发消息给板子。 */
+static int mqtt_send_puback(uint16_t packet_id)
+{
+    uint8_t packet[4];
+
+    packet[0] = 0x40;                          /* PUBACK */
+    packet[1] = 0x02;                          /* 剩余长度固定 2 */
+    packet[2] = (packet_id >> 8) & 0xFF;
+    packet[3] = packet_id & 0xFF;
+
+    return send(mqtt_socket, packet, sizeof(packet), 0);
+}
+
 /* 解析 MQTT 数据包 */
 static int mqtt_parse_packet(void)
 {
@@ -1660,6 +1785,8 @@ static int mqtt_parse_packet(void)
             /* 解析主题和载荷 */
             {
                 int pos = 1;
+                int hdr_end;
+                int avail;
 
                 /* 跳过剩余长度编码 */
                 int remaining = 0;
@@ -1669,6 +1796,12 @@ static int mqtt_parse_packet(void)
                     multiplier *= 128;
                     pos++;
                 } while (buffer[pos - 1] & 0x80);
+
+                /* 剩余长度字段结束的位置：下面算载荷长度要用它做基准 */
+                hdr_end = pos;
+
+                /* QoS 在固定头的低 4 位里：bit0=retain，bit2:1=QoS */
+                int qos = (buffer[0] >> 1) & 0x03;
 
                 /* 解析主题 */
                 int topic_len = (buffer[pos] << 8) | buffer[pos + 1];
@@ -1680,16 +1813,48 @@ static int mqtt_parse_packet(void)
                 topic[copy_len] = '\0';
                 pos += topic_len;
 
+                /* MQTT 3.1.1 的 PUBLISH 可变头里，主题名之后**只有 QoS>0** 才跟
+                 * 2 字节 Packet Identifier。
+                 *
+                 * 原来这里漏了这一步，把主题之后的全部字节都当载荷，于是入站
+                 * QoS1 的报文（payload 头上多出 2 字节包 ID，高字节通常是 0x00）
+                 * 一律解析失败——队友的智能灯/设备状态都是 QoS1 发布，命令和
+                 * 状态全丢，串口上只能看到 JSON parse failed。
+                 * 现在按 QoS 位跳过这 2 字节，载荷长度也随之减掉。
+                 */
+                if (qos > 0 && pos + 2 <= len) {
+                    uint16_t packet_id = (uint16_t)((buffer[pos] << 8) | buffer[pos + 1]);
+
+                    pos += 2;
+
+                    /* QoS1 必须回 PUBACK，否则 broker 会重投、命令被重复执行。
+                     * QoS2 该回的是 PUBREC，这里不动（目前没有对端用 QoS2）。 */
+                    if (qos == 1) {
+                        mqtt_send_puback(packet_id);
+                    }
+                }
+
                 /* 解析载荷 */
                 char payload[1024];
                 int payload_len = len - pos;
+                if (payload_len < 0) {
+                    payload_len = 0;
+                }
+                /* 一次 recv 里可能挤着不止一包（broker 合并发送、SUBACK 紧跟
+                 * PUBLISH），用报文自带的剩余长度截断，别把下一包的字节也算进
+                 * 这条的载荷。 */
+                avail = remaining - (pos - hdr_end);
+                if (avail >= 0 && payload_len > avail) {
+                    payload_len = avail;
+                }
                 if (payload_len > (int)(sizeof(payload) - 1)) {
                     payload_len = (int)(sizeof(payload) - 1);
                 }
                 memcpy(payload, &buffer[pos], payload_len);
                 payload[payload_len] = '\0';
 
-                printf("Received: topic=%s, payload=%s\n", topic, payload);
+                printf("Received: topic=%s qos=%d, payload=%s\n",
+                       topic, qos, payload);
 
                 /* 调用回调 */
                 if (mqtt_callback) {
@@ -1787,7 +1952,10 @@ void network_task(void *arg)
                                  mqtt_config.password) < 0) {
                     mqtt_fails++;
 
-                    if (mqtt_fails >= 5 && MQTT_NBROKERS > 1) {
+                    /* 配置里钉了 broker（mqtt_broker）就不再降级：现场要的是
+                     * "只连队友那台"，自己漂到别的 broker 反而更难查
+                     * （板子显示已连接、收不到东西）。没配时行为完全不变。 */
+                    if (mqtt_fails >= 5 && MQTT_NBROKERS > 1 && !g_mqtt_broker_pinned) {
                         /* 这台连不上（公共实例限流很常见），换下一台 */
                         broker_idx = (broker_idx + 1) % MQTT_NBROKERS;
                         broker_switches++;

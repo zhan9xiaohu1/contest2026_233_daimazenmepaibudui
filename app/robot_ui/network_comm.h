@@ -47,6 +47,18 @@ typedef enum {
 } msg_type_t;
 
 /* ==================== 回调函数类型 ==================== */
+
+/**
+ * MQTT 收包回调（全局只有一个槽，network_set_mqtt_callback() 注册）。
+ *
+ * 所有订阅到的主题都从这里出来，回调拿到的是"主题 + 原始 JSON 串"，
+ * 由上层按 topic 里的话题名分发。mqtt_connect() 每轮连上后会自动订阅：
+ *   - zhi_ai/<client_id>/command       QoS1，控制命令
+ *   - zhi_ai/<client_id>/device_state  QoS0，子设备（智能灯）执行结果，
+ *     形如 {"type":"device_state","device_id":...,"state":"on"/"off",
+ *           "success":true,"message":...,"timestamp":...}
+ * 订阅可用 mqtt_subscribe() 追加，topic 直接给完整话题名。
+ */
 typedef void (*mqtt_msg_callback_t)(const char *topic, const char *payload);
 typedef void (*wifi_status_callback_t)(bool connected);
 typedef void (*alarm_callback_t)(const char *alarm_type, const char *details);

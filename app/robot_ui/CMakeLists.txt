@@ -41,9 +41,21 @@ if(CONFIG_LVX_USE_CONTEST2026_233_ZHI_AI)
   # SRCS 里的 reminder_sched.c：提醒的软调度（硬件只有一个 RTC 日循环 alarm 槽，
   # 多个提醒要在软件层排队）。提醒列表的数据也放在那里，touch_ui.c 只通过
   # reminder_sched_* 增删查；到点回调在工作线程里，main.c 用 lv_async_call 弹窗。
+  # 环境听音（工作流 C）：常态听音 + 突发大音量检测 -> ASR -> 大模型判断。
+  # 实现在 ambient_listen.c，默认**关**（配置键 enable_ambient_listen），
+  # 打开后才起线程占麦克风、才分配那约 250 KiB 堆缓冲。
   nuttx_add_application(
     NAME robot_ui
     SRCS main.c robot_ui.c touch_ui.c reminder_sched.c network_comm.c time_sync.c
+         ambient_listen.c
+         # 跨线程"投到 LVGL 线程"的唯一投递口：内部把 lv_async_call 用一把
+         # 互斥锁包住（LVGL 9.1 的 timer 链表插入本身没有锁，多线程同时插会
+         # 插坏链表 -> LVGL 线程跳到垃圾地址 -> 整机硬故障）。原因和残余风险
+         # 写在 ui_async.h 里，调用点见 main.c / touch_ui.c。
+         ui_async.c
+         # 语音链路推界面的跨 app 直调入口（ai_companion 直接函数调用，不再只靠
+         # MQTT 绕公网）。头文件是自给自足的，hello_app 那边只 include 它。
+         robot_ui_bridge.c
          lv_font_ui_16.c lv_font_ui_20.c lv_font_ui_24.c
     STACKSIZE 32768
     PRIORITY 100

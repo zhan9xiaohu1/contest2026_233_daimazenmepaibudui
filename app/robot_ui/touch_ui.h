@@ -109,13 +109,58 @@ uint32_t touch_ui_voice_chat_generation(void);
 void touch_ui_set_voice_submit_cb(voice_submit_cb_t cb, void *user_data);
 void touch_ui_set_voice_cancel_cb(voice_cancel_cb_t cb, void *user_data);
 
+/* ==================== 语音镜像面板（纯显示，不开麦克风） ==================== */
+/*
+ * 语音入口已经迁到框架侧（hello_app 的 ai_companion：常开麦克风跑 VAD -> ASR ->
+ * 大模型 -> TTS），robot_ui 这边**不再开麦**，只负责把"它在不在听、什么时候回答"
+ * 显示出来 —— 用户原话：「没有提交按钮？我怎么知道他在听他什么时候回复」。
+ *
+ * 这个面板和 touch_ui_show_voice_chat() 长得一模一样，区别是：
+ *   1) 没有录音计时（那一行根本不创建）；
+ *   2) 底部大按钮是「关闭」（点了只关窗），**不会**回调 voice_chat_start_cb_t
+ *      —— 那条路是去 audio_record_start() 的，半双工设备上和 ai_companion 抢麦；
+ *   3) 状态行默认「直接说话就行，我在听」；
+ *   4) 对话区是**双方对话历史**：用户的发言（"你说：…"，小一号浅蓝）和智爱的
+ *      回复（"智爱：…"，白色）一行行往下排，只保留最近几轮，能往上划回看
+ *      —— 用户原话：「又看不到回复又看不到自己说了什么」。
+ *
+ * 状态行 / 对话区用 touch_ui_set_voice_state() / touch_ui_set_voice_user_text() /
+ * touch_ui_set_voice_reply() 更新，都走 lv_async_call，任何线程可调。
+ * 任何线程也能调这个打开函数（内部投递）。
+ */
+void touch_ui_show_voice_mirror(void);
+
+/* 镜像面板状态行的四种状态：听=蓝、想=橙、说=绿、空闲=灰（颜色比字更早看出在干什么） */
+typedef enum {
+    TOUCH_VOICE_STATE_IDLE = 0,     /* 「直接说话就行，我在听」灰 */
+    TOUCH_VOICE_STATE_LISTENING,    /* 「我在听…」蓝 */
+    TOUCH_VOICE_STATE_THINKING,     /* 「正在想…」橙 */
+    TOUCH_VOICE_STATE_SPEAKING      /* 「正在说话…」绿 */
+} touch_voice_state_t;
+
+/* 改状态行的文字 + 颜色（其它行不动）。面板没开着时什么都不做，任何线程可调。
+ * 与 touch_ui_set_voice_status() 的关系：那个是"写任意一句话、颜色不变"，
+ * 这个是按状态写固定的话 + 换颜色；两个都能用，后写的盖前写的。 */
+void touch_ui_set_voice_state(touch_voice_state_t state);
+
 /* 下面这些是给工作线程用的（内部走 lv_async_call 投到 LVGL 线程，
  * 所以任何线程都能调，但不要在 LVGL 线程里忙等） */
 
 /* 弹窗里的状态行（"正在识别…" / "识别失败" / "AI 无回复" ...） */
 void touch_ui_set_voice_status(const char *text);
 
-/* 对话区的文字（识别结果与 AI 回复，可换行、可滚动） */
+/* 显示用户刚才说的话（ASR 原文）。面板没开时空操作。
+ * 语义：它开一条新的"你说：…"（一轮对话的开始），随后的
+ * touch_ui_set_voice_reply() 收尾成这一轮的"智爱：…"，一轮一轮往下堆成历史 ——
+ * 镜像面板只保留最近几轮（写满就丢最老的），所以行数有上限、不会撑破面板。
+ * 入参约定：必须是**清洗过的显示文本**（先过 robot_ui/main.c 的
+ * sanitize_for_display()）。那个函数是 main.c 里的 static，touch_ui.c 够不到，
+ * 字形过滤这一层只能在调用方做；touch_ui.c 只负责长度封顶和控制字符。 */
+void touch_ui_set_voice_user_text(const char *text);
+
+/* 对话区里"智爱：…"那一行：收尾上面那一轮；没有在等收尾的轮就自己开一轮。
+ * 可换行、可滚动。面板没开着时空操作（内部 lv_async_call 投到 LVGL 线程）。
+ * 入参同 touch_ui_set_voice_user_text()：要是清洗过的显示文本。 */
 void touch_ui_set_voice_reply(const char *text);
 
 /* 一轮对话结束（成功或失败）：按钮变回可点的「再说一次」，
