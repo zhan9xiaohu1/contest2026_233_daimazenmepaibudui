@@ -499,6 +499,61 @@ git apply <本仓库>/patches/apps-ai-agent-vela-tls-chunked-end.patch
 
 ---
 
+# vela_tls 关闭旧连接时发 close_notify → TLS 的 send 没有超时 → 永久卡死（2026-09-14 新增补丁）
+
+## 现象
+
+语音聊天里点「提交」之后，界面**永远停在「处理中」**（不是崩溃：弹窗还能点、主菜单还能用，
+只是这一轮永远不结束）。串口日志停在：
+
+```
+[VoiceChat] 开始识别 (124160 字节)
+[mimo_voice] ASR: PCM 124160 字节 -> WAV -> base64 165608 字节
+[mimo_voice] alloc  asr.resp       16384 字节
+        ← 之后连 "[vela_tls] Handshake start" 都没有，一直不出来
+```
+
+## 根因（栈抓出来的）
+
+```
+voice_worker → mimo_asr_recognize → vela_tls_pool_cleanup
+  → tls_ctx_free → mbedtls_ssl_close_notify → mbedtls_ssl_flush_output
+  → mbedtls_net_send → write → psock_tcp_send → net_sem_timedwait2   ← 卡在这
+```
+
+两个叠加的原因：
+
+1. `tls_ctx_free()`（`src/infra/vela_tls.c`）**会发 close_notify** —— 那是一次**阻塞的 TCP 发送**。
+2. 本文件的 socket **只在 `CONFIG_AI_AGENT_NET_RPMSG` 下才设 `SO_SNDTIMEO`**（我们这版没开），
+   所以这次 send **没有超时**：对端已经失联时，它就死等 TCP 重传（分钟级）。
+
+`mimo_post()` 每次请求前会调 `vela_tls_pool_cleanup()`（为了强制新建连接、避开"复用死连接"），
+于是**每次识别/对话都要先陪这一次卡死**。而且 `tls_ctx_free()` 是在 `s_pool_lock` 里调的，
+别的线程跟着一起堵。
+
+## 修改
+
+| 位置 | 改动 |
+|------|------|
+| `tls_ctx_free()` | **不再发 `mbedtls_ssl_close_notify()`**：这些连接都是要丢掉的旧连接，本地拆掉就行，服务端收到 FIN/RST 自己回收 |
+| `tls_ctx_connect()` 里设 socket 超时那段 | **无条件设 `SO_SNDTIMEO = 30s`**（原来只在 RPMSG 下设）——请求体最大 1.5 MB，USB RNDIS 上一两秒就传完，30s 足够，超时就报错走失败分支而不是卡死 |
+
+## 应用方式
+
+```bash
+cd <openvela 工作区>/packages/ai_agent
+git apply <本仓库>/patches/apps-ai-agent-vela-tls-chunked-end.patch
+git apply <本仓库>/patches/apps-ai-agent-vela-tls-no-block-close.patch
+```
+
+## 验证
+
+- `git apply --check --reverse` 通过（补丁与已改好的工作区逐字对应）。
+- 上板：`ASR: PCM ... base64 ...` 之后应在几百毫秒内出现 `[vela_tls] Handshake start`
+  → `Handshake OK` → `ASR: 识别结果`，不再停在"处理中"。
+
+---
+
 # 2026-09-14 上板实测暴露的三个问题（本轮改动总览）
 
 | 文件 | 改了什么 |
@@ -510,6 +565,7 @@ git apply <本仓库>/patches/apps-ai-agent-vela-tls-chunked-end.patch
 | `app/robot_ui/CMakeLists.txt`、`robot_ui.c`、`touch_ui.c` | 更新「971 个字符」那段过期注释 |
 | `patches/nuttx-usbdev-rndis-nomem.patch` | RNDIS `-ENOMEM` 不再断言 |
 | `patches/apps-ai-agent-vela-tls-chunked-end.patch` | chunked 响应提前收尾 |
+| `patches/apps-ai-agent-vela-tls-no-block-close.patch` | 关旧连接不再发 close_notify、TLS send 加 30s 超时（修「永远停在处理中」） |
 
 ## 中文字库覆盖常用汉字全集
 
@@ -647,3 +703,111 @@ gcc -std=c99 -Wall -Wextra -o /tmp/san_test /tmp/san_test.c && /tmp/san_test
 `voice_tts`/`voice_asr` 的分发层后面，不能假设调用方一定串行。改为**就地复用**
 （解码原地、重采样直接写调用方缓冲）+ 缩小块大小，同样把分配次数和峰值都降下来了。
 如果上板后仍然观察到 PSRAM 碎片问题，再考虑加带锁的 scratch 池。
+
+---
+
+# vela_tls 连接池的槽位被跨 task group 复用 → 误关别人的 fd → TLS 读到别人的数据流（2026-09-14 新增补丁）
+
+## 现象
+
+20:10 那次**提醒人声没出声**（到点该播的播报丢了）。日志里这一轮的最后一条
+TLS 记录是握手失败：
+
+```
+[vela_tls] Handshake start: Host=..., UNIX=...
+[vela_tls] ssl_handshake ret=-0x7200: <错误串>
+```
+
+而且是**发出去约 40 秒之后**才失败（不是立刻），界面这一侧的播报已经过去了。
+
+## 根因
+
+`src/infra/vela_tls.c` 里的连接池 `static conn_slot_t s_pool[CONN_POOL_SIZE]`
+（池大小 2，`CONFIG_AI_AGENT_TLS_CONN_POOL_SIZE=2`）是**全机共享**的静态对象，
+槽位里存的是一个**裸 fd 号**（藏在 `ctx.net.fd`）。而：
+
+- NuttX 的 **fd 号只在 task group 内有意义**：每个 group 的 fd 表各自从 3 开始编号；
+- 整机是**单一大镜像**：`ai_agent`、`hello_app`、`robot_ui` 是三个**独立 task group**
+  （defconfig 里 `CONFIG_EXAMPLES_AI_AGENT_VELA=y` / `CONFIG_LVX_USE_CONTEST2026_233_HELLO_APP=y` /
+  `CONFIG_LVX_USE_CONTEST2026_233_ZHI_AI=y` 各是一个 app），但它们共享同一份 static 变量、
+  同一份函数代码 —— 于是 A 组的代码能拿到 B 组放进去的槽位。
+
+`vela_tls_pool_cleanup()` 被 `app/hello_app/mimo_voice.c:784`（`mimo_post()`，
+**每次 ASR / TTS / chat 请求前**都调）、`mimo_voice.c:2473`（天气 GET 前）、
+`mimo_location.c:522` 调用 —— 它跑在**调用者自己的组**里，里面 `tls_ctx_free()`
+→ `close(fd)`，也就是拿 B 组的 fd 号在 A 组里关。两种坏结果：
+
+1. 该号在 A 组不存在 → `close()` 静默 `EBADF`，对端的 keep-alive 永远不回收；
+2. 该号在 A 组**恰好被另一个活着的文件占着**（MQTT socket、push socket、音频设备、
+   lcd…全都从 3 开始编）→ **误关别人的 fd**；随后 A 组下一次 `socket()` 极可能拿回
+   同一个号，别的持有者（`network_task` 每 100ms 的 `recv`、每 30s 的心跳 `send`）
+   继续用这个号收发，就和这条 TLS 连接**共享同一个 socket** → mbedtls 读到的是别人
+   的协议字节流 → `ssl_handshake ret=-0x7200`（`INVALID_RECORD`）。那条连接上
+   服务端 keep-alive 的数据被对端任务读走/自己的读被别人的流污染，所以表现为
+   "发出去之后卡一会儿才失败"，正是提醒播报那一轮。
+
+同类教训工程里已经记过一次：`app/robot_ui/network_comm.c:477-482` 写着
+"跨任务 close() 会和 network_task 里的 recv() 抢同一个 fd（关掉后 fd 号立刻被复用），
+**实测会把整机打复位**"。
+
+## 修改
+
+| 位置 | 改动 |
+|------|------|
+| `conn_slot_t` `:164` | 新增 `pid_t owner` —— 槽位归属的 task group |
+| `pool_owner()`（新增 `:178`） | 用 `getpid()`。NuttX 下它就是 **group 的 pid**（`group_create()` 里 `tg_info->ta_pid = tg_pid`，`libs/libc/sched/task_getpid.c` 读它；`pthread_create()` 走 `group_bind()` 继承创建者的 group、不新建 group），所以同组各线程一样、跨组不一样，正好是"fd 属于哪个组"的判据 |
+| `pool_acquire()` `:184` | ① 只复用 `owner == 本组` 的槽位（别人的 fd 绝不借来用）；② `valid==false` 的槽位（ctx 早就 free 过、fd 已关）可以被本组**认领**，换个 owner 是安全的；③ **只 evict 本组自己的空闲槽位**，本组没有可用槽位就返回 NULL 走临时连接 —— **绝不 evict 别人的槽位**，那等于在别人的组里 close 别人的 fd |
+| `vela_tls_pool_cleanup()` `:274` | 只释放 `owner == 本组` 的槽位（`in_use` 的照旧跳过），别人的留给它们自己的主人 |
+| `vela_https_request()` 的 `pool_reconnect:` `:901` | 原来**无锁**地改 `slot->valid/ctx`，收进 `s_pool_lock`（理由写在注释里：槽位字段的改动路径必须一致，不然是"用没保护的状态指挥别人"） |
+| 新增 `s_req_lock` + `req_lock_try_acquire()` / `req_lock_release()` `:809` | 给**一次 HTTPS 请求**套一层串行，覆盖 `pool_acquire → connect → write → read → release`；**带超时的 trylock，拿不到就不串行继续跑** |
+
+### 为什么用「带超时的 trylock」而不是老实 `pthread_mutex_lock`
+
+- **嵌套会自死锁**：本构建 `CONFIG_PTHREAD_MUTEX_TYPES=y`、默认类型是
+  `PTHREAD_MUTEX_NORMAL`（非递归），NuttX 对"同线程再次 lock"是**故意死锁**的
+  （`pthread_mutex_timedlock.c` 注释：`is required to deadlock for the case of the
+  non-robust NORMAL mutex`）。今天这条路**没有嵌套**（顺调用链查过：内部只走
+  `pool_acquire` / `tls_ctx_connect` / `tls_write_request` / `tls_read_response` /
+  `pool_release` + `proxy_open_tunnel()` + `network_acquire_resource()`，这些都不回调
+  `vela_https_*`；上层 `llm_chat` / `llm_chat_tools` / 各 tool / `mimo_post` 都是
+  "这一次发完再发下一次"），但以后很可能变成"工具调用里再发一次 HTTPS"，那时同线程
+  重入就是永久卡死一块板子。用 trylock 就永远不会死等。
+- **等锁必须有上界**：这把锁覆盖的区间里有 120s 读超时 / 30s 写超时（LLM 流式响应
+  真会占满），而提醒人声、语音播报这种"说到就到"的路径不能被它拖住。所以只等
+  `REQ_LOCK_WAIT_MS`（500ms）就放弃、退化成并行发 —— 并行是安全的（池按 owner 隔离、
+  raw buffer 自带 trylock），只是少一层保险。
+
+### 为什么**不**把 `vela_tls_pool_cleanup()` 也塞进这把锁
+
+- **正确性不需要**：请求正在用的槽位 `in_use==true`（`pool_acquire` 里在
+  `s_pool_lock` 下置位、`pool_release` 清），cleanup 遇到 `in_use` 本来就跳过，
+  所以并发 cleanup 不可能 free 掉一个正在使用的槽位；两边改槽位字段又都在
+  `s_pool_lock` 下，不会撕裂。
+- **代价很实在**：`mimo_post()` 是"先 cleanup 再 request"。如果 cleanup 也抢这把锁，
+  语音链路上一次"立刻要出声"的请求就得先等一个正在跑的 LLM 请求（可能上百秒）放下
+  锁，白白把瞬间返回的调用变成长期阻塞。
+- **owner 隔离之后剩下的唯一交错**是"同组另一个线程刚要 acquire 的槽位被清了"，
+  最坏结果只是多一次握手（`pool_acquire` 看到 `valid==false` 会重连），无害。
+
+## 应用方式
+
+```bash
+cd <openvela 工作区>/packages/ai_agent
+git apply <本仓库>/patches/apps-ai-agent-vela-tls-chunked-end.patch
+git apply <本仓库>/patches/apps-ai-agent-vela-tls-no-block-close.patch
+git apply <本仓库>/patches/apps-ai-agent-vela-tls-pool-owner.patch
+```
+
+三个补丁都改 `src/infra/vela_tls.c` 的**不同位置**，按上面顺序应用。
+（本补丁的基线是"前两个补丁已应用"的工作区，单独应用 **不能**跳过前两个。）
+
+## 验证
+
+- `syntax_check.sh packages/ai_agent/src/infra/vela_tls.c` → `[OK] 0 error`
+  （该包在 `compile_commands.json` 里有真实编译命令，`-I` / `-D` / `-march` 与固件一致）。
+- `git apply --check --reverse` 通过（补丁与已改好的工作区逐字对应）。
+- 补丁链自检：`git show HEAD:src/infra/vela_tls.c` 依次打上 chunked-end、
+  no-block-close、pool-owner 三个补丁后，与当前工作区文件 `cmp` **逐字节相同**。
+- **没上板**：板子当时卡死、串口静默（主 agent 在全程录串口），本轮只做语法预检
+  和补丁一致性检查，没有烧录、没跑完整构建。上板要看的是：提醒到点时人声能出声，
+  且日志里不再出现 `-0x7200`。
