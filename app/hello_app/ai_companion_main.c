@@ -2114,6 +2114,8 @@ static uint32_t g_listen_last_try_ms;      /* 上次重开录音的时间（只�
  *   连"忙"都不认，强行重开。另外还有一条更快的路：录音线程自己报的
  *   ctx->record_died（异常中断）不等任何时间 —— 只要是"下一拍"就能重开
  *   （只留一道"两次重开至少隔 1.8 秒"的防抖，防止设备一起来就死时高频开关设备）。
+ *   还有第三条路，专治最隐蔽的那种形状：会话看着还在（四个开关标志全健康）、
+ *   数据流却真的断了 —— 判据是 ai_audio 那边两个**数据流**观测，见下面那段。
  */
 
 static void listen_supervise_tick(sm_context_t *ctx)
@@ -2145,10 +2147,96 @@ static void listen_supervise_tick(sm_context_t *ctx)
       return;
     }
 
-  /* 录音还活着（设备已 START 且线程没退出）：把重试状态复位 */
+  /* 会话看着还在（设备 START 着、录音线程也没退出），但**数据流真的断了** ——
+   * 这是第三条自愈路径，专治"永久聋"里最隐蔽的那种形状：
+   *
+   *   录音线程卡在 audio_in_read() 里（设备不再产生 DMA 完成中断）、或者卡在
+   *   数据回调里出不来，四个开关标志（recording / record_thread_valid /
+   *   record_stop / record_exited）**全是健康的** —— 原来这里一句
+   *   audio_record_is_active() 就判"活着、复位、返回"，连一次重试都不排，
+   *   用户那边就是"界面还亮着、喊它没反应，只能重启板子"。
+   *
+   * 判据用 ai_audio 那边两个**数据流**观测（定义与各自的坑见 ai_audio.h 的
+   * audio_record_wait_ms / audio_record_idle_ms），任一成立即命中：
+   *   ① read 已经等了 AUDIO_RECORD_STALL_MS(8 秒)：线程此刻**真的阻塞在 read
+   *      里**（没在等时这个观测是 -1，天然不成立）。下层单次 read 自己 5 秒必回
+   *      （超时返回 -ETIMEDOUT，录音线程跳过那一帧接着读，见 board 的 read 和
+   *      ai_audio.c 的容忍上限），所以 8 秒没回来 = "连那 5 秒超时都没回来"
+   *      那种卡死，这正是 8 秒这个数的来历；
+   *   ② 距最后一滴数据已经 LISTEN_SUPERVISE_FORCE_MS(45 秒)：兜住 ① 看不见的
+   *      形状（线程压根没回到 read）。阈值**直接复用**上面"忙也得有上限"那个
+   *      45 秒，不另立一个数：两个数回答的是同一个问题"录音断了多久才算死"，
+   *      口径不一致只会让人算不清最坏多久能自愈。
+   *
+   * 合法的空窗必须排除掉（排不掉就是误判，命中一次要白停白开一次，几十毫秒里
+   * 正在收的音频就没了）：
+   *   - 状态机 AI_TALKING：ASR + 大模型 + TTS 合成是在**录音线程的 VAD 回调里**
+   *     同步跑的（ai_state_machine.c 的 sm_ai_talking_enter → process_ai_dialogue），
+   *     那几十秒一次 read 都不会发生（①不成立，但②会一路涨）—— 正常说完一句话
+   *     就能让"距上次数据"涨到几十秒，不排除就是每次正常对话都重开一次麦。
+   *     ASR 在追问相位里也跑（process_ai_dialogue 的 ask_mode），所以追问相位
+   *     非 IDLE 一并排除；
+   *   - 扬声器在响：TTS 出声期间录音是被特意停掉的（半双工让路），设备怎么收尾
+   *     由播放线程决定（audio_prepare_output / audio_resume_record），这里插一脚
+   *     就是互相打断。
+   *   （让路 / 收尾 / "我要常听"没开着这三种情况在上面那条早退里就返回了，
+   *     不在这里重复写。）
+   * 这三个窗口都由**别人**维护的标志决定，也会卡住不回 —— 所以它们只排除本判据；
+   * 上面那条"录音不活跃够久就强行重开"（stale）的兜底照旧管它们。
+   *
+   * 命中后**真停一次**：audio_record_stop() 才会发设备级 AUDIOIOC_STOP、关掉本层
+   * fd、把 ctx 里的锁存清干净（它自己的收尾有上界：轮询线程退出的 300ms，界面优先，
+   * 见 audio_reap_record_thread）。停完**不 return** —— 下面那段"不活跃"的流程会按
+   * 既有退避重开（LISTEN_SUPERVISE_RETRY_MS = 1.8 秒），重开前该清的场
+   * （g_speech_capturing / g_speech_frames / kws_reset）也一并走到。
+   * 幂等：停完 audio_record_is_active() 就是 false，本判据不会再命中第二次；
+   * 万一重开失败，走的是既有的翻倍退避，不会每一拍来敲一次设备。
+   * 不阻塞主循环：动手之前先按下面真开麦那一段同样的方式 trylock 抢一次
+   * "设备动作权"（抢不到就放弃这一拍），整条路最重的一步就是那次有界的 stop
+   * （≤300ms），和原来"发现不活跃就重开"那条路一样重。 */
 
-  if (audio_record_is_active(&g_audio_ctx))
+  if (audio_record_is_active(&g_audio_ctx) &&
+      !audio_is_playing(&g_audio_ctx) &&
+      g_ask_phase == ASK_PHASE_IDLE &&
+      sm_get_state(ctx) != SM_STATE_AI_TALKING &&
+      (audio_record_wait_ms(&g_audio_ctx) >= AUDIO_RECORD_STALL_MS ||
+       audio_record_idle_ms(&g_audio_ctx) >= (int)LISTEN_SUPERVISE_FORCE_MS))
     {
+      /* 动设备之前先抢"设备动作权"（和下面真开麦那一段是同一条纪律：让路线程
+       * 也会 stop/start 常开录音，两边同时上手就是同一个录音线程被 join 两次 /
+       * 两条线程抢一个设备）。trylock 失败就放弃这一拍 —— 卡死的会话不会自己好，
+       * 下一拍判据照样成立，让一拍不心疼。 */
+
+      locked = false;
+
+      if (!g_yield_worker_dead)
+        {
+          if (pthread_mutex_trylock(&g_mic_device_lock) != 0)
+            {
+              return;
+            }
+
+          locked = true;
+        }
+
+      printf("[监听守护] 会话看着还在、数据流已断：read 已等 %d ms（阈值 %d）、"
+             "距最后一滴数据 %d ms（阈值 %u）—— 判定数据流断了，"
+             "真停一次再重开\n",
+             audio_record_wait_ms(&g_audio_ctx), AUDIO_RECORD_STALL_MS,
+             audio_record_idle_ms(&g_audio_ctx),
+             (unsigned)LISTEN_SUPERVISE_FORCE_MS);
+
+      audio_record_stop(&g_audio_ctx);
+
+      if (locked)
+        {
+          pthread_mutex_unlock(&g_mic_device_lock);
+        }
+    }
+  else if (audio_record_is_active(&g_audio_ctx))
+    {
+      /* 录音还活着（设备已 START 且线程没退出）：把重试状态复位 */
+
       g_listen_retry_armed = false;
       g_listen_fail_count = 0;
       g_listen_backoff_ms = LISTEN_SUPERVISE_RETRY_MS;

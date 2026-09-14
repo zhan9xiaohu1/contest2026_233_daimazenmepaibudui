@@ -20,6 +20,13 @@
 #include "ai_audio.h"
 #include "sf32lb52_audio_in.h"     /* 板级录音封装 audio_in_start/read/stop */
 
+/* 板级录音封装还有第三个入口：**放弃**当前会话 —— 只清理本层自己的状态并关掉
+ * 本层那个 fd，绝不发 AUDIOIOC_STOP。板级头里也会有这条声明，这里再声明一次
+ * 只是不让本文件绑在它的落地时间上（两处签名一致，不冲突）。
+ * 用法只有一处：录音线程收尾时，这一代已经**不是我们的**了，见那里。 */
+
+int audio_in_abandon(void);
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -187,7 +194,8 @@ static int audio_since_ms(uint32_t since)
  * audio_reap_record_thread() 放弃 join（有界 300ms，设备卡住时就会发生）之后
  * 才醒过来 —— 那时上层已经完全可能已经起了**新一代**会话。这种"上一代的线程"
  * 再去收尾就是踩别人：
- *   - audio_in_stop() 会把新一代刚 START 好的设备停掉（设备全局一份）；
+ *   - audio_in_stop() / audio_in_abandon() 动到的都是**全局那一份**录音会话
+ *     （前者发设备级 STOP、后者关掉那个 fd，设备/ fd 都只有一份）；
  *   - recording / record_exited / record_died 会被写成新一代的状态，
  *     于是"线程在跑、标志说没在录"，监听守护据此反复重开，永远好不了。
  * 判据就是"当前会话记着的那个线程还是不是我"；正常情况下它一定是 true
@@ -562,6 +570,7 @@ static void *audio_record_thread(void *arg)
   ssize_t nbytes;
   int read_errno = 0;          /* 这一次 audio_in_read() 之后 errno 的快照 */
   bool stale = false;          /* 醒过来才发现自己已经被新一代会话接管 */
+  bool lost = false;           /* 这一代是被别人带走的（不是本层让它停的） */
 
   AUDIO_DEBUG("录音线程启动");
 
@@ -754,6 +763,12 @@ static void *audio_record_thread(void *arg)
            *     这一代录音到此为止，而且不会有 VAD 回调来收尾 —— 上层要是不知道，
            *     状态机就会一直停在"正在听"直到自己超时，用户体感就是"卡死了"。
            *     所以置上 record_died，让上层下一拍（100ms）就能重开。
+           *     同一个判据还要**顺手定下这一代的收尾方式**（下面的 lost）：
+           *     没人让停的会话，设备多半已经握在别人手里了，线程收尾时绝不能
+           *     再发设备级 STOP（理由和做法见线程末尾那段）。
+           *     在这里定、不在收尾处再读一次 record_stop：中间那几微秒里上层
+           *     完全可能正好调 audio_record_stop()，那样"这一次是异常死亡"就会
+           *     被读成"本层在停"，收尾方式正好反了。
            *
            * 注意这里**不能**去补一次 vad_callback(false) 冒充"语音结束"：
            * VAD 报 false 的意思是"人说完了一句完整的话，去送 ASR"，
@@ -815,6 +830,7 @@ static void *audio_record_thread(void *arg)
           if (!ctx->record_stop)
             {
               ctx->record_died = true;
+              lost = true;             /* 收尾改走 abandon，不再发设备级 STOP */
               printf("[录音] 录音异常中断（read 返回 %ld，errno=%d，不是本层在停），"
                      "会话已死\n", (long)nbytes, read_errno);
             }
@@ -830,7 +846,8 @@ static void *audio_record_thread(void *arg)
   /* 收尾前再确认一次"我还是当前这一代"：上面那次判断之后（处理一帧 + 打印的
    * 工夫里）上层完全可能已经起了新一代会话，这时本线程已经是个"上一代的
    * 残影"。再往后每一句都是错的：
-   *   - audio_in_stop() 会把新一代刚 START 好的设备停掉（设备是全局一份）；
+   *   - audio_in_stop() / audio_in_abandon() 会把新一代刚 START 好的会话带走
+   *     （设备与那份 fd 都是全局一份）；
    *   - recording / record_exited 会被写到新一代头上，于是"线程在跑、标志说
    *     没在录、还报 record_exited"，监听守护据此反复重开，永远好不了。
    * 所以这时候什么都不碰，直接退出。 */
@@ -842,11 +859,40 @@ static void *audio_record_thread(void *arg)
       return NULL;
     }
 
-  /* 线程自己收尾时也要把设备还回去。audio_in_stop() 是幂等的：
-   * 正常 audio_record_stop() 路径下这里已经是空操作。
-   * 不能留一个 START 过的设备没人关，否则下次 audio_in_start() 给的是 -EBUSY。 */
+  /* 线程自己收尾时也要把设备还回去，但**怎么还**取决于这一代是谁结束的
+   * （就是上面那个 lost）。
+   *
+   * 本层让停的（lost 为假）照旧走 audio_in_stop()：它幂等，audio_record_stop()
+   * 那条路到这里通常已经是空操作（设备早停了），只有"那次 STOP 被驱动拒了"
+   * （现场见过 ENOTTY）时才真的有用 —— 那是把设备还回去的最后一次机会，
+   * 不能省。而"线程压根没进循环"（want 为 0，帧长配置异常）也落在这一支：
+   * 设备是 audio_record_start() 刚 START 好的，只有本层能动它。
+   *
+   * 异常死亡的（lost 为真）改走 audio_in_abandon()。这一代已经**不是我们的**了：
+   * 最典型的是设备被别的会话抢走（半双工，对方一个 STOP 就把录放两条通路一起
+   * 停掉，我们的 read() 于是以 0/EOF 醒来）。此刻握住设备的正是刚接管它的那个
+   * 会话 —— 现场多半是正在播报的 TTS —— 收尾时再发一次**设备级** AUDIOIOC_STOP
+   * 就会连它一起打死（串口里"[录音] 录音异常中断…会话已死"后面紧跟播报半路
+   * 哑掉，就是这条路径，而且在现场反复出现）。
+   *
+   * 改走 abandon 不会漏设备：它只关本层那个 fd，而关 fd 是否真去动硬件由 NuttX
+   * 上层决定 —— fs 上层在**这个设备上最后一个 fd 被关**时才调驱动的 hw_shutdown
+   * （见 nuttx/audio/audio.c 的 audio_close：upper->head 变空才调），而
+   * hw_shutdown 自己会停 RX/TX DMA、DISABLE AUDPRC、关功放、并把卡在 read 里的
+   * 会话作废（见 board 的 sf32lb52_audio_hw_shutdown）。于是两种情况都对：
+   *   - 有人接管着设备 → 它自己那份 fd 还在，我们这一 close 到不了驱动，
+   *     对方的录/放毫发无伤（这正是要的效果）；
+   *   - 没人接管（连续读超时到上限这种"会话自己没了"）→ 我们是最后一个 fd，
+   *     驱动照常收尾，设备被放回去，下次 audio_in_start() 不会拿到 -EBUSY。 */
 
-  audio_in_stop();
+  if (lost)
+    {
+      audio_in_abandon();
+    }
+  else
+    {
+      audio_in_stop();
+    }
 
   AUDIO_DEBUG("录音线程退出");
   ctx->recording = false;

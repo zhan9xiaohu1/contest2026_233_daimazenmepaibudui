@@ -4,7 +4,8 @@
  * SF32LB52 录音通路封装（麦克风输入）
  *
  * 把「打开 / 配置 / START / read / STOP / close」这一套标准 NuttX audio
- * 接口收进三个函数，给不熟悉驱动的上层（成员二的 ai_audio.c 等）直接用。
+ * 接口收进四个函数，给不熟悉驱动的上层（成员二的 ai_audio.c 等）直接用。
+ * 其中 stop() 与 abandon() 是两个**用途不同**的收尾入口，分工见各自的说明。
  *
  * 底层设备是 /dev/audio/audio0（注意带 audio/ 子目录），接口本身是
  * ioctl(AUDIOIOC_CONFIGURE, AUDIO_TYPE_INPUT) + ioctl(AUDIOIOC_START)
@@ -20,7 +21,8 @@
  *   - AUDIOIOC_STOP 会同时停掉播放和录音两条通路，不能全双工；
  *   - close() 在"最后一个 fd"时会走驱动的 shutdown 路径（关中断上下文），
  *     该路径已修（sf32lb52_audio.c 的最小化 hw_shutdown），但本模块
- *     绝不在里面做额外的事，只 ioctl(STOP) + close()。
+ *     绝不在里面做额外的事，只 ioctl(STOP) + close()
+ *     （abandon() 是唯一的例外：它故意不发 STOP，见它那一段）。
  *
  ****************************************************************************/
 
@@ -150,6 +152,11 @@ ssize_t audio_in_read(FAR void *buf, size_t len);
  *   停止并关闭录音通路（ioctl(AUDIOIOC_STOP) + close(fd)）。
  *   没在录音时是安全的空操作，返回 OK。
  *
+ *   ⚠️ 本函数**发的是设备级 STOP**（同时停录和放）。如果这次会话"
+ *   根本不是本层停的"、只是想把本层的句柄还回去（典型：audio_in_read() 返回
+ *   0/EOF 之后的收尾），请用 audio_in_abandon() —— 那时设备多半已经被别人的
+ *   会话接手，一个设备级 STOP 打过去就是把接手方打死。
+ *
  *   可以从**同一个 app 的另一个线程**调用来"救"一个正阻塞在
  *   audio_in_read() 里的任务（驱动已修：STOP 能唤醒阻塞中的 read，read 返回 0）。
  *   task_create() 出来的子任务（hw_test 的读任务就是）虽然属于另一个 task group，
@@ -172,14 +179,82 @@ ssize_t audio_in_read(FAR void *buf, size_t len);
  *   shutdown 路径；该路径曾在关中断上下文里卡死整机，现已修成最小化
  *   的 hw_shutdown()（见 docs/audio_driver_usage.md 第 8 节）。
  *
+ *   还有第三种"OK"：本次会话已经有别的线程拿到收尾权正在收（共用标志），本函数
+ *   确认那个线程还在之后**直接返回 OK，既没发 STOP 也没关 fd** —— 这是故意的
+ *   （两个线程各 close 一次会关掉这个槽位刚被别人复用的 fd）。返回值看不出这一
+ *   区别，所以这种情况会留一条限频 WARNING（每 3 秒最多一条，见 .c 里的
+ *   AUDIO_IN_STOP_SPIN_LOG_MS），排查时按"stop 空转"搜。
+ *
  *   **不要在中断上下文里调用**（close 路径可能取锁）。
  *
  * Returned Value:
- *   OK：正常停掉（或本来就没在录）；-EPERM：跨组调用且 fd 不是音频设备，
- *   本次没有动设备；-errno：AUDIOIOC_STOP 失败（设备可能仍在跑，日志里有明细）。
+ *   OK：正常停掉（或本来就没在录，或有别的线程正在收尾——后者见上面那段）；
+ *   -EPERM：跨组调用且 fd 不是音频设备，本次没有动设备；
+ *   -errno：AUDIOIOC_STOP 失败（设备可能仍在跑，日志里有明细）。
  *
  ****************************************************************************/
 
 int audio_in_stop(void);
+
+/****************************************************************************
+ * Name: audio_in_abandon
+ *
+ * Description:
+ *   放弃当前录音会话：只清理本层自己的状态并关闭 fd，**绝不发 AUDIOIOC_STOP**。
+ *   用在「会话不是被本层停的」收尾路径上（read 返回 0/EOF 等），
+ *   避免把一个设备级 STOP 打到别人正在用的会话上。
+ *   返回 0 成功；负数表示本层当时本来就没有会话（已幂等）。
+ *
+ *   ── 什么时候用 abandon / 什么时候必须用 stop ──
+ *     · 用 abandon —— 这一代会话**已经结束**，本层只是要还回自己的句柄：
+ *       audio_in_read() 返回 0/EOF 之后的收尾就是这种情况。EOF 的三个来源
+ *       （见 audio_in_read）分别是"被 AUDIOIOC_STOP 打断 / 设备没在跑 /
+ *       会话换代"，前两个说明设备已经不在跑这一代了，第三个说明设备已经被
+ *       别人的会话接手。两种情况下再发 STOP 都是纯破坏：AUDIOIOC_STOP 是
+ *       **设备级**的，会同时停掉播放和录音，于是"被接手方"的收尾动作会把刚
+ *       接手设备的那个会话打死 —— 单向让路变成双向拆台。
+ *     · 必须用 stop —— 会话还是本层的、需要**主动把设备停掉**时：录够了、
+ *       上层要切去播放（半双工必须串行）等等。只有 STOP 是"停"，
+ *       也只有 STOP 能唤醒另一个阻塞在 audio_in_read() 里的线程。
+ *
+ *   ── 为什么"只关自己的 fd"就够，不会把设备永久锁住 ──
+ *     close() 走到 NuttX 音频上层 audio_close()（nuttx/audio/audio.c:223-283），
+ *     当这是该设备**最后一个**还开着的 file 对象时，上层会调
+ *     lower->ops->shutdown()，也就是驱动的 sf32lb52_audio_shutdown() →
+ *     sf32lb52_audio_hw_shutdown()（board/contest_board/src/sf32lb52_audio.c:1514）：
+ *     那里停 DMA、DISABLE AUDPRC、软复位、关功放、nxsem_post() 唤醒可能还在
+ *     read() 里等的人，并把 priv->running 清成 false、把三个持有者 id 清成 -1。
+ *     所以"不发 STOP 就还回去"不会留下一个下不来台的 running：本层会话状态在
+ *     最后一个 fd 被关时就被清干净了，下一个 app 可以正常 START。
+ *     反过来，只要还有别人开着这个设备，上层就**不会**调 shutdown —— 这正是
+ *     本函数想要的效果：别人的会话一个字节都不动。
+ *
+ *   ── 边界（用错会出问题，务必看） ──
+ *     · abandon **不唤醒**任何阻塞中的 read：它没有 STOP 可发。如果本层还有
+ *       线程卡在 audio_in_read() 里，要么等它自己出来，要么改用 stop()。
+ *       另外 NuttX 的 close() 在"同一个 file 对象还被别的线程用着"（比如那次
+ *       阻塞的 read 还持有引用）时只先减引用计数，真正的 close（以及上面的
+ *       上层 shutdown）要等那次 read 返回后才执行
+ *       （fs/inode/fs_files.c 的 file_put）。所以别把 abandon 当"另一种 stop"
+ *       用在需要**立刻**把设备停下来的场景。
+ *     · 跨 task group 的调用沿用 stop() 那套只读身份探测（GETCAPS(QUERY)）：
+ *       探测不过就返回 -EPERM，fd 不关、全局不动；探测通过（task_create
+ *       复制出来的同一个 file 对象）才照常关，并留一行 WARNING。
+ *     · 与 stop() **共用**同一个"正在收尾"标志：两个线程同时收同一次会话时，
+ *       后到的那个直接返回，不会出现两次 close 打到同一个 fd 槽位上。
+ *     · 不要在中断上下文里调用（close 路径可能取锁）。
+ *
+ * Returned Value:
+ *    OK      —— 已放弃（fd 已关，没发 AUDIOIOC_STOP）；
+ *    -ENOENT —— 本层当时没有会话：没 start 过 / 已经收过尾 / 已有别的线程
+ *               （stop 或另一次 abandon）正在收这一次会话。这是**幂等返回，
+ *               不是错误**，调用方按"已经干净了"处理即可；
+ *    -EPERM  —— 跨 task group 调用且那个 fd 号在本组里不是音频设备：
+ *               什么都没动（会话仍在原持有者手里）；
+ *    -EINVAL —— 锁坏掉了（不可能的状态）。
+ *
+ ****************************************************************************/
+
+int audio_in_abandon(void);
 
 #endif /* __BOARDS_CONTEST_BOARD_SRC_SF32LB52_AUDIO_IN_H */

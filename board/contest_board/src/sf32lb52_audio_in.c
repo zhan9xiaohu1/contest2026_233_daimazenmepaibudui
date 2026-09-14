@@ -3,7 +3,9 @@
  *
  * SF32LB52 录音通路封装（麦克风输入）
  *
- * 只做三件事：start（open + CONFIGURE + START）、read、stop（STOP + close）。
+ * 做四件事：start（open + CONFIGURE + START）、read、stop（STOP + close）、
+ * abandon（只 close 自己的 fd，**不发 STOP** —— 用在"这次会话不是被本层停的"
+ * 那类收尾路径上，见 sf32lb52_audio_in.h 里 abandon 与 stop 的分工）。
  * 内部用一个全局 fd 表示"当前这次录音会话"，用一把 nxmutex 保护 fd 与状态。
  *
  * 线程约定（重要）：
@@ -46,6 +48,7 @@
 #include <nuttx/audio/audio.h>
 #include <nuttx/mutex.h>
 #include <nuttx/sched.h>
+#include <nuttx/clock.h>          /* clock_systime_ticks()/MSEC2TICK()：空转日志限频 */
 
 #include "sf32lb52_audio_in.h"
 
@@ -61,6 +64,11 @@
 #define AUDIO_IN_RATE_16K     16000
 #define AUDIO_IN_RATE_44K1    44100
 #define AUDIO_IN_RATE_48K     48000
+
+/* "stop 空转"日志的限频窗口（见 audio_in_stop()）。stop() 是高频路径，而空转
+ * 一旦发生就会每次调用都发生，不限频会把串口刷满、反而冲掉有用的上下文。 */
+
+#define AUDIO_IN_STOP_SPIN_LOG_MS  3000
 
 /****************************************************************************
  * Private Data
@@ -100,14 +108,22 @@ static pid_t g_audio_in_owner_group = (pid_t)-1;
 
 static mutex_t g_audio_in_lock = NXMUTEX_INITIALIZER;
 
-/* "有线程正在停这次会话"。停在锁外做（ioctl 不能持锁），所以用一个标志防并发：
- * 两个线程同时看到同一个 fd 各自 close 一次，第二次关掉的可能是刚被别人复用
- * 的槽位。只由 audio_in_stop() 读写，配着全局一起看；标志带线程 id，好让
- * "停到一半线程就没了"留下的残留能被下一次调用识别并清掉（和 start() 里那套
- * "持有者还在不在"的自愈判据同一个套路）。 */
+/* "有线程正在收这一次会话"。收尾在锁外做（ioctl/close 都不能持锁），所以用一个
+ * 标志防并发：两个线程同时看到同一个 fd 各自 close 一次，第二次关掉的可能是刚被
+ * 别人复用的槽位。**stop() 与 abandon() 共用这一把收尾权** —— 谁先拿到标志谁负责
+ * 关那一次 fd，后到的那个直接返回（abandon 返回 -ENOENT，stop 返回 OK），
+ * 否则"一方发 STOP、另一方 close"就会各自关一次同一个 fd。
+ * 配着全局一起看；标志带线程 id，好让"收到一半线程就没了"留下的残留能被下一次
+ * 调用识别并清掉（和 start() 里那套"持有者还在不在"的自愈判据同一个套路）。 */
 
 static bool  g_audio_in_stop_pending;
 static pid_t g_audio_in_stop_owner = (pid_t)-1;
+
+/* "stop 空转"日志的下一次可打点时刻（clock_systime_ticks()）。只在
+ * audio_in_stop() 里"已有别的线程在收尾"那条分支用；0 = 还没打过，
+ * 所以第一次空转必然留下一条日志。 */
+
+static clock_t g_audio_in_stop_spin_log_next;
 
 /****************************************************************************
  * Private Functions
@@ -237,6 +253,41 @@ int audio_in_start(int sample_rate, int channels, int bits)
       g_audio_in_fd          = -1;
       g_audio_in_owner       = (pid_t)-1;
       g_audio_in_owner_group = (pid_t)-1;
+    }
+
+  /* 收尾权标志的残留自愈：它和上面那份会话记录是一对，会话记录被判成残留清掉
+   * 之后，它可能还停在真值上 —— 典型是拿着收尾权的那个线程在阻塞的 ioctl/close
+   * 里被删掉了/所属 app 直接退了，标志就成了没人能清的残留。
+   * 残留着它的后果很重：之后每一次 audio_in_stop() 都会因为"已有线程在收尾"而
+   * **空转返回 OK**（调用方也都不看返回值），于是会话永远停不下、fd 永不 close；
+   * 而 tid 一旦被新线程复用，那次查活就会一直误判成"人还在"，连自愈都做不到。
+   *
+   * 判据就是文件里另外两处自愈（audio_in_stop() / audio_in_abandon() 开头的
+   * "记下线程 id、用 nxsched_get_tcb() 查活"）那套，不另造。**只有查不到 TCB 才
+   * 清**：查得到说明那人正拿着收尾权在动那个 fd，这个标志是"别重复关 fd"的唯一
+   * 凭据，必须留着，本函数不去替它清 —— 那要么由它自己收尾时清掉，要么等它没了
+   * 由下一次 stop()/abandon() 用同一套判据清。
+   * 清掉是安全的：已经存在的线程才可能再走到 close(fd)，一个查不到 TCB 的线程
+   * 既不会再关那个 fd，也不会把标志置回真值 ——
+   * "谁先拿到收尾权谁负责关那一次 fd"的语义一点没动。 */
+
+  if (g_audio_in_stop_pending)
+    {
+      FAR struct tcb_s *stopper = nxsched_get_tcb(g_audio_in_stop_owner);
+
+      if (stopper != NULL)
+        {
+          nxsched_put_tcb(stopper);
+        }
+      else
+        {
+          syslog(LOG_WARNING,
+                 "AUDIO_IN: 上一次收尾的线程 %d 已消失，清掉残留的 stop 标志"
+                 "（否则之后的 stop() 会一直空转）\n",
+                 (int)g_audio_in_stop_owner);
+          g_audio_in_stop_pending = false;
+          g_audio_in_stop_owner   = (pid_t)-1;
+        }
     }
 
   /* 走到这里只有两种可能：本来没有会话，或刚把残留清掉。
@@ -434,11 +485,33 @@ int audio_in_stop(void)
        * start() 里那套"持有者线程还在不在"的做法，自愈。 */
 
       FAR struct tcb_s *stopper = nxsched_get_tcb(g_audio_in_stop_owner);
+      pid_t   stopper_tid       = g_audio_in_stop_owner;
+      clock_t now;
 
       if (stopper != NULL)
         {
           nxsched_put_tcb(stopper);
           nxmutex_unlock(&g_audio_in_lock);
+          now = clock_systime_ticks();
+
+          /* 空转返回 OK 这件事，调用方**看不出来**（返回值与"真停掉了"完全一样），
+           * 所以这里留一条限频日志：真有线程卡在收尾里，就会持续留痕，而不是
+           * 一声不响地报成功。限频是必须的 —— 空转一旦发生就是每次调用都发生，
+           * 不限频会把串口刷满、反而冲掉有用的上下文。
+           * **只加日志、不动返回值**：调用方现在把 OK 当"设备已停"，
+           * 改返回码会牵动它们的语义（见头文件里"第三种 OK"那段）。 */
+
+          if ((int32_t)(now - g_audio_in_stop_spin_log_next) >= 0)
+            {
+              g_audio_in_stop_spin_log_next =
+                now + MSEC2TICK(AUDIO_IN_STOP_SPIN_LOG_MS);
+              syslog(LOG_WARNING,
+                     "AUDIO_IN: 本次 stop **空转**：线程 %d 仍在收尾这一次会话"
+                     "（fd=%d），会话没被停、fd 没关，这里照旧返回 OK。"
+                     "反复出现即说明那个线程卡在 ioctl/close 里回不来了\n",
+                     (int)stopper_tid, fd);
+            }
+
           return OK;
         }
 
@@ -568,5 +641,147 @@ int audio_in_stop(void)
     }
 
   syslog(LOG_INFO, "AUDIO_IN: stopped\n");
+  return OK;
+}
+
+/****************************************************************************
+ * Name: audio_in_abandon
+ *
+ * Description:
+ *   放弃当前录音会话：清掉本层的记录 + close 掉自己的 fd。除跨组时那一遍只读的
+ *   身份探测（GETCAPS）之外，**一个 ioctl 都不发，尤其不发 AUDIOIOC_STOP**。
+ *   契约、返回值和"什么时候该用 abandon、什么时候必须用 stop"见
+ *   sf32lb52_audio_in.h 里 audio_in_abandon 那一段。
+ *
+ *   为什么不能直接复用 audio_in_stop()：它中间那句 ioctl(AUDIOIOC_STOP) 是
+ *   **设备级**的（同时停播放和录音）。而本函数服务的是"这一次会话根本不是本层
+ *   停的"那类收尾路径（audio_in_read() 返回 0/EOF），此时设备要么已经停了、
+ *   要么已经被别人的会话接手 —— 再发一个设备级 STOP 就是把刚接手的那一方打死，
+ *   单方向让路由此变成双向拆台。
+ *
+ *   为什么"只 close 自己的 fd"不会把设备锁死：见头文件里那一节（最后一个 file
+ *   对象被关时 NuttX 音频上层会调驱动的 shutdown，那里会把 running 清掉）。
+ ****************************************************************************/
+
+int audio_in_abandon(void)
+{
+  pid_t owner;
+  pid_t owner_group;
+  int fd;
+
+  if (nxmutex_lock(&g_audio_in_lock) < 0)
+    {
+      return -EINVAL;                 /* 锁坏掉了，属于不可能的状态 */
+    }
+
+  fd = g_audio_in_fd;
+
+  if (fd < 0)
+    {
+      nxmutex_unlock(&g_audio_in_lock);
+
+      /* 本来就没有会话。幂等：重复调、没 start 就调，都是这个返回值，
+       * 不动任何东西（这正是调用方想要的"已经干净了"）。 */
+
+      return -ENOENT;
+    }
+
+  if (g_audio_in_stop_pending)
+    {
+      /* 已经有线程拿到收尾权（stop() 或另一次 abandon()）在收这一次会话。
+       * 放行会让两个线程各 close 一次同一个 fd，所以这里直接返回 ——
+       * 对调用方来说"会话已经在被收走了"，语义上和本层没有会话是一回事。 */
+
+      FAR struct tcb_s *stopper = nxsched_get_tcb(g_audio_in_stop_owner);
+
+      if (stopper != NULL)
+        {
+          nxsched_put_tcb(stopper);
+          nxmutex_unlock(&g_audio_in_lock);
+          syslog(LOG_INFO,
+                 "AUDIO_IN: abandon 时线程 %d 正在收这一次会话，本次不重复关 fd\n",
+                 (int)g_audio_in_stop_owner);
+          return -ENOENT;
+        }
+
+      syslog(LOG_WARNING,
+             "AUDIO_IN: 上一次收会话的线程 %d 已消失，清掉残留的收尾标志\n",
+             (int)g_audio_in_stop_owner);
+      g_audio_in_stop_pending = false;
+    }
+
+  owner       = g_audio_in_owner;
+  owner_group = g_audio_in_owner_group;
+  g_audio_in_stop_pending = true;
+  g_audio_in_stop_owner   = nxsched_gettid();
+
+  nxmutex_unlock(&g_audio_in_lock);
+
+  /* 跨组调用要先确认这个 fd 到底通到哪个设备，否则 close() 关掉的是别人组里的
+   * 另一个 file 对象（fd 号只在开它的那个 task group 里保证有意义）。判据与
+   * stop() 里那段完全一样，也同样是只读探测：过不了就一个系统调用都不发。
+   *
+   * 本组自己的调用不做这个探测：fd 号是自己开的，close 掉它就是收自己的尾。 */
+
+  if (owner_group != getpid() && !audio_in_fd_is_audio_device(fd))
+    {
+      syslog(LOG_ERR,
+             "AUDIO_IN: abandon 被别的 task group 调用，且 fd=%d 在本组里不是音频"
+             "设备（会话属于 group %d / 线程 %d，调用者是 group %d 线程 %d）："
+             "已拒绝，fd 没关、全局状态没动。\n"
+             "  说明：fd 号在每个 task group 里各有一套含义，跨组拿别人的 fd 号做"
+             "close/ioctl 只会打到本组自己的文件上。跨 app 让路请改成"
+             "\"登记请求 + 持有者自己的线程执行\"。\n",
+             fd, (int)owner_group, (int)owner, (int)getpid(),
+             (int)nxsched_gettid());
+
+      if (nxmutex_lock(&g_audio_in_lock) == 0)
+        {
+          g_audio_in_stop_pending = false;
+          g_audio_in_stop_owner   = (pid_t)-1;
+          nxmutex_unlock(&g_audio_in_lock);
+        }
+
+      return -EPERM;
+    }
+
+  /* 清全局再 close —— 顺序和 stop() 保持一致（那里是"STOP 成功 → 清全局 →
+   * close"）。只在"会话还是刚才那一个"时清，免得把期间新开的一次会话顶掉：
+   * 清完之后再有 audio_in_start()，它看到的就是"无会话"，可以正常开新的一次，
+   * 而它新开的 fd 号不可能是我们手里这个（这个槽位还被我们占着，open 会拿别的
+   * 号），所以下面的 close 关掉的一定是我们自己那一次会话的 fd。 */
+
+  if (nxmutex_lock(&g_audio_in_lock) == 0)
+    {
+      if (g_audio_in_fd == fd)
+        {
+          g_audio_in_fd          = -1;
+          g_audio_in_owner       = (pid_t)-1;
+          g_audio_in_owner_group = (pid_t)-1;
+        }
+
+      g_audio_in_stop_pending = false;
+      g_audio_in_stop_owner   = (pid_t)-1;
+      nxmutex_unlock(&g_audio_in_lock);
+    }
+
+  /* 只关自己的 fd，不发 AUDIOIOC_STOP：这是本函数存在的全部意义。
+   * 关闭最后一个 file 对象时上层会替我们调驱动的 shutdown（把 running 清掉），
+   * 还有别人开着设备时则连 shutdown 都不会碰 —— 两种情况都不会锁住设备。 */
+
+  close(fd);
+
+  if (owner_group != getpid())
+    {
+      syslog(LOG_WARNING,
+             "AUDIO_IN: abandoned（由别的 task group %d 代收：会话 group=%d / "
+             "线程 %d，fd=%d 已关，**没发 AUDIOIOC_STOP**）\n",
+             (int)getpid(), (int)owner_group, (int)owner, fd);
+      return OK;
+    }
+
+  syslog(LOG_WARNING,
+         "AUDIO_IN: abandoned（fd=%d 已关，**没发 AUDIOIOC_STOP**：这次会话不是"
+         "本层停的，设备留给当前持有者）\n", fd);
   return OK;
 }
