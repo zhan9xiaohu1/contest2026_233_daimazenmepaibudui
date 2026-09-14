@@ -42,11 +42,21 @@
 
 #define AUDIO_PLAY_DEVICE      "/dev/audio/audio0"
 
-/* 播放分块：100 ms 一块。驱动里的 write() 是**同步**的（阻塞到这块放完），
+/* 播放分块：250 ms 一块。驱动里的 write() 是**同步**的（阻塞到这块放完），
  * 分块后 audio_play_stop() 最多等一块 + 驱动的等待余量就能生效。
- * 播放缓冲本身仍由 ctx->play_buf 承担（AUDIO_PLAY_BUFFER_MS）。 */
+ * 播放缓冲本身仍由 ctx->play_buf 承担（AUDIO_PLAY_BUFFER_MS）。
+ *
+ * 块大小是"听感 vs 打断跟手"的取舍：块边界要 DMAStop 再重新起传输，而驱动里
+ * 那块 TX DMA 是 DMA_CIRCULAR（见 board 的 sf32lb52_audio.c），边界越密越容易
+ * 听到"啪"。从 100 ms 抬到 250 ms，边界从 10 次/秒降到 4 次/秒。
+ * 代价是打断变慢，数字见 audio_play_stop() 的注释；要更跟手就改回 100。 */
 
-#define AUDIO_PLAY_CHUNK_MS    100
+#define AUDIO_PLAY_CHUNK_MS    250
+
+/* 每个分块首尾各做多长的淡入/淡出（ms）。这是消除块边界爆音的主要手段，
+ * 原理和代价见 audio_apply_chunk_fade()。 */
+
+#define AUDIO_PLAY_FADE_MS     3
 
 /* 驱动侧音量值域 0..1000（nuttx/audio/audio.h 的 AUDIO_VOLUME_MAX，
  * 也就是 AUDIOIOC_CONFIGURE + AUDIO_TYPE_FEATURE + AUDIO_FU_VOLUME 的取值），
@@ -62,6 +72,8 @@
 static void *audio_record_thread(void *arg);
 static void *audio_play_thread(void *arg);
 static uint32_t audio_calc_frame_energy(const int16_t *data, size_t frames);
+static size_t audio_play_chunk_bytes(const audio_context_t *ctx);
+static void audio_apply_chunk_fade(audio_context_t *ctx, size_t frames);
 static int audio_open_play_device(audio_context_t *ctx);
 static void audio_close_play_device(int fd);
 static int audio_apply_volume(int fd, uint8_t volume);
@@ -69,6 +81,7 @@ static int audio_configure_output(int fd, const audio_context_t *ctx);
 static int audio_hw_set_volume(const audio_context_t *ctx, uint8_t volume);
 static void audio_prepare_output(audio_context_t *ctx);
 static void audio_resume_record(audio_context_t *ctx);
+static void audio_reap_play_thread(audio_context_t *ctx, const char *who);
 static int audio_play_begin(audio_context_t *ctx, size_t frames,
                             audio_play_complete_cb_t callback,
                             void *user_data);
@@ -113,6 +126,97 @@ static uint32_t audio_calc_frame_energy(const int16_t *data, size_t frames)
     }
 
   return (uint32_t)(sum / frames);
+}
+
+/**
+ * @brief  一个播放分块的字节数
+ *
+ * 播放线程按它切块，淡入淡出也按它算块边界 —— 只能有**一份**算法，
+ * 否则淡化的位置和实际 write() 的分块位置对不上，等于白做。
+ */
+
+static size_t audio_play_chunk_bytes(const audio_context_t *ctx)
+{
+  return (size_t)ctx->config.sample_rate * AUDIO_PLAY_CHUNK_MS / 1000 *
+         (size_t)ctx->config.channels * sizeof(int16_t);
+}
+
+/**
+ * @brief  给每个分块的首尾各加一段淡入/淡出（就地改 ctx->play_buf）
+ *
+ * 为什么加：驱动那边 HAL_AUDCODEC_Transmit_DMA() 把 TX DMA 设成 DMA_CIRCULAR
+ * （见 board/contest_board/src/sf32lb52_audio.c 的注释），这一块放完的同时
+ * 硬件会**立刻从块首再播一遍**；要等 DMA 完成中断把 write() 唤醒、走到
+ * HAL_AUDCODEC_DMAStop() 才停得下来。所以每个块边界上，波形都是
+ * "块尾 → 块首"来回跳两下 —— 块尾和块首的幅度差多少，就是多响的一声"啪"。
+ * 每块 100 ms 时一秒十声，就是同事听到的"每个字都有爆音"。
+ *
+ * 怎么解决：把每块的头尾各压成 AUDIO_PLAY_FADE_MS 的斜坡，让块尾和块首
+ * 都落在**静音附近**。这样一来重播的那几个采样是"从 0 慢慢起来"的，
+ * 停 DMA 那一下也是"停在 0 附近"，两边都没有跳变。驱动侧另外做了配套：
+ * 在 DMA 完成中断里就把 DMA 掐掉（sf32lb52_audio_tx_freeze），把重播长度
+ * 压到一个 32bit 字以内，斜坡盖得住。
+ *
+ * 代价：每块首尾共 2 × AUDIO_PLAY_FADE_MS = 6 ms 的样本被压低，250 ms 一块
+ * 算下来只占 2.4%，是听感上基本听不出来的轻微调幅；不改时长、不改音高、
+ * 不多占内存（就地改本模块自己的播放缓冲，不碰调用者的数据）。
+ */
+
+static void audio_apply_chunk_fade(audio_context_t *ctx, size_t frames)
+{
+  size_t channels = (size_t)ctx->config.channels;
+  size_t frame_bytes = channels * sizeof(int16_t);
+  size_t chunk_frames = audio_play_chunk_bytes(ctx) / frame_bytes;
+  size_t fade_frames = (size_t)ctx->config.sample_rate * AUDIO_PLAY_FADE_MS / 1000;
+  size_t begin;
+
+  if (chunk_frames == 0 || fade_frames == 0)
+    {
+      return;
+    }
+
+  for (begin = 0; begin < frames; begin += chunk_frames)
+    {
+      size_t len = frames - begin;     /* 最后一块可能不足一块 */
+      size_t fade = fade_frames;
+      size_t i;
+      size_t c;
+
+      if (len > chunk_frames)
+        {
+          len = chunk_frames;
+        }
+
+      /* 块比两段斜坡还短（尾部残块、很短的提示音）：两侧各分一半，
+       * 保证两段不重叠，也不会除零。 */
+
+      if (fade * 2 > len)
+        {
+          fade = len / 2;
+        }
+
+      if (fade == 0)
+        {
+          continue;
+        }
+
+      for (i = 0; i < fade; i++)
+        {
+          size_t f_in  = begin + i;                 /* 从块首往后数 */
+          size_t f_out = begin + len - 1 - i;       /* 从块尾往前数 */
+          int32_t g = (int32_t)i;                   /* 0 → 1 的线性斜坡 */
+
+          for (c = 0; c < channels; c++)
+            {
+              ctx->play_buf[f_in * channels + c] =
+                (int16_t)((int32_t)ctx->play_buf[f_in * channels + c] *
+                          g / (int32_t)fade);
+              ctx->play_buf[f_out * channels + c] =
+                (int16_t)((int32_t)ctx->play_buf[f_out * channels + c] *
+                          g / (int32_t)fade);
+            }
+        }
+    }
 }
 
 /**
@@ -220,34 +324,57 @@ static int audio_hw_set_volume(const audio_context_t *ctx, uint8_t volume)
  *
  * 顺序照 app/audio_test 与板级 alarm 模块真机验证过的那套：
  * open -> CONFIGURE(AUDIO_TYPE_OUTPUT) -> CONFIGURE(AUDIO_FU_VOLUME) -> START。
+ *
+ * 这里的失败一律 `printf` 一行（**不能只走 AUDIO_DEBUG**）：本构建没开
+ * CONFIG_DEBUG_AI_AUDIO，那个宏整体编译成空，于是"START 被驱动 -EBUSY 拒掉"
+ * 这种"一声都没出"的事在串口上一点痕迹都没有，上层还当它放完了。
+ * 每次失败播放只会有这一行（下面播放线程里最多再有一行），不会刷屏。
  */
 
 static int audio_open_play_device(audio_context_t *ctx)
 {
   int fd;
+  int ret;
 
   fd = open(AUDIO_PLAY_DEVICE, O_WRONLY);
   if (fd < 0)
     {
       int errcode = errno;
 
-      AUDIO_DEBUG("打开播放设备 %s 失败: %d", AUDIO_PLAY_DEVICE, errcode);
+      printf("[AUDIO] 播放没出声：打不开 %s (%d)\n", AUDIO_PLAY_DEVICE, errcode);
       return -errcode;
     }
 
-  if (audio_configure_output(fd, ctx) != OK)
+  /* 配置失败就把它自己的错误码透出去（原来是笼统的 -EIO，上层看不出是
+   * 参数/驱动哪一步坏的）。AUDIOIOC_CONFIGURE 那一步失败时 errno 已经被
+   * audio_configure_output() 翻成了负 errno。 */
+
+  ret = audio_configure_output(fd, ctx);
+  if (ret != OK)
     {
       close(fd);
-      return -EIO;
+      printf("[AUDIO] 播放没出声：配输出方向失败 (%d)\n", ret);
+      return ret;
     }
 
-  audio_apply_volume(fd, ctx->config.volume);
+  /* 音量下发失败是非致命的（驱动自己有一份默认音量），但"提示音听不见"
+   * 也可能是这个原因，所以照样留一行。 */
+
+  ret = audio_apply_volume(fd, ctx->config.volume);
+  if (ret != OK)
+    {
+      printf("[AUDIO] 播放音量下发失败 (%d)：这段可能偏小甚至听不见\n", ret);
+    }
 
   if (ioctl(fd, AUDIOIOC_START, 0) < 0)
     {
       int errcode = errno;
 
-      AUDIO_DEBUG("播放 AUDIOIOC_START 失败: %d", errcode);
+      /* 这就是"半双工被对方占着"的落点：驱动在方向冲突时（录音通路的模拟级
+       * 还开着、本次要起播放）返回 -EBUSY，一声都不会出。 */
+
+      printf("[AUDIO] 播放没出声：AUDIOIOC_START 被拒 (%d)%s\n", errcode,
+             (errcode == EBUSY) ? "：设备被另一方向的会话占着" : "");
       close(fd);
       return -errcode;
     }
@@ -438,7 +565,35 @@ static void *audio_record_thread(void *arg)
         }
       else
         {
-          AUDIO_DEBUG("录音结束/读取失败: %zd", nbytes);
+          /* 读返回 0 / 负值就必须跳出去（理由见上面那段）。但"是谁让这次录音
+           * 结束的"要分清楚 —— 上层（ai_companion 的监听守护）正是靠这一点
+           * 区分"正常收尾"和"会话死了"：
+           *
+           *   - ctx->record_stop 已经置位：audio_record_stop() 让我们停的，
+           *     正常收尾。放音前的半双工让路（audio_prepare_output）走的也是
+           *     这条路，它播完会自己把录音恢复起来，不需要谁去救。
+           *   - record_stop 还是假：**没人**要求停，是驱动 AUDIOIOC_STOP 了
+           *     通路 / 下层 5 秒 DMA 超时 / 设备被别的会话（半双工）抢走了。
+           *     这一代录音到此为止，而且不会有 VAD 回调来收尾 —— 上层要是不知道，
+           *     状态机就会一直停在"正在听"直到自己超时，用户体感就是"卡死了"。
+           *     所以置上 record_died，让上层下一拍（100ms）就能重开。
+           *
+           * 注意这里**不能**去补一次 vad_callback(false) 冒充"语音结束"：
+           * VAD 报 false 的意思是"人说完了一句完整的话，去送 ASR"，
+           * 和"设备没了"完全不是一回事（补了会把半截音频送去识别）。
+           * 异常中断只值一个标志，怎么处理是上层的事（见 ai_audio.h）。 */
+
+          if (!ctx->record_stop)
+            {
+              ctx->record_died = true;
+              printf("[录音] 录音异常中断（read 返回 %ld，不是本层在停），"
+                     "会话已死\n", (long)nbytes);
+            }
+          else
+            {
+              AUDIO_DEBUG("录音被 stop 打断，正常收尾（不置 record_died）");
+            }
+
           break;
         }
     }
@@ -467,6 +622,11 @@ static void *audio_record_thread(void *arg)
  * task group，跨任务用别人的 fd 会炸机（这项目已经炸过三次）。
  * 驱动里的 write() 是同步的（阻塞到这块 DMA 放完），所以分块写，
  * 每块之间看一眼 play_stop，audio_play_stop() / audio_deinit() 才能及时生效。
+ *
+ * 本线程是 ctx->play_last_result 的**唯一**写入者，写入点在完成回调之前 ——
+ * 让"这次到底出没出声"在回调那一刻就是确定的（读法见 ai_audio.h 的
+ * audio_play_last_result()）。完成回调本身语义不变：设备打不开、START 被拒、
+ * 写失败也照样回调，好让上层状态机不会等一个永远不来的完成事件。
  */
 
 static void *audio_play_thread(void *arg)
@@ -474,9 +634,9 @@ static void *audio_play_thread(void *arg)
   audio_context_t *ctx = (audio_context_t *)arg;
   size_t frame_bytes = ctx->config.channels * sizeof(int16_t);
   size_t total_bytes = ctx->play_frames * frame_bytes;
-  size_t chunk_bytes =
-    (size_t)ctx->config.sample_rate * AUDIO_PLAY_CHUNK_MS / 1000 * frame_bytes;
+  size_t chunk_bytes = audio_play_chunk_bytes(ctx);
   size_t done = 0;
+  int fail = 0;                  /* 0=没失败；负值=没出声的原因，最后写进 ctx */
   int fd;
 
   if (chunk_bytes == 0)
@@ -490,8 +650,13 @@ static void *audio_play_thread(void *arg)
   if (fd < 0)
     {
       /* 打不开设备就不假装在放：直接走完流程，让 play_complete 回调
-       * 把上层状态机推下去，别让它等一个永远不会来的完成事件。 */
+       * 把上层状态机推下去，别让它等一个永远不会来的完成事件。
+       * 但"没出声"这件事必须记下来（下面写进 play_last_result），
+       * 否则上层读到回调就以为放完了 —— 那正是"一声没响、日志说放完了"的根因。
+       * 具体原因（open / CONFIGURE / START 哪一步、什么错误码）已经由
+       * audio_open_play_device() 那行 printf 打出串口了，这里不重复。 */
 
+      fail = fd;
       AUDIO_DEBUG("播放设备不可用: %d", fd);
     }
   else
@@ -513,11 +678,25 @@ static void *audio_play_thread(void *arg)
 
           if (written <= 0)
             {
-              AUDIO_DEBUG("播放写入失败: %zd", written);
+              fail = -EIO;
+              printf("[AUDIO] 播放没出声：write 返回 %zd"
+                     "（已写 %zu/%zu 字节，这段只出了一部分或一声没出）\n",
+                     written, done, total_bytes);
               break;
             }
 
           done += (size_t)written;
+        }
+
+      /* "写满但没走完"：被上层 stop 打断不算失败（那是调用方要停），
+       * 除此之外只要没写满就是没放完 —— 不记下来的话，上层会把它当成
+       * "放完了"（这也是上面那行日志之后的兜底，正常路径到不了）。 */
+
+      if (fail == 0 && !ctx->play_stop && done < total_bytes)
+        {
+          fail = -EIO;
+          printf("[AUDIO] 播放没出声：写了 %zu/%zu 字节就退出循环了\n",
+                 done, total_bytes);
         }
     }
 
@@ -525,6 +704,29 @@ static void *audio_play_thread(void *arg)
    * 所以它必须是播放的最后一步。fd 也是在本线程里关的。 */
 
   audio_close_play_device(fd);
+
+  /* 结果落定：必须在 audio_resume_record() / play_cb **之前** ——
+   * 回调里（或回调返回后立刻）读到的要是最终值，不能是中转值。
+   *
+   * 判据是"整段有没有写进设备"，不是"线程收没收尾"：
+   *   - 有失败码（打不开 / START 被拒 / 写失败）→ 原样记下，就是"没出声"；
+   *   - 没失败码但没写满 → 只可能是被 audio_play_stop() 砍断的（写失败那条
+   *     上面已经排除了），记 -ECANCELED：不算放完，也不算"出错"；
+   *   - 写满了 → OK（**即**播放线程收尾时 play_stop 才置位，也照样是"整段
+   *     都进了设备"，不该因为一个收尾竞态被报成"被打断"）。 */
+
+  if (fail != 0)
+    {
+      ctx->play_last_result = fail;
+    }
+  else if (done < total_bytes)
+    {
+      ctx->play_last_result = -ECANCELED;
+    }
+  else
+    {
+      ctx->play_last_result = OK;
+    }
 
   ctx->playing = false;
   ctx->state = ctx->recording ? AUDIO_STATE_RECORDING : AUDIO_STATE_IDLE;
@@ -539,12 +741,21 @@ static void *audio_play_thread(void *arg)
       audio_resume_record(ctx);
     }
 
-  /* 播放完成回调（在播放线程里回调，调用者可以放心紧跟着开录音） */
+  /* 播放完成回调（在播放线程里回调，调用者可以放心紧跟着开录音）。
+   * 语义不变：失败也回调 —— 上层（hello_app 的 TTS 状态机）靠它收尾，
+   * 吞掉它会让人一直卡在"正在说话"。想区分成败请读 play_last_result。 */
 
   if (!ctx->play_stop && ctx->play_cb)
     {
       ctx->play_cb(ctx->play_user_data);
     }
+
+  /* 最后一步：告诉 audio_reap_play_thread() "我已经跑完了"。
+   * 必须在所有收尾动作（关播放设备 / 恢复录音 / 完成回调）**之后**置位 ——
+   * 回收的人看到它就是直接 join 走 TCB，早置一位等于把线程剩下的动作甩给一个
+   * 随时可能被释放的上下文。和录音线程末尾那个 record_exited 是同一套语义。 */
+
+  ctx->play_exited = true;
 
   AUDIO_DEBUG("播放线程退出");
   return NULL;
@@ -556,6 +767,11 @@ static void *audio_play_thread(void *arg)
  *
  * 设备由播放线程自己 open/START/write/STOP/close，这里只负责：
  * 回收上一次的播放线程（它自己会关 fd）、记下参数、起线程。
+ *
+ * 起线程前后各写一次 play_last_result（见 ai_audio.h 的 audio_play_last_result）：
+ *   - 起线程前写 -EINPROGRESS：让"上一次的结果"在这次还没出结果时就先作废，
+ *     否则读的人可能读到上一次的 0 而以为这次放完了；
+ *   - 线程起不来时写 -ret：这也是一次"没出声"的播放尝试，得如实记下来。
  */
 
 static int audio_play_begin(audio_context_t *ctx, size_t frames,
@@ -567,20 +783,38 @@ static int audio_play_begin(audio_context_t *ctx, size_t frames,
   /* 上一次的播放线程需要回收。正常情况下 audio_play_stop() 已经 join 过了，
    * 这里是兜底（比如播放线程自己跑完、没被 stop 过）。
    * 如果本函数就是在播放线程里被调的（播放完成回调里又开一段），不能 join 自己：
-   * 线程已经写完了缓冲、回调返回后就退出，直接起新的即可。 */
+   * 线程已经写完了缓冲、回调返回后就退出，直接起新的即可。
+   *
+   * 回收是**有界**的（见 audio_reap_play_thread）。它放弃 join（线程卡在设备里
+   * 没退出来）时不能再往下走：那条线程还在用同一个 ctx->play_buf，也还占着音频
+   * 设备，再起一条播放线程就是"两条线程抢一个设备 + 一起写同一块缓冲"。
+   * 报 -EBUSY 让上层自己收尾（上层本来就有负返回值的处理），好过在这里死等。 */
 
   if (ctx->play_thread_valid)
     {
       if (pthread_equal(pthread_self(), ctx->play_thread))
         {
           AUDIO_DEBUG("在播放线程里重开播放，跳过 join");
+          ctx->play_thread_valid = false;
         }
       else
         {
-          pthread_join(ctx->play_thread, NULL);
-        }
+          audio_reap_play_thread(ctx, "play_begin");
 
-      ctx->play_thread_valid = false;
+          if (ctx->play_thread_valid)
+            {
+              AUDIO_DEBUG("上一次播放线程还没收尾，本次起播放弃");
+
+              /* 录音已经为这次播放让过路了（audio_prepare_output），
+               * 而这次没播成：赶紧把录音恢复起来，别让上层一直聋着。
+               * playing 此刻还是 false（调用方在 audio_play_start 里刚判过），
+               * 恢复逻辑不会反过来再停一次播放 —— 和下面 pthread_create
+               * 失败那条路同一个处理。 */
+
+              audio_resume_record(ctx);
+              return -EBUSY;
+            }
+        }
     }
 
   ctx->play_cb = callback;
@@ -588,12 +822,15 @@ static int audio_play_begin(audio_context_t *ctx, size_t frames,
   ctx->play_frames = frames;
   ctx->play_stop = false;
   ctx->playing = true;
+  ctx->play_exited = false;               /* 新一代播放线程的收尾标记 */
+  ctx->play_last_result = -EINPROGRESS;   /* 这次的结果还没落定 */
 
   ret = pthread_create(&ctx->play_thread, NULL, audio_play_thread, ctx);
   if (ret != 0)
     {
       AUDIO_DEBUG("创建播放线程失败: %d", ret);
       ctx->playing = false;
+      ctx->play_last_result = -ret;       /* 这次也没出声 */
 
       /* 录音已经为这次播放让过路了，但播放没起来：赶紧恢复，
        * 别让上层一直聋着（playing 已经置 false，恢复逻辑不会再停播放）。 */
@@ -717,21 +954,42 @@ void audio_deinit(audio_context_t *ctx)
 
   AUDIO_DEBUG("反初始化音频模块");
 
-  /* 停止录音和播放。两个 stop 都会等到各自的线程退出（设备 fd 由录音封装
-   * 和播放线程自己关），所以下面 free 缓冲是安全的。 */
+  /* 停止录音和播放。两个 stop 都会等各自的线程退出（设备 fd 由录音封装
+   * 和播放线程自己关），正常路径下等到这里就可以安全 free 缓冲了。
+   *
+   * 但两条回收都是**有界**的：设备那一侧卡住时它们会放弃 join（留一行日志），
+   * 线程还活着、还在用 record_buf / play_buf。那种情况下**绝不能** free ——
+   * 线程会踩到已释放的缓冲（比漏一点内存严重得多，而且现场只会是一个
+   * 莫名其妙的崩溃）。所以这里逐个判：只要线程还没退干净就留着缓冲不释放，
+   * 反正本函数只在收摊时跑一次。 */
 
   audio_record_stop(ctx);
   audio_play_stop(ctx);
 
-  /* 释放缓冲区 */
+  /* 释放缓冲区。
+   *
+   * **不置 NULL**：指针要留给那条还在跑的线程用 —— 播放线程下一轮还会
+   * `write(fd, ctx->play_buf + done, chunk)`，把它清成 NULL 就成了"空指针 + 偏移"
+   * 的一个非法地址（驱动那边只判 buffer == NULL，判不出这种），比漏内存危险得多。
+   * 这里只是不 free，缓冲区本身仍是有效的堆块。 */
 
-  if (ctx->record_buf != NULL)
+  if (ctx->record_thread_valid && !ctx->record_exited)
+    {
+      syslog(LOG_ERR, "[AUDIO] 录音线程还没退干净，保留录音缓冲不释放"
+                      "（避免线程踩已释放内存）\n");
+    }
+  else if (ctx->record_buf != NULL)
     {
       free(ctx->record_buf);
       ctx->record_buf = NULL;
     }
 
-  if (ctx->play_buf != NULL)
+  if (ctx->play_thread_valid && !ctx->play_exited)
+    {
+      syslog(LOG_ERR, "[AUDIO] 播放线程还没退干净，保留播放缓冲不释放"
+                      "（避免线程踩已释放内存）\n");
+    }
+  else if (ctx->play_buf != NULL)
     {
       free(ctx->play_buf);
       ctx->play_buf = NULL;
@@ -837,6 +1095,7 @@ int audio_record_start(audio_context_t *ctx,
   ctx->record_stop = false;
   ctx->recording = true;
   ctx->record_exited = false;         /* 新一代录音线程的收尾标记 */
+  ctx->record_died = false;           /* 上一代的"异常中断"标记到此作废 */
 
   ret = pthread_create(&ctx->record_thread, NULL,
                        audio_record_thread, ctx);
@@ -908,6 +1167,68 @@ static void audio_reap_record_thread(audio_context_t *ctx, const char *who)
 }
 
 /**
+ * @brief  回收播放线程（有界等待，理由同 audio_reap_record_thread）
+ *
+ * 和录音那条是同一套做法：先轮询 ctx->play_exited（usleep 自旋，不依赖任何内核
+ * 超时），退出后再 join 回收 TCB；等不到就放弃并留一行日志，play_thread_valid
+ * 保持 true 让下一次收尾再来。
+ *
+ * 为什么必须有上界（这次才加的）：这条回收有**两条路径是在设备的"动作权"锁里
+ * 做的** —— hello_app 起播（audio_play_start_locked）和让路线程 / 监听守护的
+ * 停开麦都会走到 audio_play_stop / audio_play_begin，而它们跑在
+ * ai_companion_main.c 的 g_mic_device_lock 里面。如果播放线程正卡在设备调用里
+ * （真机上确实出现过：驱动里 hw_start / 那次 STOP 的现场，见 ai_companion_yield.h
+ * 头上那次事故），裸的 pthread_join 就是永久等待 —— 而它是攥着锁等的，
+ * 于是主循环里下一次起播、下一次让路受理全部跟着钉死，整个 app（连带等它让麦克风
+ * 的 robot_ui 提醒链路）一起静默。放弃 join 的代价只是 TCB 晚一点回收，
+ * 设备那边的残局本来就得由驱动 / 上层的守护去收拾，不该由一个应用线程无期限地等。
+ *
+ * 上限为什么比录音那 300ms 宽：播放线程被 stop 时可能正阻塞在一次同步 write()
+ * 里，而驱动那一块的大小是 AUDIO_PLAY_CHUNK_MS=250ms、它自己的等待上限是
+ * "一块 + 500ms 余量"（见 ai_audio.c 的 audio_play_stop 注释与
+ * board/contest_board/src/sf32lb52_audio.c 的 write）。300ms 会在完全正常的
+ * 路径上误判成"没退出来"，所以这里给 1000ms：正常收尾一定能在这之内退干净。
+ */
+
+#define AUDIO_PLAY_REAP_MS   1000
+
+static void audio_reap_play_thread(audio_context_t *ctx, const char *who)
+{
+  int i;
+
+  if (!ctx->play_thread_valid)
+    {
+      return;
+    }
+
+  /* 在播放线程自己里调（完成回调里又停一次）：不能 join 自己。
+   * 线程回调返回后就会退出，TCB 留给下次回收。 */
+
+  if (pthread_equal(pthread_self(), ctx->play_thread))
+    {
+      AUDIO_DEBUG("在播放线程里调 stop，跳过 join");
+      return;
+    }
+
+  for (i = 0; i < AUDIO_PLAY_REAP_MS / 10 && !ctx->play_exited; i++)
+    {
+      usleep(10000);                    /* 10ms × 100 = 1000ms 上限 */
+    }
+
+  if (!ctx->play_exited)
+    {
+      syslog(LOG_ERR,
+             "[AUDIO] %s: 播放线程 %dms 内没退出，放弃 join"
+             "（多半卡在音频设备调用里；TCB 留给下一次回收）\n",
+             who, AUDIO_PLAY_REAP_MS);
+      return;                           /* play_thread_valid 保持 true */
+    }
+
+  pthread_join(ctx->play_thread, NULL);
+  ctx->play_thread_valid = false;
+}
+
+/**
  * @brief  停止录音
  */
 
@@ -956,6 +1277,29 @@ bool audio_is_recording(audio_context_t *ctx)
 }
 
 /**
+ * @brief  录音这条链路是不是真的还活着
+ *
+ * 四个字段缺一不可（理由见 ai_audio.h 的声明）：
+ *   recording            —— 设备 START 过、线程被期望在跑
+ *   record_thread_valid  —— 线程 TCB 还没被回收
+ *   record_stop          —— 有人在停它（停的过程中不该被当成"健康的常听"）
+ *   record_exited        —— 线程已经跑到最后一行（收尾标记，见录音线程末尾）
+ *
+ * 它只回答"还活着吗"，不回答"为什么死的"：后者看 ctx->record_died
+ * （录音异常中断的标记，上层认领后自己清，见 ai_audio.h 那张说明表）。
+ */
+
+bool audio_record_is_active(const audio_context_t *ctx)
+{
+  if (ctx == NULL || !ctx->recording || !ctx->record_thread_valid)
+    {
+      return false;
+    }
+
+  return !(ctx->record_stop || ctx->record_exited);
+}
+
+/**
  * @brief  开始播放音频数据
  */
 
@@ -996,11 +1340,13 @@ int audio_play_start(audio_context_t *ctx,
 
   audio_prepare_output(ctx);
 
-  /* 复制音频数据到缓冲区（必须在播放线程起来之前复制完） */
+  /* 复制音频数据到缓冲区（必须在播放线程起来之前复制完）。
+   * 复制完立刻做分块淡入淡出 —— 只改我们自己的副本，不碰调用者的 data。 */
 
   AUDIO_DEBUG("开始播放 (%zu 帧)", frames);
 
   memcpy(ctx->play_buf, data, frames * frame_bytes);
+  audio_apply_chunk_fade(ctx, frames);
 
   return audio_play_begin(ctx, frames, callback, user_data);
 }
@@ -1085,6 +1431,10 @@ int audio_play_file(audio_context_t *ctx,
       return -EINVAL;
     }
 
+  /* 和 audio_play_start 一样：分块边界上做淡入淡出，消除"每块一个啪" */
+
+  audio_apply_chunk_fade(ctx, frames);
+
   /* 半双工：确认文件能放了，再停录音（播完会自动恢复） */
 
   audio_prepare_output(ctx);
@@ -1111,25 +1461,24 @@ void audio_play_stop(audio_context_t *ctx)
    * 这里**不能**替它 ioctl(STOP)/close —— 那是跨任务碰 fd。
    * 让设备停下来的办法是置 play_stop：线程每 AUDIO_PLAY_CHUNK_MS 一块
    * 同步 write，写完一块就会看到标志、由它自己 ioctl(STOP)+close 后退出。
-   * 最坏等一块 + 驱动内部的等待余量（约 600ms），不会长时间卡死。 */
+   *
+   * 阻塞时长（AUDIO_PLAY_CHUNK_MS = 250 时）：
+   *   - 常规：等到当前这块放完为止，≤ 250 ms，平均约 125 ms；
+   *   - 驱动异常（DMA 完成中断没来）：write() 自己的等待上限
+   *     一块 + 500 ms = 750 ms，然后照样退出来。
+   * 真等不到（设备那一侧卡住了）由 audio_reap_play_thread() 兜底：放弃 join、
+   * 留一行日志，不改"等不到就永远等"那条路。（本函数有两条路径是在
+   * hello_app 的设备动作权锁里被调的，见那个函数的说明。）
+   * 把块改小（100 ms）打断更跟手，代价是块边界的爆音更密，
+   * 取舍说明见文件头部 AUDIO_PLAY_CHUNK_MS 那里。 */
 
   ctx->play_stop = true;
 
-  if (ctx->play_thread_valid)
-    {
-      /* 和录音一样：如果是从播放线程自己里调的（播放完成回调里又调 stop），
-       * 不能 join 自己；线程返回前会自己判断 play_stop 决定是否再回调。 */
+  /* 和录音一样：如果是从播放线程自己里调的（播放完成回调里又调 stop），
+   * 不能 join 自己；线程返回前会自己判断 play_stop 决定是否再回调。
+   * 这两种情况都在 audio_reap_play_thread() 里判。 */
 
-      if (pthread_equal(pthread_self(), ctx->play_thread))
-        {
-          AUDIO_DEBUG("在播放线程里调 stop，跳过 join");
-        }
-      else
-        {
-          pthread_join(ctx->play_thread, NULL);
-          ctx->play_thread_valid = false;
-        }
-    }
+  audio_reap_play_thread(ctx, "stop");
 
   ctx->playing = false;
 
@@ -1145,6 +1494,24 @@ void audio_play_stop(audio_context_t *ctx)
 bool audio_is_playing(audio_context_t *ctx)
 {
   return (ctx != NULL) ? ctx->playing : false;
+}
+
+/**
+ * @brief  上一次播放到底出没出声（见 ai_audio.h 的完整说明）
+ *
+ * 实现就是读播放线程写下的那个字段：写的人在完成回调之前写定，读的人在回调
+ * 之后读（robot_ui/main.c 的 reminder_play_exclusive 就是这么用的），所以不需要
+ * 额外加锁；volatile 只保证编译器每次都真去读内存（不要缓存进寄存器）。
+ */
+
+int audio_play_last_result(const audio_context_t *ctx)
+{
+  if (ctx == NULL)
+    {
+      return -EINVAL;
+    }
+
+  return ctx->play_last_result;
 }
 
 /**

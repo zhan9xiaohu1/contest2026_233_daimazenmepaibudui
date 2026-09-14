@@ -29,6 +29,24 @@
 #define AI_MQTT_DEFAULT_PORT       1883
 #define AI_MQTT_DEFAULT_CLIENT_ID  "zhi_ai_001"
 
+/* 回传给界面的命令动作名（robot_ui 的 on_ai_command_received() 认这几个） */
+#define AI_CMD_ACTION_AI_REPLY     "ai_reply"     /* param = 要显示的文字 */
+#define AI_CMD_ACTION_SET_FACE     "set_face"     /* param = 表情名 */
+#define AI_CMD_ACTION_START_ALARM  "start_alarm"  /* param = 报警页上的文字 */
+
+/* set_face 的表情名 */
+#define AI_CMD_FACE_HAPPY          "happy"
+#define AI_CMD_FACE_THINKING       "thinking"
+#define AI_CMD_FACE_WORRIED        "worried"
+
+/* 一条命令里 param 最多放多少字节（JSON 转义前的上限，超出截断） */
+#define AI_CMD_PARAM_MAX           512
+
+/* 复用已有 MQTT 连接时的等待时长（毫秒）：
+ * 界面（robot_ui）的 network_task 会自己连 broker，先等它一会儿，
+ * 免得两边各开一条同 client_id 的连接。详见 ai_network_start_shared()。 */
+#define AI_MQTT_SHARED_WAIT_MS     3000
+
 /* 心跳间隔(毫秒) */
 #define AI_HEARTBEAT_INTERVAL_MS   30000
 
@@ -319,5 +337,79 @@ int ai_network_send_alarm(ai_network_context_t *ctx,
 
 int ai_network_send_device_command(ai_network_context_t *ctx,
                                    const char *device_id, const char *command);
+
+/****************************************************************************
+ * 结果回传（语音入口在框架侧之后，界面只认 MQTT，需要下面这组接口）
+ ****************************************************************************/
+
+/**
+ * @brief  接上网络并把 AI 的结果回传给界面
+ *
+ * 和 ai_network_init() 的区别：network_comm.c 在一个固件里只有一份实例，
+ * 界面（robot_ui）的 network_task 已经拥有那条 MQTT socket。
+ * 所以这里**不重跑 network_comm_init()、不抢回调、不重复订阅**，
+ * 只在没人连的时候兜底连一次，之后所有 publish 都走那条共用连接。
+ *
+ * @param  ctx        网络上下文
+ * @param  client_id  MQTT 客户端 ID（决定 publish 的主题），NULL/空串用默认值
+ * @return 0 成功(含"已经在连"的情况), 负值失败
+ */
+
+int ai_network_start_shared(ai_network_context_t *ctx, const char *client_id);
+
+/**
+ * @brief  改 client_id（主题名跟着变，要在 publish 之前调）
+ * @param  ctx        网络上下文
+ * @param  client_id  新的客户端 ID，NULL/空串回落默认值
+ * @return 0 成功, 负值失败(太长)
+ */
+
+int ai_network_set_client_id(ai_network_context_t *ctx, const char *client_id);
+
+/**
+ * @brief  取当前 client_id
+ * @param  ctx  网络上下文
+ * @return 字符串（ctx 为空时返回默认值）
+ */
+
+const char *ai_network_get_client_id(ai_network_context_t *ctx);
+
+/**
+ * @brief  往 zhi_ai/<client_id>/command 发一条 {action, param}
+ * @param  ctx     网络上下文
+ * @param  action  动作名，见 AI_CMD_ACTION_*
+ * @param  param   参数（UTF-8 文本，超长截断；NULL 当空串）
+ * @return 0 成功, -ENOTCONN 没连上, 负值失败
+ */
+
+int ai_network_publish_command(ai_network_context_t *ctx,
+                               const char *action, const char *param);
+
+/**
+ * @brief  把 AI 回复正文发给界面显示（action=ai_reply）
+ * @param  ctx   网络上下文
+ * @param  text  回复正文
+ * @return 0 成功, 负值失败
+ */
+
+int ai_network_send_ai_reply(ai_network_context_t *ctx, const char *text);
+
+/**
+ * @brief  让界面换个表情（action=set_face）
+ * @param  ctx   网络上下文
+ * @param  face  表情名，见 AI_CMD_FACE_*
+ * @return 0 成功, 负值失败
+ */
+
+int ai_network_send_face(ai_network_context_t *ctx, const char *face);
+
+/**
+ * @brief  让界面弹报警页（action=start_alarm）
+ * @param  ctx   网络上下文
+ * @param  text  报警页上的文字
+ * @return 0 成功, 负值失败
+ */
+
+int ai_network_send_start_alarm(ai_network_context_t *ctx, const char *text);
 
 #endif /* AI_NETWORK_H */

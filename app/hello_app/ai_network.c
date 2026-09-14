@@ -768,3 +768,345 @@ int ai_network_send_device_command(ai_network_context_t *ctx,
   /* 调用 network_comm 发送设备命令 */
   return send_device_command(device_id, command);
 }
+
+/****************************************************************************
+ * 结果回传：publish 到 zhi_ai/<client_id>/command (W1)
+ *
+ * 背景：语音入口统一到框架侧（ai_companion）之后，界面 robot_ui 不再开麦，
+ * 只认 MQTT。所以"要显示的东西"（AI 回复正文、表情、报警页）都从这里发出去。
+ *
+ * 一个必须知道的事实：network_comm.c 会被编进**同一个固件**，
+ * 界面那边（robot_ui）和这里用的是同一份 mqtt_config / mqtt_socket。
+ * 所以这里刻意做得很保守：
+ *   - 不调 network_comm_init()（它会把界面那边已配好的状态 memset 掉）；
+ *   - 不调 network_set_mqtt_callback()（MQTT 收包回调只有一个槽，
+ *     占了它就等于把界面的 ai_reply 派发顶掉，界面再也收不到消息）；
+ *   - 不重复订阅（界面 mqtt_connect() 里已经订阅了 command 主题）。
+ ****************************************************************************/
+
+/**
+ * @brief  把一段 UTF-8 文本转成能塞进 JSON 字符串的字节
+ *
+ * 只转义 JSON 必须转义的（" 和 \），把换行/制表压成空格，丢掉其余控制字符；
+ * 中文等 UTF-8 多字节序列原样透传。截断落在某段 UTF-8 序列中间时，
+ * 把这段不完整的字节丢掉 —— 界面是直接拿去显示的，半个字会变方块。
+ *
+ * @param  in        输入（NULL 当空串）
+ * @param  out       输出缓冲
+ * @param  out_size  输出缓冲大小（含结尾 '\0'）
+ * @return 写进 out 的字节数（不含结尾 '\0'）
+ */
+
+static size_t ai_network_json_escape(const char *in, char *out, size_t out_size)
+{
+  const unsigned char *p = (const unsigned char *)(in != NULL ? in : "");
+  size_t n = 0;
+  size_t i;
+
+  if (out_size == 0)
+    {
+      return 0;
+    }
+
+  while (*p != '\0')
+    {
+      unsigned char c = *p;
+      size_t seq;      /* 这个字符占几个输入字节 */
+      size_t need;     /* 转义后占几个输出字节 */
+
+      if (c == '"' || c == '\\')
+        {
+          seq = 1;
+          need = 2;
+        }
+      else if (c == '\n' || c == '\r' || c == '\t')
+        {
+          seq = 1;
+          need = 1;
+        }
+      else if (c < 0x20 || c == 0x7f)
+        {
+          seq = 1;
+          need = 0;    /* 其余控制字符直接丢 */
+        }
+      else if ((c & 0x80) == 0x00)
+        {
+          seq = 1;
+          need = 1;
+        }
+      else if ((c & 0xe0) == 0xc0)
+        {
+          seq = 2;
+          need = 2;
+        }
+      else if ((c & 0xf0) == 0xe0)
+        {
+          seq = 3;
+          need = 3;
+        }
+      else if ((c & 0xf8) == 0xf0)
+        {
+          seq = 4;
+          need = 4;
+        }
+      else
+        {
+          seq = 1;
+          need = 0;    /* 非法首字节 */
+        }
+
+      /* 多字节序列必须凑齐续字节，否则说明尾巴被截断了 */
+      for (i = 1; i < seq; i++)
+        {
+          if ((p[i] & 0xc0) != 0x80)
+            {
+              seq = 0;
+              break;
+            }
+        }
+
+      if (seq == 0 || n + need + 1 > out_size)
+        {
+          break;
+        }
+
+      if (need == 2)
+        {
+          out[n++] = '\\';
+        }
+
+      if (need != 0)
+        {
+          if (c == '\n' || c == '\r' || c == '\t')
+            {
+              out[n++] = ' ';
+            }
+          else
+            {
+              memcpy(&out[n], p, seq);
+              n += seq;
+            }
+        }
+
+      p += seq;
+    }
+
+  out[n] = '\0';
+  return n;
+}
+
+/**
+ * @brief  改 client_id
+ */
+
+int ai_network_set_client_id(ai_network_context_t *ctx, const char *client_id)
+{
+  if (ctx == NULL)
+    {
+      return -EINVAL;
+    }
+
+  if (client_id == NULL || client_id[0] == '\0')
+    {
+      client_id = AI_MQTT_DEFAULT_CLIENT_ID;
+    }
+
+  if (strlen(client_id) >= sizeof(ctx->config.mqtt_client_id))
+    {
+      ai_network_err("client_id 太长: %s", client_id);
+      return -EINVAL;
+    }
+
+  strncpy(ctx->config.mqtt_client_id, client_id,
+          sizeof(ctx->config.mqtt_client_id) - 1);
+  ctx->config.mqtt_client_id[sizeof(ctx->config.mqtt_client_id) - 1] = '\0';
+
+  return OK;
+}
+
+/**
+ * @brief  取当前 client_id
+ */
+
+const char *ai_network_get_client_id(ai_network_context_t *ctx)
+{
+  if (ctx == NULL || ctx->config.mqtt_client_id[0] == '\0')
+    {
+      return AI_MQTT_DEFAULT_CLIENT_ID;
+    }
+
+  return ctx->config.mqtt_client_id;
+}
+
+/**
+ * @brief  接上网络（复用界面已经建好的那条连接，没人管时兜底连一次）
+ */
+
+int ai_network_start_shared(ai_network_context_t *ctx, const char *client_id)
+{
+  int ret;
+  int i_;
+
+  if (ctx == NULL)
+    {
+      return -EINVAL;
+    }
+
+  /* 只清自己的上下文，不碰 network_comm 的全局状态 */
+
+  memset(ctx, 0, sizeof(ai_network_context_t));
+
+  ctx->config.mqtt_port = AI_MQTT_DEFAULT_PORT;
+  strncpy(ctx->config.mqtt_broker, AI_MQTT_DEFAULT_BROKER,
+          sizeof(ctx->config.mqtt_broker) - 1);
+
+  ret = ai_network_set_client_id(ctx, client_id);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ctx->state = AI_NET_STATE_IDLE;
+  ctx->initialized = true;
+
+  /* 已经连着（界面那边的 network_task 连的）：直接复用，别再开第二条。
+   * 两个 client_id 相同的连接同时挂在一个 broker 上，broker 会把先来的踢掉。 */
+
+  if (ai_network_is_mqtt_connected(ctx))
+    {
+      ctx->state = AI_NET_STATE_MQTT_CONNECTED;
+      ai_network_info("复用已有的 MQTT 连接, client_id=%s",
+                      ai_network_get_client_id(ctx));
+      return OK;
+    }
+
+  /* 界面（robot_ui）在不在？
+   * 本板走 USB RNDIS，wifi_connect() 在这个板级配置下只是把"已联网"标志置上
+   * （和 robot_ui/main.c 的写法一致），不调用它 MQTT 那边会因为"WiFi 未连接"
+   * 直接拒绝连接。
+   * 这个标志顺带还是个"界面来过"的信号：界面一开机就调它、别的地方都不调，
+   * 所以我们自己单跑时它是 false。 */
+
+  if (!ai_network_is_wifi_connected(ctx))
+    {
+      /* 只有自己在跑：没人会去连 MQTT，直接连，不用等 */
+
+      wifi_connect("RNDIS", "");
+    }
+  else
+    {
+      /* 界面在跑：它的 network_task 开机后第一轮就会去连 MQTT，
+       * 先等它一会儿，别跟它抢同一条 client_id 的连接。 */
+
+      for (i_ = 0; i_ < AI_MQTT_SHARED_WAIT_MS / 100; i_++)
+        {
+          if (ai_network_is_mqtt_connected(ctx))
+            {
+              ctx->state = AI_NET_STATE_MQTT_CONNECTED;
+              ai_network_info("等到了界面建立的 MQTT 连接, client_id=%s",
+                              ai_network_get_client_id(ctx));
+              return OK;
+            }
+
+          usleep(100000);
+        }
+    }
+
+  /* 没人管连接（比如只跑了 ai_companion，没起界面）：自己兜底连一次。
+   * 注意 socket 建起来之后，收包/重连仍然是界面的 network_task 在做；
+   * 只跑 ai_companion 时没人收包（命令主题收不到），但回传照样能发。 */
+
+  ai_network_info("自己建立 MQTT 连接, client_id=%s",
+                  ai_network_get_client_id(ctx));
+  ret = ai_network_connect_mqtt(ctx);
+  if (ret < 0)
+    {
+      ai_network_err("连接 MQTT 失败: %d", ret);
+      return ret;
+    }
+
+  return OK;
+}
+
+/**
+ * @brief  往 zhi_ai/<client_id>/command 发一条 {action, param}
+ */
+
+int ai_network_publish_command(ai_network_context_t *ctx,
+                               const char *action, const char *param)
+{
+  char topic[128];
+  char escaped[AI_CMD_PARAM_MAX];
+  char payload[AI_CMD_PARAM_MAX + 64];
+  int ret;
+
+  if (ctx == NULL || action == NULL || action[0] == '\0')
+    {
+      return -EINVAL;
+    }
+
+  if (!ai_network_is_mqtt_connected(ctx))
+    {
+      ai_network_warn("MQTT 未连接，命令发不出去: action=%s", action);
+      return -ENOTCONN;
+    }
+
+  if (ai_network_json_escape(param, escaped, sizeof(escaped)) == 0
+      && param != NULL && param[0] != '\0')
+    {
+      ai_network_warn("命令参数放不下或不可显示，已丢空: action=%s", action);
+    }
+
+  snprintf(payload, sizeof(payload), "{\"action\":\"%s\",\"param\":\"%s\"}",
+           action, escaped);
+  snprintf(topic, sizeof(topic), AI_MQTT_TOPIC_COMMAND,
+           ai_network_get_client_id(ctx));
+
+  ret = mqtt_publish(topic, payload, 0, false);
+  if (ret < 0)
+    {
+      ai_network_err("命令下发失败: %s -> %d", topic, ret);
+      return ret;
+    }
+
+  ai_network_info("命令已下发: %s %s", topic, payload);
+  return OK;
+}
+
+/**
+ * @brief  把 AI 回复正文发给界面显示
+ */
+
+int ai_network_send_ai_reply(ai_network_context_t *ctx, const char *text)
+{
+  if (text == NULL || text[0] == '\0')
+    {
+      return -EINVAL;
+    }
+
+  return ai_network_publish_command(ctx, AI_CMD_ACTION_AI_REPLY, text);
+}
+
+/**
+ * @brief  让界面换个表情
+ */
+
+int ai_network_send_face(ai_network_context_t *ctx, const char *face)
+{
+  if (face == NULL || face[0] == '\0')
+    {
+      return -EINVAL;
+    }
+
+  return ai_network_publish_command(ctx, AI_CMD_ACTION_SET_FACE, face);
+}
+
+/**
+ * @brief  让界面弹报警页
+ */
+
+int ai_network_send_start_alarm(ai_network_context_t *ctx, const char *text)
+{
+  return ai_network_publish_command(ctx, AI_CMD_ACTION_START_ALARM,
+                                    text != NULL ? text : "");
+}

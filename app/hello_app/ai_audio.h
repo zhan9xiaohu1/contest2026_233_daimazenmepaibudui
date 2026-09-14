@@ -40,7 +40,26 @@
 /* 注意: 16000Hz * 20ms = 320 帧, 缓冲必须能容纳一个帧周期的数据 */
 #define AUDIO_RECORD_BUF_FRAMES      640     /* 录音缓冲帧数 (640=40ms@16kHz, 留余量) */
 #define AUDIO_PLAY_BUF_FRAMES        80      /* 播放缓冲帧数 (80*20ms=1.6秒) */
-#define AUDIO_PLAY_BUFFER_MS         8000    /* 最大缓存8秒（与 tts_buf 的 256 KB 对齐，否则 5~8 秒的 TTS 报 -ENOSPC 一声不响） */
+
+/* 单次播放的时长上限（audio_play_start / audio_play_file 超过它就返回 -ENOSPC，不截断）。
+ *
+ * 30 秒 @16k 单声道 16bit = 16000 × 1 × 2 × 30 = 960000 字节 ≈ 938 KiB **堆**分配，
+ * 而且是在 audio_init() 里一次性分配、**常驻**（原来是 8 秒 / 256 KB）。
+ * 真机 heap_info 约 8.65 MB 堆、空闲 7.27 MB（见 docs/ai_agent_usage.md 第 7 节），
+ * 多这 700 KB 没问题。
+ *
+ * 为什么是 30 秒（这里有个取舍）：
+ *   - 提醒语音最长 6 秒、要念两遍 = 12 秒，8 秒的旧上限会让第二遍直接 -ENOSPC
+ *     （上层表现是"一声不响"）；
+ *   - 云端 TTS 是**分块合成**的（见 mimo_voice.c），300 字的长回复 ≈ 66 秒，
+ *     全放下要 2.1 MB；play_buf 是常驻的，再往上抬等于白占内存。
+ *     所以取 30 秒（≈130 字）覆盖绝大多数回复，更长的在 TTS 那层按"装不下多少
+ *     就念多少"截断并打日志（不会失败，也不会静默）。
+ *   想更长：这里的 AUDIO_PLAY_BUFFER_MS 和 app/robot_ui/main.c 的
+ *   VOICE_TTS_BUF_BYTES **必须一起改**（后者要 ≥ 16000 × 2 × 秒数），
+ *   否则只是把 -ENOSPC 从播放层挪到 TTS 缓冲那层。 */
+
+#define AUDIO_PLAY_BUFFER_MS         30000
 
 /* VAD (Voice Activity Detection) 参数 */
 #define AUDIO_VAD_ENERGY_THRESHOLD   500     /* 能量阈值 */
@@ -140,6 +159,7 @@ typedef struct
   volatile bool       record_stop;    /* 停止录音标志 */
   bool                record_thread_valid; /* 录音线程需要回收 */
   volatile bool       record_exited;  /* 录音线程已跑完（收尾用，见 audio_record_stop） */
+  volatile bool       record_died;    /* 录音异常中断（不是谁让它停的） */
 
   /* 播放相关 */
   bool                playing;        /* 是否正在播放 */
@@ -151,6 +171,17 @@ typedef struct
   volatile bool       play_stop;      /* 停止播放标志 */
   size_t              play_frames;    /* 当前播放帧数 */
   bool                play_thread_valid; /* 播放线程需要回收 */
+  volatile bool       play_exited;    /* 播放线程已跑完（回收用，见 audio_reap_play_thread）
+                                       * 语义和 record_exited 完全对称：线程最后一步才置位。
+                                       * 为什么要它：NuttX 的 pthread_join 没有超时参数，
+                                       * 裸 join 一旦线程卡在设备里就是永久等待；而这条 join
+                                       * 有几条路径是在"设备动作权"那把锁里做的（起播与让路
+                                       * 互斥，见 ai_companion_main.c 的 g_mic_device_lock），
+                                       * 永久等待会把整个 hello_app 主循环一起钉住。所以回收
+                                       * 改成"有界轮询这个位 + 放弃 + 日志"。 */
+  volatile int        play_last_result; /* 上一次播放的结果：0=整段放完，负值=没出声的原因
+                                         * （-EINPROGRESS=这次还没结束）。只由播放线程写，
+                                         * 读的人请用 audio_play_last_result()，语义见那里。 */
   bool                record_resume_on_play_end; /* 播放是为它停的录音，播完恢复 */
 
   /* VAD相关 */
@@ -217,6 +248,30 @@ void audio_record_stop(audio_context_t *ctx);
 bool audio_is_recording(audio_context_t *ctx);
 
 /**
+ * @brief  录音这条链路是不是真的还活着（录音线程仍在跑）
+ * @param  ctx: 音频上下文指针
+ * @return true设备已 START 且录音线程仍在, false线程已退出/正在停/从未启动
+ *
+ * 给上层的"监听守护"用：audio_is_recording() 只说明 process 认为在录，
+ * 录音线程因为驱动 AUDIOIOC_STOP 或下层 5 秒 DMA 超时（audio_in_read
+ * 返回 0 / -110）自己跳出循环之后，它同样会（并且只来得及）把
+ * recording 置 false，但线程退出与 record_stop 的中间状态只有本函数能分清。
+ * 注意它看不穿驱动：驱动把通路 STOP 掉、而线程还阻塞在 read 里的那一段
+ * （最长下层那 5 秒）仍算"活着"。
+ *
+ * 配套的 ctx->record_died 回答的是另一个问题："线程为什么退出的"：
+ *   - false：线程是被 audio_record_stop() 停的（正常收尾，含放音前的半双工
+ *     让路），或者根本没死 —— 上层按退避重开就行；
+ *   - true ：没人要求停，read 自己返回了 0 / 负值（驱动 STOP 了通路、DMA
+ *     超时、或者设备被别的会话抢走）。这一代录音会话**不会再回来**了，上层
+ *     该立刻重开，而不是等状态机 / 守护自己的超时。
+ * 它是"一次性事件"标志：由 ai_audio 置位、由**上层认领后自己清掉**
+ * （audio_record_start() 起新一代线程时也会清）。
+ */
+
+bool audio_record_is_active(const audio_context_t *ctx);
+
+/**
  * @brief  开始播放音频数据
  * @param  ctx: 音频上下文指针
  * @param  data: 音频数据（16k/单声道/s16le）
@@ -232,6 +287,11 @@ bool audio_is_recording(audio_context_t *ctx);
  * 删掉 ai_audio.c 播放线程末尾那段"恢复录音"即可。
  * data 超过播放缓冲（AUDIO_PLAY_BUFFER_MS）返回 -ENOSPC，不截断。
  * 实际出声由播放线程完成（本线程自己 open/write/close 设备）。
+ *
+ * ⚠️ 本函数返回 0 只代表"数据拷进去了、播放线程起来了"，**不代表会出声**
+ *    （设备/START 都要到播放线程里才动）。而完成回调的语义是"播放线程收尾了"，
+ *    设备打不开、START 被 -EBUSY 拒掉、写失败时同样会回调 —— 回调被调用**不等于**
+ *    有声音。要知道"这次到底出声没有"，读 audio_play_last_result()。
  */
 
 int audio_play_start(audio_context_t *ctx,
@@ -270,6 +330,33 @@ void audio_play_stop(audio_context_t *ctx);
  */
 
 bool audio_is_playing(audio_context_t *ctx);
+
+/**
+ * @brief  上一次播放到底出没出声
+ * @param  ctx: 音频上下文指针
+ * @return 0 = 整段都写进了设备、正常放完（真出声）；
+ *         -EINPROGRESS = 这一次播放还没结束（刚开始，或者正在放、还没写满）；
+ *         其他负值 = 没出声的原因，就是播放层记下的错误码
+ *                    （-EBUSY: START 被驱动拒掉；-EIO: 写设备失败；
+ *                     -errno: 设备打不开；-ECANCELED: 中途被 stop。按 0 以外皆为"不可信"处理即可）。
+ *
+ * 为什么需要它（播放完成回调回答不了这个问题）：
+ *   audio_play_start() 只是 memcpy + pthread_create 就返回，真正
+ *   open/CONFIGURE/START/write 全在播放线程里；而**完成回调的语义是"播放线程收尾了"，
+ *   不是"声音出来了"** —— START 被驱动以 -EBUSY 拒掉（半双工，另一方向的会话正占着
+ *   通路）、write() 返回 <= 0 时，播放线程照样走到末尾并且照样回调，为的是让上层状态机
+ *   （hello_app 的 TTS 播报）不会永远等一个不会来的完成事件。所以"回调被调了"和
+ *   "有声音"是两件事，只有本接口能区分。
+ *   回调语义保持原样（有人靠它推状态机），本接口是**加**出来的旁路信息。
+ *
+ * 谁写：ai_audio.c 的播放线程（唯一写入者），写在完成回调**之前** ——
+ *       所以回调里/回调返回后读到的都是最终值。
+ * 谁读：robot_ui/main.c 的 reminder_play_exclusive()（判"这声铃到底响没响"）。
+ * 为什么不直接把 ctx->play_last_result 字段暴露给上层：那是写入方的私有物，
+ *       读取方只该认这个语义（以后加错误码、改判据只动一处），而且本函数对 NULL 安全。
+ */
+
+int audio_play_last_result(const audio_context_t *ctx);
 
 /**
  * @brief  设置音量

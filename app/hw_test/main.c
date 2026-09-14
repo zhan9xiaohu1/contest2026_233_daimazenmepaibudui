@@ -22,6 +22,14 @@
  *                            超时是 FAIL —— 单独运行
  *   hw_test status           打印统一外设状态（board_status_get）：网络拿
  *                            到 IPv4 地址才算 PASS，其它设备只提示 —— 单独运行
+ *   hw_test kws enroll <slot> [秒]  录唤醒词模板（命令词识别，MFCC+DTW）：
+ *                            slot 0..3（0=「你好，openvela」、1=「Hello，openvela」），
+ *                            秒数默认 4（钳到 2..8），存 /data/kws/slotN.tpl
+ *                            —— 单独运行，且必须先停掉 ai_companion
+ *   hw_test kws test         打印唤醒词模板数 / 阈值 / 每个槽位是否可用
+ *                            —— 单独运行
+ *   hw_test kws live [秒]    实时听唤醒词，命中就打一行（默认 10 秒）
+ *                            —— 单独运行，且必须先停掉 ai_companion
  *
  * 设计约定：
  *   - 每一步失败都只打印 FAIL，不中断后面的步骤，也不会卡死
@@ -31,6 +39,9 @@
  *     设 alarm、开麦克风、响喇叭、等按键），所以放在子命令里；而且它们
  *     **不跑**上面那套 5 步自检，只跑自己，免得每次验 IMU 还要先等
  *     10 秒触摸 + 5 秒按键
+ *   - kws 三条子命令都要**独占麦克风**：本板半双工，且整机是单一大镜像
+ *     （ai_companion 开机自启后会一直持有麦克风），所以跑之前必须先停掉
+ *     ai_companion，否则 audio_in_start() 直接 -EBUSY
  *   - 默认自检里的按键步骤是"非交互"的（没人按也算 PASS，只证明能读）；
  *     要真的验证按键，跑 `hw_test button`，它超时会 FAIL
  *   - **按键一律走板级 GPIO 模块 `sf32lb52_boardbtn`，不碰 /dev/buttons**：
@@ -97,6 +108,17 @@
 #  include "voice/voice_asr.h"
 #  include "voice/voice_tts.h"
 #  include "mimo_voice.h"
+#endif
+
+/* 唤醒词自检（kws 子命令）要用 hello_app 的命令词识别模块 kws_dtw.c：
+ * 它只在 hello_app 被编进固件时才有符号，而 hw_test 的 CMakeLists 里已经用
+ * `../hello_app` 拿到了头文件（跨 app 的符号在最终链接时解析 —— 和 tts/asr
+ * 借 hello_app 的 MiMo 后端是同一套做法），所以这里判一下总开关：
+ * 没开 hello_app 时 kws 子命令只打印"本配置不支持"，其余子命令不受影响。 */
+
+#if defined(CONFIG_LVX_USE_CONTEST2026_233_HELLO_APP)
+#  define HW_TEST_HAS_KWS 1
+#  include "kws_dtw.h"
 #endif
 
 /* IMU：本板的 LSM6DS3 走的是 NuttX **老式字符驱动**（不是 uORB），
@@ -200,6 +222,38 @@
 
 #define BTN_DEFAULT_WAIT_SEC  15    /* 默认等待秒数 */
 
+/* kws 子命令（唤醒词「你好，openvela」/「Hello，openvela」的命令词识别，
+ * 模块本体在 app/hello_app/kws_dtw.c）。
+ *
+ * 模板落盘约定（见 kws_dtw.h）：/data/kws/slotN.tpl，N = 0..3，
+ * 其中 slot0 =「你好，openvela」、slot1 =「Hello，openvela」。
+ * ⚠ 本板 /data 是 tmpfs —— 重启就丢，要长期保留得靠别的手段搬走/重录。
+ *
+ * ⚠ 半双工 + 单一大镜像：ai_companion 开机自启后会一直持有麦克风（听唤醒词），
+ *   所以跑 kws 子命令之前必须先把它停掉，否则 audio_in_start() 直接 -EBUSY。 */
+
+#define KWS_ENROLL_DEFAULT_SEC 4    /* 录模板默认时长；1~2 秒的短语 + 尾静音够用 */
+#define KWS_ENROLL_MIN_SEC     2    /* 再短就可能把短语截掉，录出个残模板 */
+#define KWS_ENROLL_MAX_SEC     8    /* 再长没意义（整句上限 2 秒），而且缓冲会变大：
+                                     * 8 秒 = 256 KB，和 TTS 缓冲同量级（那一块
+                                     * 在真机上分得到） */
+#define KWS_LIVE_DEFAULT_SEC   10   /* kws live 默认听多久 */
+#define KWS_LIVE_MAX_SEC       30   /* 最长听多久：别把唯一的麦克风占太久 */
+#define KWS_PREP_SEC           3    /* 录音前的准备时间（数 3..1 再开始录） */
+
+/* 100ms 一块：远小于封装建议的 1 秒上限，而且 live 模式喂帧的粒度就是它
+ * （拆成 1 秒一块的话，命中最多要等 1 秒才报出来） */
+
+#define KWS_READ_CHUNK_BYTES   (AUDIO_SAMPLE_RATE * 2 / 10)
+#define KWS_READ_TASK_STACK    4096   /* 同 AUDIO_READ_TASK_STACK */
+
+/* kws 子命令的三种动作（main 解析参数时用；0 = 没选 kws） */
+
+#define KWS_CMD_NONE   0
+#define KWS_CMD_ENROLL 1
+#define KWS_CMD_TEST   2
+#define KWS_CMD_LIVE   3
+
 /****************************************************************************
  * Private Types
  ****************************************************************************/
@@ -229,6 +283,21 @@ static volatile int     g_arec_done;
 static volatile ssize_t g_arec_n;
 static FAR int16_t     *g_arec_buf;
 static int              g_arec_len;
+
+/* kws 子命令：录音读任务和主任务之间的交接状态。
+ * 和 audio 子命令同一套写法（task_create 只能带一个参数，所以用文件级全局 +
+ * volatile 标志）。g_krec_buf 只在 enroll 模式（整段 PCM 要交给 kws_enroll）
+ * 里用 malloc 拿；live 模式用下面那块静态缓冲边读边喂，不攒 PCM。 */
+
+static volatile int  g_krec_done;    /* 读任务结束 */
+static volatile int  g_krec_got;     /* 已读字节数 */
+static volatile int  g_krec_err;     /* 读任务停下时 read 的返回值 */
+static volatile int  g_krec_hits;    /* live 模式：命中次数（每命中一次打一行） */
+static FAR int16_t  *g_krec_buf;     /* enroll 模式：攒 PCM 的缓冲（live 模式为 NULL） */
+static int           g_krec_len;     /* 一共要读多少字节 */
+static int           g_krec_live;    /* 1 = 边读边喂 kws_feed */
+
+static int16_t g_krec_live_buf[AUDIO_SAMPLE_RATE / 10];   /* 100ms（KWS_READ_CHUNK_BYTES） */
 
 /* alarm 子命令：模块工作线程里回调，这里只累计事件给主任务打印 */
 
@@ -340,6 +409,16 @@ static void usage(void)
          "（要联网 + 配好 api_key/llm_host，单独运行）\n");
   printf("  hw_test asr <文件>   读一个 WAV（16bit PCM，采样率不限，内部转 16k）"
          "做 MiMo 云端语音识别并打印结果（单独运行）\n");
+  printf("  hw_test kws enroll <slot> [秒]  录唤醒词模板：slot 0..3"
+         "（0=「你好，openvela」、1=「Hello，openvela」），秒数默认 4（2..8），"
+         "存到 /data/kws/slotN.tpl（单独运行）\n");
+  printf("  hw_test kws test     打印唤醒词模板数/阈值/每个槽位是否可用"
+         "（单独运行）\n");
+  printf("  hw_test kws live [秒]  实时听唤醒词，命中就打一行，默认 10 秒"
+         "（单独运行）\n");
+  printf("      注意：kws 三条都要独占麦克风 —— ai_companion 开机自启后会一直"
+         "持有它（半双工），\n"
+         "            跑之前必须先停掉 ai_companion，否则 audio_in_start 直接 -EBUSY\n");
 }
 
 /****************************************************************************
@@ -1847,6 +1926,636 @@ static int step_audio(int seconds)
 }
 
 /****************************************************************************
+ * kws 子命令：唤醒词「你好，openvela」/「Hello，openvela」的命令词识别
+ *            （MFCC + DTW，模块本体在 app/hello_app/kws_dtw.c）
+ *
+ * 模块本身是纯计算：不开麦、不起线程、不碰设备。所以"录模板"这一步必须由
+ * 外面来做 —— 就是这里：用板级录音封装（sf32lb52_audio_in，和 audio 子命令
+ * 同一套）把 PCM 录出来交给 kws_enroll()。**本子命令是唯一的录模板入口**，
+ * 没有它，唤醒词功能等于开不了。
+ *
+ * 模板约定（kws_dtw.h）：/data/kws/slotN.tpl，N = 0..3，
+ *   slot0 =「你好，openvela」、slot1 =「Hello，openvela」（slot2/3 空着备用）。
+ * ⚠ /data 是 tmpfs：模板重启就丢，长期保留得把它搬走或重新录。
+ *
+ * ⚠ 麦克风是半双工、整机又是单一大镜像：ai_companion 开机自启后会一直持有
+ *   麦克风（听唤醒词），而且它和这里共享 kws_dtw 的全局状态（模块没有锁，
+ *   见 .h 的"线程安全"）。所以跑 kws 子命令之前**必须先停掉 ai_companion**，
+ *   否则 audio_in_start() 直接返回 -EBUSY，并且两边同时调 KWS 接口会互相踩。
+ ****************************************************************************/
+
+#ifdef HW_TEST_HAS_KWS
+
+/* 槽位个数必须和 kws_dtw.h 的 KWS_MAX_TEMPLATES 一致（下面按槽位写死了提示词） */
+
+#if KWS_MAX_TEMPLATES != 4
+#  error "kws 槽位提示词表是 4 条，KWS_MAX_TEMPLATES 改了要一起改"
+#endif
+
+/****************************************************************************
+ * Name: kws_slot_word
+ *
+ * Description:
+ *   slot 对应的唤醒词（方便提示用户"这一槽该念什么"）。
+ *   slot2/slot3 是 .h 里留的实验槽（比如改成只念 "openvela"），没有固定词。
+ *
+ ****************************************************************************/
+
+static FAR const char *kws_slot_word(int slot)
+{
+  switch (slot)
+    {
+      case 0:
+        return "你好，openvela";
+
+      case 1:
+        return "Hello，openvela";
+
+      case 2:
+        return "（自定义槽位，想录什么就录什么）";
+
+      case 3:
+        return "（自定义槽位，想录什么就录什么）";
+
+      default:
+        return "（未知槽位）";
+    }
+}
+
+/****************************************************************************
+ * Name: kws_reader_task
+ *
+ * Description:
+ *   kws 子命令的读任务：按 KWS_READ_CHUNK_BYTES（100ms）分块读。
+ *   live 模式顺手在**本任务**里喂 kws_feed（模块没有锁，只允许一个线程调它，
+ *   所以喂帧和 kws_enroll 都在这个线程里，主任务只管计时/收尾）。
+ *
+ ****************************************************************************/
+
+static int kws_reader_task(int argc, FAR char *argv)
+{
+  int offset = 0;
+
+  (void)argc;
+  (void)argv;
+
+  while (offset < g_krec_len)
+    {
+      int chunk = g_krec_len - offset;
+      FAR int16_t *dst;
+      ssize_t n;
+
+      if (chunk > KWS_READ_CHUNK_BYTES)
+        {
+          chunk = KWS_READ_CHUNK_BYTES;
+        }
+
+      if (g_krec_live)
+        {
+          dst = g_krec_live_buf;
+        }
+      else
+        {
+          dst = g_krec_buf + offset / 2;    /* offset 是字节，缓冲按采样点算 */
+        }
+
+      n = audio_in_read((FAR char *)dst, (size_t)chunk);
+
+      if (n <= 0)
+        {
+          /* <=0 必须跳出：0 = 被 STOP 打断或下层 5 秒超时（不是"再读一次
+           * 就有数据"），负值 = fd 已失效（没 start / 已被 stop）。 */
+
+          g_krec_err = (int)n;
+          break;
+        }
+
+      /* kws_feed 的负返回值只有"没初始化(-ENOSYS)/参数非法(-EINVAL)"两种，
+       * 这里前面一定 kws_init 过、参数也是固定的合法 buffer，所以不会发生
+       * （真发生了也只是这一路不喂帧，不影响录音/还设备）。 */
+
+      if (g_krec_live && kws_feed(dst, (size_t)n / 2) == 1)
+        {
+          /* kws_feed 命中时它自己会打一条 "[KWS] 命中唤醒词（slotN…）"，
+           * 这里再补一条带"第几次/第几毫秒"的，方便当验收判据 */
+
+          g_krec_hits++;
+          printf("      [命中] 第 %d 次（已录 %d ms）\n", g_krec_hits,
+                 (int)((long)offset * 1000 / (AUDIO_SAMPLE_RATE * 2)));
+        }
+
+      offset += (int)n;
+    }
+
+  g_krec_got  = offset;
+  g_krec_done = 1;
+  return 0;
+}
+
+/****************************************************************************
+ * Name: kws_record
+ *
+ * Description:
+ *   kws 子命令的录音。live != 0 时边读边喂 kws_feed（不攒 PCM）；
+ *   live == 0 时攒进一块 malloc 的缓冲，由调用方拿去 kws_enroll。
+ *   超时救场和缓冲归属的判断与 step_audio 完全一致（同一套驱动的坑）：
+ *   read 没在预期时间内返回就 audio_in_stop()（它会唤醒阻塞在 read 里的任务），
+ *   读任务真卡死时**故意不释放缓冲**（免得它醒来写已释放内存）。
+ *
+ *   ⚠ 麦克风是单一大镜像里共享的一份全局：**只要 start 成功过，本函数每个
+ *     return 之前都调了 audio_in_stop()**（幂等），一次泄漏就会把后面所有
+ *     录音都锁死。反过来，start 本身失败的路径**故意不调 stop** —— 那意味着
+ *     这次会话不是我们的，stop 会把别人（比如 ai_companion）正在录的会话
+ *     一起 STOP + close 掉；start 自己的失败路径已经把它 open 出来的 fd 关干净。
+ *
+ * Returned Value:
+ *   0 = 录满（*pcm_out 拿到 malloc 的缓冲，调用方负责 free；live 模式给 NULL）；
+ *   -1 = 失败（原因已经打印，设备已经还给板级封装）。
+ *
+ ****************************************************************************/
+
+static int kws_record(int seconds, int live, FAR int16_t **pcm_out)
+{
+  int nsamples = AUDIO_SAMPLE_RATE * seconds;
+  FAR int16_t *buf = NULL;
+  clock_t t0;
+  uint32_t elapsed_ms;
+  int ret;
+
+  *pcm_out = NULL;
+
+  if (!live)
+    {
+      buf = (FAR int16_t *)malloc((size_t)nsamples * sizeof(int16_t));
+      if (buf == NULL)
+        {
+          printf("      malloc %d 字节失败（把录音秒数调小一点再试）\n",
+                 nsamples * 2);
+          return -1;
+        }
+    }
+
+  ret = audio_in_start(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_BITS);
+  if (ret < 0)
+    {
+      printf("      audio_in_start(%d, %d, %d) 失败: %d\n",
+             AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_BITS, ret);
+      printf("      （-EBUSY = 麦克风被别人占着：ai_companion 开机自启后会一直"
+             "持有它，跑 kws 子命令前先停掉它）\n");
+      free(buf);
+      return -1;
+    }
+
+  /* 到这里麦克风才是我们的：下面每个 return 之前都必须 audio_in_stop() */
+
+  g_krec_buf  = buf;
+  g_krec_len  = nsamples * 2;
+  g_krec_live = live;
+  g_krec_done = 0;
+  g_krec_got  = 0;
+  g_krec_err  = 0;
+  g_krec_hits = 0;
+
+  if (task_create("kws_rec", 100, KWS_READ_TASK_STACK,
+                  (main_t)kws_reader_task, NULL) < 0)
+    {
+      printf("      task_create 失败: %d\n", errno);
+      audio_in_stop();
+      free(buf);
+      return -1;
+    }
+
+  /* 计时同样用单调时钟（理由见 step_rtc 里的注释） */
+
+  t0 = clock_systime_ticks();
+  elapsed_ms = 0;
+
+  while (!g_krec_done &&
+         elapsed_ms < (uint32_t)(seconds + AUDIO_WAIT_SLACK_SEC) * 1000)
+    {
+      usleep(100 * 1000);
+      elapsed_ms = (uint32_t)TICK2MSEC(clock_systime_ticks() - t0);
+    }
+
+  if (!g_krec_done)
+    {
+      /* audio_in_stop() 里的 AUDIOIOC_STOP 能让阻塞在 read() 里的任务返回 */
+
+      audio_in_stop();
+      t0 = clock_systime_ticks();
+      while (!g_krec_done &&
+             (uint32_t)TICK2MSEC(clock_systime_ticks() - t0) < 1000)
+        {
+          usleep(100 * 1000);
+        }
+
+      printf("      read 没在 %d 秒内返回，已调 audio_in_stop()\n",
+             seconds + AUDIO_WAIT_SLACK_SEC);
+
+      if (g_krec_done)
+        {
+          free(buf);
+        }
+      else
+        {
+          /* 读任务还活着：**故意不释放缓冲**。它可能仍挂在驱动的 read()
+           * 里持有这块地址，一 free 就是 use-after-free。
+           * fd 已由 audio_in_stop() 关闭，读任务下次进 audio_in_read()
+           * 会直接拿到 -EINVAL 跳出，不会再往这块内存写。
+           * 一次失败的自检，漏一块缓冲是可以接受的代价。 */
+          printf("      （读任务还活着，故意不释放缓冲，避免它醒来写已释放内存）\n");
+        }
+
+      return -1;
+    }
+
+  /* 读任务已经结束（正常或 read 出错），把设备还回去 */
+
+  audio_in_stop();
+  g_krec_buf = NULL;
+
+  if (g_krec_got < g_krec_len)
+    {
+      printf("      只读到 %d/%d 字节（read 返回 %d）\n", (int)g_krec_got,
+             g_krec_len, (int)g_krec_err);
+      free(buf);
+      return -1;
+    }
+
+  *pcm_out = buf;
+  return 0;
+}
+
+/****************************************************************************
+ * Name: step_kws_enroll
+ *
+ * Description:
+ *   `hw_test kws enroll <slot> [秒]`：录一段麦克风音频交给 kws_enroll()
+ *   做成模板，并落盘到 /data/kws/slotN.tpl。
+ *
+ *   参数（非法一律打中文提示 + FAIL，绝不越界写）：
+ *     slot   必给，0..KWS_MAX_TEMPLATES-1（越界或没给都直接 FAIL）；
+ *     秒数   可选，默认 KWS_ENROLL_DEFAULT_SEC，钳到
+ *            [KWS_ENROLL_MIN_SEC, KWS_ENROLL_MAX_SEC]。
+ *
+ * Returned Value:
+ *   OK = 模板已经在 RAM 里（落盘成功与否见打印）；
+ *   -1 = 参数非法 / 初始化失败 / 录音失败 / kws_enroll 失败。
+ *
+ ****************************************************************************/
+
+static int step_kws_enroll(int slot, int seconds)
+{
+  FAR int16_t *pcm = NULL;
+  char detail[128];                 /* 失败原因里带中文，留够（避免 snprintf 截在
+                                     * 一个多字节字符中间变成乱码） */
+  int peak;
+  int got;
+  int n;
+  int ret;
+  int i;
+
+  if (slot < 0)
+    {
+      printf("hw_test kws enroll: 缺 slot 参数。用法 "
+             "hw_test kws enroll <slot> [秒]，slot 取 0..%d"
+             "（slot0 =「你好，openvela」、slot1 =「Hello，openvela」）\n",
+             KWS_MAX_TEMPLATES - 1);
+      report("唤醒词录模板", 0, "缺 slot 参数");
+      return -1;
+    }
+
+  if (slot >= KWS_MAX_TEMPLATES)
+    {
+      printf("hw_test kws enroll: slot %d 越界，只允许 0..%d"
+             "（slot0 =「你好，openvela」、slot1 =「Hello，openvela」）\n",
+             slot, KWS_MAX_TEMPLATES - 1);
+      report("唤醒词录模板", 0, "slot 越界（只允许 0..3）");
+      return -1;
+    }
+
+  if (seconds < KWS_ENROLL_MIN_SEC || seconds > KWS_ENROLL_MAX_SEC)
+    {
+      int clamp = seconds;
+
+      if (clamp < KWS_ENROLL_MIN_SEC)
+        {
+          clamp = KWS_ENROLL_MIN_SEC;
+        }
+
+      if (clamp > KWS_ENROLL_MAX_SEC)
+        {
+          clamp = KWS_ENROLL_MAX_SEC;
+        }
+
+      printf("      提示：录音秒数 %d 不在 %d..%d 里，按 %d 秒录\n",
+             seconds, KWS_ENROLL_MIN_SEC, KWS_ENROLL_MAX_SEC, clamp);
+      seconds = clamp;
+    }
+
+  printf("[KWS] 录模板 slot%d：请念「%s」；录 %d 秒（%d Hz/单声道/16bit）\n",
+         slot, kws_slot_word(slot), seconds, AUDIO_SAMPLE_RATE);
+  printf("      前提：麦克风必须空闲 —— ai_companion 开机自启后会一直占着它\n");
+  printf("            （半双工 + 单一大镜像），跑之前先停掉 ai_companion\n");
+
+  ret = kws_init();
+  if (ret < 0)
+    {
+      printf("      kws_init() 失败: %d（内部表建不起来，属异常）\n", ret);
+      report("KWS 模块初始化", 0, "kws_init 失败");
+      return -1;
+    }
+
+  snprintf(detail, sizeof(detail), "模板 %d 条，目录 " KWS_DATA_DIR,
+           kws_ready_count());
+  report("KWS 模块初始化", 1, detail);
+
+  /* 给用户一点准备时间（录音是"数完才开始"的，免得开头几个字被吃掉） */
+
+  printf("      请准备：%d 秒后开始录音，然后把这一整句清楚地念一遍\n",
+         KWS_PREP_SEC);
+
+  for (i = KWS_PREP_SEC; i > 0; i--)
+    {
+      printf("      %d...\n", i);
+      usleep(1000 * 1000);
+    }
+
+  printf("      >>> 开始录音，请说：「%s」 <<<\n", kws_slot_word(slot));
+
+  ret = kws_record(seconds, 0, &pcm);
+  if (ret < 0)
+    {
+      report("KWS 录音", 0, "录音失败（原因见上面）");
+      return -1;
+    }
+
+  got  = (int)(g_krec_got / 2);             /* 采样点个数 */
+  peak = audio_level(pcm, got);             /* 打印 peak/avg + 有没有声音 */
+
+  snprintf(detail, sizeof(detail), "%d 采样点（%dms），peak=%d%s", got,
+           got * 1000 / AUDIO_SAMPLE_RATE, peak,
+           peak > AUDIO_SOUND_PEAK ? " 有声音" : " 静音");
+  report("KWS 录音", 1, detail);
+
+  /* 特征提取 + 端点检测走的是识别那一套（kws_dtw.h 保证口径一致） */
+
+  ret = kws_enroll(pcm, (size_t)got, slot);
+  n   = kws_template_frames(slot);
+
+  if (ret == 0)
+    {
+      snprintf(detail, sizeof(detail),
+               "%d 个特征点（%dms），已落盘 " KWS_DATA_DIR "/slot%d.tpl",
+               n, n * KWS_FEAT_MS, slot);
+      report("唤醒词模板", 1, detail);
+      printf("      提示：跑 `hw_test kws test` 看全部槽位状态，"
+             "`hw_test kws live 10` 当场试唤醒\n");
+    }
+  else if (ret == 1)
+    {
+      /* 模板进 RAM 了，只是 /data 写失败：现在能用，重启会丢（kws_dtw.h
+       * 明确说落盘失败不算致命，所以这里算 PASS，但要把话说明白） */
+
+      snprintf(detail, sizeof(detail),
+               "%d 个特征点（%dms），但没落盘（重启会丢）",
+               n, n * KWS_FEAT_MS);
+      report("唤醒词模板", 1, detail);
+      printf("      注意：本次唤醒词已经能用（模板在 RAM 里），但写 " KWS_DATA_DIR
+             " 失败（原因见上面 [KWS] 行）—— 重启后要重录\n");
+    }
+  else
+    {
+      FAR const char *why;
+
+      if (ret == -EINVAL)
+        {
+          why = "有效语音太短/太安静（整句念完整、前后留一点安静再试）";
+        }
+      else if (ret == -ENOSPC)
+        {
+          why = "有效语音超过 2.0 秒上限（短语说短一点）";
+        }
+      else if (ret == -ENOSYS)
+        {
+          why = "模块没初始化";
+        }
+      else
+        {
+          why = "kws_enroll 返回负值";
+        }
+
+      snprintf(detail, sizeof(detail), "kws_enroll=%d：%s", ret, why);
+      report("唤醒词模板", 0, detail);
+    }
+
+  free(pcm);
+
+  return (ret == 0 || ret == 1) ? OK : -1;
+}
+
+/****************************************************************************
+ * Name: step_kws_test
+ *
+ * Description:
+ *   `hw_test kws test`：打印当前已登记的模板数、判定阈值、每个槽位是否可用
+ *   （数据都来自 kws_dtw.c 的查询接口）。
+ *
+ *   没有模板算 FAIL —— 那种情况下 kws_feed() 永远不会返回 1，唤醒词等于没开。
+ *
+ ****************************************************************************/
+
+static int step_kws_test(void)
+{
+  char detail[96];
+  int ready;
+  int s;
+  int n;
+  int ret;
+
+  printf("[KWS] 模板状态（目录 %s，约定 %d Hz/单声道/16bit）\n",
+         KWS_DATA_DIR, AUDIO_SAMPLE_RATE);
+
+  ret = kws_init();
+  if (ret < 0)
+    {
+      printf("      kws_init() 失败: %d（内部表建不起来，属异常）\n", ret);
+      report("KWS 模块初始化", 0, "kws_init 失败");
+      return -1;
+    }
+
+  ready = kws_ready_count();
+
+  printf("      阈值          : %d（每维每帧 RMS 距离 ×1000；"
+         "kws_set_threshold 可改）\n", kws_get_threshold());
+  printf("      一个特征点    : %dms\n", KWS_FEAT_MS);
+
+  /* 这里不打印 kws_get_last_distance()：kws_init() 内部会 kws_reset()，
+   * 那个值必然是 -1（要看"差多少"请用 kws live，它跑完会打出来） */
+
+  for (s = 0; s < KWS_MAX_TEMPLATES; s++)
+    {
+      n = kws_template_frames(s);
+
+      if (n > 0)
+        {
+          printf("      slot%d : 可用 —— %d 个特征点（%dms），应念「%s」\n",
+                 s, n, n * KWS_FEAT_MS, kws_slot_word(s));
+        }
+      else
+        {
+          printf("      slot%d : 空   —— 应念「%s」\n", s, kws_slot_word(s));
+        }
+    }
+
+  snprintf(detail, sizeof(detail), "模板 %d/%d 条可用，阈值 %d", ready,
+           KWS_MAX_TEMPLATES, kws_get_threshold());
+  report("唤醒词模板", ready > 0, detail);
+
+  if (ready == 0)
+    {
+      printf("      提示：还没有模板，kws_feed 永远不会返回 1 —— 先录一条：\n");
+      printf("            hw_test kws enroll 0 4   （念「你好，openvela」）\n");
+      printf("            hw_test kws enroll 1 4   （念「Hello，openvela」）\n");
+    }
+  else
+    {
+      printf("      提示：/data 是 tmpfs —— 模板重启就丢，"
+             "重启后要重录（或从别处拷回 " KWS_DATA_DIR "）\n");
+    }
+
+  return ready > 0 ? OK : -1;
+}
+
+/****************************************************************************
+ * Name: step_kws_live
+ *
+ * Description:
+ *   `hw_test kws live [秒]`：边录音边实时喂 kws_feed，命中就打印一行。
+ *   用途是**在没有语音应用的情况下单独验收唤醒词** —— 因为它不依赖
+ *   ai_companion/LVGL，只看"说了唤醒词会不会报命中"。
+ *
+ *   ⚠ 只能在 ai_companion 没跑的时候用：它开机自启时会独占麦克风（半双工），
+ *     而且和这里共享 KWS 的全局状态。使用提示里也打了这句话。
+ *
+ ****************************************************************************/
+
+static int step_kws_live(int seconds)
+{
+  char detail[96];
+  FAR int16_t *pcm = NULL;
+  int hits;
+  int ret;
+
+  if (seconds < 1 || seconds > KWS_LIVE_MAX_SEC)
+    {
+      int clamp = (seconds < 1) ? KWS_LIVE_DEFAULT_SEC : KWS_LIVE_MAX_SEC;
+
+      printf("      提示：听音秒数 %d 不在 1..%d 里，按 %d 秒听\n",
+             seconds, KWS_LIVE_MAX_SEC, clamp);
+      seconds = clamp;
+    }
+
+  printf("[KWS] 实时听 %d 秒：请说「你好，openvela」或「Hello，openvela」\n",
+         seconds);
+  printf("      注意：本板半双工 + 整机单一大镜像 —— ai_companion 开机自启后\n");
+  printf("            会一直独占麦克风，所以本命令只能在它没跑的时候用，\n");
+  printf("            否则 audio_in_start() 直接失败 -EBUSY。\n");
+  printf("      命中延迟：说完最后一个字后还要等 ~300ms 的尾静音才判（正常）\n");
+
+  ret = kws_init();
+  if (ret < 0)
+    {
+      printf("      kws_init() 失败: %d（内部表建不起来，属异常）\n", ret);
+      report("KWS 模块初始化", 0, "kws_init 失败");
+      return -1;
+    }
+
+  report("KWS 模块初始化", 1, "见上面的 [KWS] 初始化行");
+
+  if (kws_ready_count() <= 0)
+    {
+      printf("      还没有模板（kws_feed 永远不会返回 1）—— 先跑 "
+             "hw_test kws enroll 0 4\n");
+      report("唤醒词实时听音", 0, "还没有模板（先 kws enroll）");
+      return -1;
+    }
+
+  /* 交给过别人（ASR）之后再听，预滚环/自适应本底/冷却都是旧的，清一下 */
+
+  kws_reset();
+
+  ret = kws_record(seconds, 1, &pcm);
+  hits = (int)g_krec_hits;
+
+  if (ret < 0)
+    {
+      report("唤醒词实时听音", 0, "录音失败（原因见上面）");
+      return -1;
+    }
+
+  snprintf(detail, sizeof(detail), "命中 %d 次 / 听 %d 秒，最近距离 %d（阈值 %d）",
+           hits, seconds, kws_get_last_distance(), kws_get_threshold());
+  report("唤醒词实时听音", hits > 0, detail);
+
+  if (hits == 0)
+    {
+      printf("      没命中怎么查：距离 -1 = 那句话被长度差挡在 DTW 带宽外；\n");
+      printf("      距离明显大于阈值 = 模板和现场口音/音量差得远，重录一次模板\n");
+    }
+  else
+    {
+      printf("      命中过 %d 次 —— 唤醒词功能在这台板子上转起来了\n", hits);
+    }
+
+  return hits > 0 ? OK : -1;
+}
+
+/****************************************************************************
+ * Name: step_kws
+ *
+ * Description:
+ *   kws 子命令的入口（main 里只认 cmd/slot/seconds 三个数）。
+ *   没编 hello_app 的配置下只打印一句"本配置不支持"。
+ *
+ ****************************************************************************/
+
+static int step_kws(int cmd, int slot, int seconds)
+{
+  switch (cmd)
+    {
+      case KWS_CMD_ENROLL:
+        return step_kws_enroll(slot, seconds);
+
+      case KWS_CMD_TEST:
+        return step_kws_test();
+
+      case KWS_CMD_LIVE:
+        return step_kws_live(seconds);
+
+      default:
+        return -1;
+    }
+}
+
+#else  /* !HW_TEST_HAS_KWS */
+
+static int step_kws(int cmd, int slot, int seconds)
+{
+  (void)cmd;
+  (void)slot;
+  (void)seconds;
+
+  printf("[KWS] 本配置没有启用 hello_app"
+         "（CONFIG_LVX_USE_CONTEST2026_233_HELLO_APP），"
+         "命令词识别模块 kws_dtw.c 不在固件里\n");
+  report("唤醒词自检", 0, "编译时未启用");
+  return -1;
+}
+
+#endif /* HW_TEST_HAS_KWS */
+
+/****************************************************************************
  * Name: audio_out_play
  *
  * Description:
@@ -2503,6 +3212,7 @@ int main(int argc, FAR char *argv[])
   int do_status     = 0;
   int do_tts        = 0;
   int do_asr        = 0;
+  int do_kws        = KWS_CMD_NONE;
   int standalone;
   int imu_frames    = IMU_DEFAULT_FRAMES;
   int rtc_sec       = RTC_DEFAULT_ALARM_SEC;
@@ -2518,6 +3228,8 @@ int main(int argc, FAR char *argv[])
   int touch_set     = 0;
   char tts_text[TTS_MAX_TEXT];
   FAR const char *asr_path = NULL;
+  int kws_slot      = -1;             /* -1 = 没给（enroll 必给，缺了要 FAIL） */
+  int kws_sec       = KWS_ENROLL_DEFAULT_SEC;
   int i;
 
   g_pass  = 0;
@@ -2621,6 +3333,59 @@ int main(int argc, FAR char *argv[])
           do_asr   = 1;
           asr_path = argv[++i];
         }
+      else if (strcmp(argv[i], "kws") == 0)
+        {
+          /* `hw_test kws <enroll|test|live> [...]`。
+           * slot / 秒数都只在"下一个参数是数字"时才吃掉 —— 和 lcd 子命令
+           * 同一个理由：`hw_test kws enroll abc` 要报"缺 slot"，
+           * 不能把 atoi("abc") = 0 当成 slot0 照录。 */
+
+          if (i + 1 >= argc)
+            {
+              printf("hw_test kws: 缺子命令"
+                     "（enroll <slot> [秒] / test / live [秒]）\n");
+              usage();
+              return EXIT_FAILURE;
+            }
+
+          i++;
+
+          if (strcmp(argv[i], "enroll") == 0)
+            {
+              do_kws = KWS_CMD_ENROLL;
+
+              if (i + 1 < argc && arg_is_number(argv[i + 1]))
+                {
+                  kws_slot = atoi(argv[++i]);
+                }
+
+              if (i + 1 < argc && arg_is_number(argv[i + 1]))
+                {
+                  kws_sec = atoi(argv[++i]);
+                }
+            }
+          else if (strcmp(argv[i], "test") == 0)
+            {
+              do_kws = KWS_CMD_TEST;
+            }
+          else if (strcmp(argv[i], "live") == 0)
+            {
+              do_kws = KWS_CMD_LIVE;
+              kws_sec = KWS_LIVE_DEFAULT_SEC;
+
+              if (i + 1 < argc && arg_is_number(argv[i + 1]))
+                {
+                  kws_sec = atoi(argv[++i]);
+                }
+            }
+          else
+            {
+              printf("hw_test kws: 未知子命令 '%s'"
+                     "（enroll <slot> [秒] / test / live [秒]）\n", argv[i]);
+              usage();
+              return EXIT_FAILURE;
+            }
+        }
       else
         {
           printf("hw_test: 未知参数 '%s'\n", argv[i]);
@@ -2629,12 +3394,13 @@ int main(int argc, FAR char *argv[])
         }
     }
 
-  /* imu / rtc / rtcday / audio / alarm / lcd / button / status / tts / asr
-   * 是各自独立的子命令：只跑自己，不跑那套 5 步自检
+  /* imu / rtc / rtcday / audio / alarm / lcd / button / status / tts / asr /
+   * kws 是各自独立的子命令：只跑自己，不跑那套 5 步自检
    * （tts / asr 要联网，是全自检里唯一会等网络的，所以也放单独模式）。 */
 
   standalone = do_imu || do_rtc || do_rtcday || do_audio || do_alarm ||
-               do_backlight || do_button || do_status || do_tts || do_asr;
+               do_backlight || do_button || do_status || do_tts || do_asr ||
+               do_kws;
 
   /* lcdcolor 只是刷个屏，别让它再干等 10 秒触摸 */
 
@@ -2649,7 +3415,7 @@ int main(int argc, FAR char *argv[])
   if (standalone)
     {
       printf("   子命令模式：只跑 imu/rtc/rtcday/audio/alarm/lcd/button/status/"
-             "tts/asr，不做 5 步自检\n");
+             "tts/asr/kws，不做 5 步自检\n");
     }
   else
     {
@@ -2717,6 +3483,12 @@ int main(int argc, FAR char *argv[])
       if (do_asr)
         {
           step_asr(asr_path);
+          printf("\n");
+        }
+
+      if (do_kws != KWS_CMD_NONE)
+        {
+          step_kws(do_kws, kws_slot, kws_sec);
           printf("\n");
         }
     }
