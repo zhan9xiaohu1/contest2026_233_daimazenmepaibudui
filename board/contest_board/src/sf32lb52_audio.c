@@ -153,6 +153,50 @@
  * 0 = 不打（默认，改动前后的行为一致）；1 = re-arm 前脉冲一次 ADC_PATH_FLUSH。 */
 #define SF32LB52_AUDIO_FLUSH_FIFO_BEFORE_ARM  0
 
+/* M3 可回退开关：整场会话只武装一次 DMA（常驻接收环）。
+ *
+ *   1 = 本次改动之后的行为（默认）：会话内**第一次** read() 把 RX 的循环 DMA
+ *       武装一次（帧长不超过 SF32LB52_AUDIO_RX_ONCE_MAX_BYTES 时走这条路），
+ *       之后每帧只做"等一次完成通知 → 把环里刚完成的那半块拷给调用者"。
+ *       **每帧不再 HAL_DMA_Abort、不再 DMA_FreeChannel、不再 NVIC 关/开、
+ *       不再重新 Start_IT。**
+ *   0 = 逐字回到改动之前：每帧 arm/abort 的老路径。新代码全部由 #if 编掉
+ *       （包括那块常驻缓冲），一个字都不进镜像；其余代码一行不动。
+ *
+ * 为什么要拿掉每帧那次 abort/re-arm：上板已经逐层剥到只剩这一个嫌疑 ——
+ * 冻结现场 CNDTR 仍是满值、HT 与 TC 这整段 5 秒一次不来、而 hdma[RX].State
+ * 一直停在 BUSY（not_armed=0）⇒ DMA 通道自己武装得好好的，是它上游那条
+ * 请求线不再被拉高。而本驱动每 20ms 就把这条通道 abort 一次（关 TC/HT/TE →
+ * 关通道 → 清该通道全部标志 → DMA_FreeChannel 里 HAL_NVIC_DisableIRQ +
+ * 通道池回收），下一次 Receive_DMA 再把 NVIC 开回来、重新分配通道、重新写
+ * CNDTR/CPAR/CM0AR/CCR —— 50 次/秒地穿过"刚拆掉、刚装上"这一刻。厂商参考
+ * 驱动整场会话只武装一次（到 stream stop 才 DMAStop），本开关就是照它改的：
+ * 这条 RX 数据通路在会话里除了 ADC 本身，没有任何东西需要每帧重启。
+ *
+ * 注意：这条路上没有"会话内每帧 stop/re-arm"，所以 M2 那记 ADC_PATH_FLUSH
+ * 在这条路上也不需要 —— DMA 一直在搬，FIFO 没有积压/溢出挂住请求线的窗口。
+ *
+ * 会话边界照旧收尾：hw_stop()/hw_shutdown() 里那条"先看句柄状态"的
+ * HAL_AUDPRC_DMAStop(RX)（abort + 通道池回收）与那记 AUDPRC 软复位**一行都
+ * 没动**，所以"开会话才武装、关会话才拆掉 + 软复位"的边界语义不变。 */
+#define SF32LB52_AUDIO_ARM_ONCE   1
+
+/* 常驻接收环能承载的单帧上限（字节）。超过它的 read 不走常驻环，逐字落回
+ * 每帧 arm 的老路径 —— 例如 hw_test 那种"一次读 1 秒 = 32000 字节"的整块
+ * 录音，本来就是"一次一停"的整块语义，老路径正是它的原生形态。
+ * 4 KB = 16k 单声道 16bit 下 128 ms，覆盖本板所有逐帧用法（20/30 ms 帧）。 */
+#define SF32LB52_AUDIO_RX_ONCE_MAX_BYTES   4096
+
+/* 常驻接收环的下限（字节）：比它还短的 read 同样不走常驻环。
+ *
+ * 为什么要有个下限：granule 就是"一帧"，而 HT/TC 是**每帧各一次**中断 ——
+ * 帧长小到几十字节时，中断频率会到每秒几万次（16k 单声道下 32 字节 = 1 ms
+ * 一帧），把 CPU 全吃掉；而上层真正逐帧读的帧长是 640/960 字节（20/30 ms）
+ * 这个量级。256 字节 = 8 ms，最坏 250 次中断/秒，离"风暴"还很远。
+ * 本板所有真实用法（640/960/3200）都在这个下限之上，这条只为挡住"万一有
+ * 谁读一个极小长度"的极端输入 —— 那种情况走老路径是安全的（一次一停）。 */
+#define SF32LB52_AUDIO_RX_ONCE_MIN_BYTES   256
+
 /****************************************************************************
  * Private Types
  ****************************************************************************/
@@ -359,6 +403,38 @@ struct sf32lb52_audio_s
   uint32_t                hw_stop_count;       /* 开机以来 hw_stop 走完整收尾的次数 */
   uint32_t                aprc_sreset_count;   /* 开机以来 AUDPRC 软复位脉冲次数 */
   uint32_t                playstart_count;     /* 开机以来 playback=true 的 hw_start 次数 */
+
+#if SF32LB52_AUDIO_ARM_ONCE
+  /* 常驻接收环（M3 / ARM_ONCE）的账 —— 整场会话只武装一次 DMA 的那一套。
+   * 详细口径见文件顶部那个开关与 sf32lb52_audio_read_once。
+   *
+   *   rx_once_armed     本会话的常驻循环 DMA 已经武装（hw_start 里清）；
+   *   rx_once_granule   半块长度（字）= 武装那一刻的 want = 一帧；
+   *                     （环整块 = 2 个 granule 的乒乓，见 g_rx_once_ring）
+   *   rx_once_evt       武装以来"完成了几帧"：HT 与 TC 各算一次。read 靠它判
+   *                     "有没有新的一帧"—— 这就是老路径那句"这一次 arm 有没有
+   *                     搬到一个字节"在 arm-once 下的等价物；
+   *   rx_once_off       最近完成的那一帧在环里的字偏移（HT→0，TC→granule）；
+   *   rx_once_lost      上层来不及取、被 DMA 重写盖掉的帧数（只看趋势：它一涨
+   *                     说明上层处理一帧比一帧的时间还久）；
+   *   rx_once_stall_periods
+   *                     连续多少个 granule 周期没有新的 TC —— 自愈判据的
+   *                     arm-once 等价形态（老路径数是"连续多少次 arm 一个字节
+   *                     都没搬到"，两者是同一条时间轴上的同一个量）；
+   *   rx_once_cndtr_prev 上一次超时现场的 CNDTR：两次一模一样 = 这 5 秒里 DMA
+   *                     一个字节都没动（请求线死了的硬证据）；
+   *   rx_once_fallback_logged
+   *                     本条会话"落回逐帧老路径"的日志打过没有（限频）。 */
+
+  bool                    rx_once_armed;
+  uint32_t                rx_once_granule;
+  uint32_t                rx_once_evt;
+  uint32_t                rx_once_off;
+  uint32_t                rx_once_lost;
+  uint32_t                rx_once_stall_periods;
+  uint32_t                rx_once_cndtr_prev;
+  bool                    rx_once_fallback_logged;
+#endif
 };
 
 /****************************************************************************
@@ -413,9 +489,43 @@ static void sf32lb52_audio_rx_dma_stop_frame(FAR struct sf32lb52_audio_s *priv);
 static void sf32lb52_audio_recover_log(FAR struct sf32lb52_audio_s *priv);
 static int  sf32lb52_audio_recover_rx(FAR struct sf32lb52_audio_s *priv);
 
+#if SF32LB52_AUDIO_ARM_ONCE
+static bool sf32lb52_audio_rx_once_prepare(FAR struct sf32lb52_audio_s *priv,
+                                           size_t buflen);
+static ssize_t sf32lb52_audio_read_once(FAR struct sf32lb52_audio_s *priv,
+                                        FAR char *buffer, size_t buflen);
+static void sf32lb52_audio_rx_once_reset(FAR struct sf32lb52_audio_s *priv);
+#endif
+
 /****************************************************************************
  * Private Data
  ****************************************************************************/
+
+#if SF32LB52_AUDIO_ARM_ONCE
+/* 常驻接收环：ARM_ONCE 时 RX 的 DMA 目的地（唯一一处，不随调用者的 buffer 变）。
+ *
+ *   - 整块 = 2 个 granule（乒乓），granule = 一帧（= 武装那一刻 read 的 want）。
+ *     HT（半满）在第一个 granule 写完时来、TC（完成）在第二个写完时来，于是
+ *     "一帧完成一次通知"；而每次通知落在的那半块，在**接下来一整个 granule
+ *     周期**里不会被 DMA 碰（它正在写另一半）—— 拷给调用者的那一刻天然不和
+ *     DMA 抢同一块内存。这也是为什么必须是 2 个 granule 的乒乓：单块的循环环
+ *     里，通知刚来 DMA 就已经从头重写这一块了，谁也没法保证拷到的是哪一半。
+ *   - 对齐：uint32_t 数组（4 字节），满足 HAL 给 RX 通道设的 WORD 粒度
+ *     （HAL_AUDPRC_DMA_Init：MemDataAlignment = DMA_MDATAALIGN_WORD），
+ *     也满足 CNDTR 是按字计数的口径（Receive_DMA 内部 dataSize = Size >> 2）。
+ *   - cache：RX 目的地不做任何 dcache 操作，这里是**有据可依**的，不是"别人
+ *     也没做"：这块数组是 .bss，链接脚本把它放进 sram（board/contest_board/
+ *     scripts/ld.script 的 `.bss : { ... } > sram`，ORIGIN = 0x20000000），
+ *     而 MPU 把 0x20000000-0x2027ffff 标成 ATTR_RAM = **Non-Cacheable**
+ *     （vendor/.../sf32lb52x/Templates/system_bf0_ap.c 里 "disable sram cache"
+ *     那一行），所以 DMA 写进去的字节 CPU 直接就读得到，不需要 invalidate。
+ *     HAL 自己也只在 memory→periph 方向 clean 源地址（bf0_hal_dma.c:437），
+ *     对 RX 目的地从来没有任何 cache 操作。
+ *   - 大小 = 2 × 上限帧长 = 8 KB（uint32_t[2048]，上限见
+ *     SF32LB52_AUDIO_RX_ONCE_MAX_BYTES）。放在 .bss 里不用堆：它要的就是
+ *     "地址固定、整场会话不换、非 cacheable"这三件事。 */
+static uint32_t g_rx_once_ring[(SF32LB52_AUDIO_RX_ONCE_MAX_BYTES / 4) * 2];
+#endif
 
 /* SF32LB52X codec 时钟配置表（采样率 → 内部 PLL/分频参数，参考 SDK） */
 
@@ -1408,6 +1518,18 @@ static int sf32lb52_audio_hw_start(FAR struct sf32lb52_audio_s *priv,
   priv->rx_arm_session  = 0;
   priv->rx_stall_seen   = 0;
   priv->rx_stall_logged = false;
+
+#if SF32LB52_AUDIO_ARM_ONCE
+  /* 新会话从"还没武装"开始（下一次 read 重新只武装一次）。
+   *
+   * 这里只清软件账、一个寄存器都不碰：上一条会话的常驻环通道已经由会话边界的
+   * 收尾拆干净了 —— hw_stop()/hw_shutdown() 里那条"先看句柄状态"的
+   * HAL_AUDPRC_DMAStop(RX) 对着的正是 arm-once 留下来的 BUSY 句柄（它会 abort +
+   * 回收通道池），而 sf32lb52_audio_start() 在 running 为真时**一定**先调
+   * hw_stop() 再进本函数，所以走到这里时通道一定已经收过尾。 */
+
+  sf32lb52_audio_rx_once_reset(priv);
+#endif
 
   if (playback)
     {
@@ -2518,6 +2640,528 @@ static ssize_t sf32lb52_audio_write(FAR struct audio_lowerhalf_s *dev,
   return buflen;
 }
 
+#if SF32LB52_AUDIO_ARM_ONCE
+/****************************************************************************
+ * Name: sf32lb52_audio_rx_once_reset
+ *
+ * Description:
+ *   把"常驻接收环"这套账清干净（会话边界、自愈之后、换帧长退回老路径时）。
+ *
+ *   只清软件状态，**一个寄存器都不动**：通道该不该 abort 由会话边界的收尾
+ *   （hw_stop/hw_shutdown 里那条"先看句柄状态"的 HAL_AUDPRC_DMAStop(RX)）
+ *   和自愈（sf32lb52_audio_recover_rx）自己负责 —— 那两处都已经做过了，
+ *   这里再 abort 一次就是对着可能已被别人重新分配走的物理通道写寄存器。
+ ****************************************************************************/
+
+static void sf32lb52_audio_rx_once_reset(FAR struct sf32lb52_audio_s *priv)
+{
+  priv->rx_once_armed           = false;
+  priv->rx_once_granule         = 0;
+  priv->rx_once_evt             = 0;
+  priv->rx_once_off             = 0;
+  priv->rx_once_lost            = 0;
+  priv->rx_once_stall_periods   = 0;
+  priv->rx_once_cndtr_prev      = 0;
+  priv->rx_once_fallback_logged = false;
+}
+
+/****************************************************************************
+ * Name: sf32lb52_audio_rx_once_prepare
+ *
+ * Description:
+ *   判断这次的 read 能不能走"常驻环"这条路；能、而且本会话还没武装过，就
+ *   顺手把整场会话的 RX DMA **只武装这一次**（M3 的全部内容）。
+ *
+ *   返回 true  = 本条 read 走 sf32lb52_audio_read_once()（此时 DMA 一定已经
+ *                武装好，且 granule == 本次 want）；
+ *   返回 false = 本条 read 落回下面那条**逐字未改**的每帧 arm 老路径。
+ *                落回时如果本会话原来武装过，常驻环那套账在这里作废 ——
+ *                老路径开头那道"句柄状态残留"检查会把还武装着的通道 abort 掉
+ *                并置 READY，下一次 read 会用新的帧长重新只武装一次。
+ *
+ *   什么时候落回老路径（四种，都是"这条 read 不是逐帧流式"）：
+ *     1) 帧长不是 4 的整数倍：DMA 是 WORD 粒度（HAL_AUDPRC_DMA_Init：
+ *        MemDataAlignment = DMA_MDATAALIGN_WORD），半字长的帧在 armed 的
+ *        那一刻就被截断了，交给调用者的长度和实际搬进来的字节对不上；
+ *     2) 帧长小于下限或超过上限（SF32LB52_AUDIO_RX_ONCE_MIN/MAX_BYTES）：
+ *        太小会变成中断风暴，太大本来是整块语义（例如 hw_test 的"一次读
+ *        1 秒 = 32000 字节"）；
+ *     3) 同一会话里换了帧长：环按一个 granule 循环，装不下别的长度，
+ *        也不该把两种长度的流拼在一起（本板三个 app 的帧长都是一次定死的，
+ *        这条只在"真有人换长度"时才会走到，日志会留下一行凭据）；
+ *     4) 队列模式（rx_apb 挂着）：那条路的完成通知要落到 AUDIO_CALLBACK_DEQUEUE
+ *        上，不能被本函数的常驻环抢走。
+ ****************************************************************************/
+
+static bool sf32lb52_audio_rx_once_prepare(FAR struct sf32lb52_audio_s *priv,
+                                           size_t buflen)
+{
+  FAR DMA_HandleTypeDef *hdma = priv->aprc.hdma[SF32LB52_AUDIO_PRC_RX_CH];
+  uint32_t want;
+
+  if (buflen < SF32LB52_AUDIO_RX_ONCE_MIN_BYTES ||
+      buflen > SF32LB52_AUDIO_RX_ONCE_MAX_BYTES ||
+      (buflen & 3u) != 0 || priv->rx_apb != NULL)
+    {
+      return false;
+    }
+
+  want = (uint32_t)(buflen >> 2);     /* 字 = DMA/CNDTR 的口径 */
+
+  if (priv->rx_once_armed)
+    {
+      /* 已经武装过：同一种帧长直接用（一帧 = 半块），别的长度退回老路径。 */
+
+      if (want == priv->rx_once_granule)
+        {
+          return true;
+        }
+
+      /* 先把旧 granule 取出来再清账 —— 日志要报的就是它。 */
+      {
+        uint32_t was = priv->rx_once_granule << 2;
+
+        sf32lb52_audio_rx_once_reset(priv);
+
+        if (!priv->rx_once_fallback_logged)
+          {
+            priv->rx_once_fallback_logged = true;
+
+            syslog(LOG_WARNING,
+                   "AUDIO: read 的帧长(%zu 字节)与本会话常驻 DMA 的 granule"
+                   "(%u 字节)不一致，本条走逐帧 arm 的老路径；每帧 abort/re-arm "
+                   "的窗口由此重新出现（只在这类混用帧长的会话里）\n",
+                   buflen, (unsigned)was);
+          }
+      }
+
+      return false;
+    }
+
+  /* ---- 本会话第一次 read：整场会话的 RX DMA 就在这一次武装完 ---- */
+
+  /* 武装前先把句柄状态摆正（与老路径开头那道"状态残留"检查同源，只是这里
+   * 每会话只做一次）：HAL_DMA_Start_IT() 只在 hdma->State == READY 时才真的
+   * 发传输，而 Receive_DMA 把它的返回值丢了、自己照样 return HAL_OK —— 不摆正
+   * 就会"以为起来了、其实没起"，接着干等 5 秒。 */
+
+  if (hdma != NULL && hdma->State != HAL_DMA_STATE_READY)
+    {
+      sf32lb52_audio_rx_dma_stop_frame(priv);
+      hdma->State = HAL_DMA_STATE_READY;
+    }
+
+  priv->aprc.State[SF32LB52_AUDIO_PRC_RX_CH] = HAL_AUDPRC_STATE_READY;
+
+  /* 武装成**两个 granule** 的循环传输（乒乓）：
+   *   HT（半满）在第一个 granule 写完时来，TC（完成）在第二个写完时来 ——
+   *   一帧一次通知，而通知落在的那半块在接下来一整个 granule 周期里不会被
+   *   DMA 碰（它正在写另一半），拷给调用者的那一刻天然安全。
+   *   只武装一个 granule 是不行的：那样通知刚来 DMA 就已经从头重写这一块了。 */
+
+  if (HAL_AUDPRC_Receive_DMA(&priv->aprc, (FAR uint8_t *)g_rx_once_ring,
+                             want * 8u, SF32LB52_AUDIO_PRC_RX_CH) != HAL_OK ||
+      hdma == NULL || hdma->State != HAL_DMA_STATE_BUSY)
+    {
+      /* 起不来：**不当场下结论**，把机会交给老路径 —— 老路径里那两道校验
+       * （res != HAL_OK → busy_fail；句柄没进 BUSY → not_armed 并打现场日志）
+       * 才是这两个计数器的正主，日志里的口径也就只有一处，不会两边各说一句。
+       * 这里只把 State 掰回 READY（Receive_DMA 在 Start_IT 之前就把
+       * State 置成了 BUSY_RX，不回退的话老路径一进去也会被挡回来）。 */
+
+      priv->aprc.State[SF32LB52_AUDIO_PRC_RX_CH] = HAL_AUDPRC_STATE_READY;
+      return false;
+    }
+
+  __HAL_AUDPRC_ENABLE(&priv->aprc);
+
+  priv->rx_once_armed   = true;
+  priv->rx_once_granule = want;
+
+  /* 冻结分诊的两笔账照旧记：arm_sess 回答"本会话第几次武装"，arm-once 下它
+   * 应当**恒为 1** —— 它不为 1 就说明这条会话中途退回老路径又武装过。 */
+
+  priv->rx_arm_seq++;
+  priv->rx_arm_session++;
+
+  /* evt 从 0 开始数，于是"第一次 read 也要等到第一帧真的完成"这件事与老路径
+   * 逐字同义（老路径第一帧同样是等一次完成中断，而不是拿半截缓冲交差）。 */
+
+  return true;
+}
+
+/****************************************************************************
+ * Name: sf32lb52_audio_read_once
+ *
+ * Description:
+ *   read() 的"整场会话只武装一次 DMA"分支（M3）。
+ *
+ *   一次调用 = 等一帧（= 一个 granule）完成通知 → 把环里刚完成的那半块拷给
+ *   调用者。**全程不做任何 abort/re-arm、不动 NVIC、不动通道池**：DMA 从上
+ *   一次武装之后就一直转着，一帧一圈。
+ *
+ *   超时语义、返回值、会话结束的判据与老路径**逐字一致**：
+ *     > 0            = 读到了 buflen 字节；
+ *     0              = 会话结束（STOP / close / 换代）：EOF；
+ *     -ETIMEDOUT     = 会话还活着，只是这一帧没等到（上层跳一帧接着读）。
+ ****************************************************************************/
+
+static ssize_t sf32lb52_audio_read_once(FAR struct sf32lb52_audio_s *priv,
+                                        FAR char *buffer, size_t buflen)
+{
+  FAR DMA_HandleTypeDef *hdma_rx = priv->aprc.hdma[SF32LB52_AUDIO_PRC_RX_CH];
+  uint32_t granule_bytes = priv->rx_once_granule << 2;
+  uint32_t bytes_per_sec;
+  uint32_t granule_ms;
+  uint32_t gen;
+  uint32_t evt_before;
+  uint32_t off;
+  uint32_t irq_before;
+  uint32_t half_before;
+  uint32_t irq_delta;
+  uint32_t half_delta;
+  uint32_t periods;             /* 这次等待跨过了多少个 granule 周期 */
+  uint32_t cndtr_now;
+  uint32_t ccr_now;
+  uint32_t isr_now;
+  uint32_t dma_err_code;
+  uint32_t aprc_cfg_now;
+  uint32_t aprc_state_now;
+  uint32_t dma_state_now;
+  bool     got = false;
+  bool     rx_err;
+  bool     quiet;
+  clock_t  now;
+  int      slice;
+
+  priv->user_tid = nxsched_gettid();
+
+  /* 与老路径同一套开场：清掉上一次 stop 可能留下的计数（不清的话本次 read
+   * 一进等待就立刻返回），置忙、清打断/清 TE 旗；会话代号在 reset 之后取。 */
+
+  nxsem_reset(&priv->rx_sem, 0);
+
+  priv->rx_busy    = true;
+  priv->rx_aborted = false;
+  priv->rx_dma_err = false;
+
+  gen         = priv->session_gen;
+  evt_before  = priv->rx_once_evt;
+  irq_before  = priv->rx_irq_count;
+  half_before = priv->rx_half_irq_count;
+
+  /* 分片等待（每片 100ms、最多 5 秒）—— 分片理由与老路径完全相同（上层的
+   * join 是"先停设备再 join"，最坏 100ms 就要能把录音线程放出来）。
+   *
+   * 关键差别：判"这一帧到了没有"用的是**计数**（rx_once_evt 涨没涨），不是
+   * 信号量本身。唤醒只是"早点醒"的辅助手段，丢了也不影响 —— 下一片醒来自己
+   * 会看到计数变了。整条 arm-once 路径因此不依赖任何一次 post 的成败。
+   *
+   * 五个判据与老路径一一对应：拿到帧 / rx_aborted / 设备停了 / 会话换代 / TE。 */
+
+  for (slice = 0; slice < 50; slice++)
+    {
+      got = (priv->rx_once_evt != evt_before);
+
+      if (got || priv->rx_aborted || !priv->running ||
+          gen != priv->session_gen || priv->rx_dma_err)
+        {
+          break;
+        }
+
+      (void)nxsem_tickwait_uninterruptible(&priv->rx_sem, MSEC2TICK(100));
+    }
+
+  /* 刚完成的那半块在环里的字偏移：**在这里读一次就定下来**，别等到 memcpy
+   * 之前再读 —— 中间要是又来了一帧，读到的就是另一块（那也安全，只是把
+   * "这一次交哪一帧"往后挪了一帧）。 */
+
+  off = priv->rx_once_off;
+
+  priv->rx_busy = false;
+
+  /* 会话结束（被 stop / close / 换代）：按 EOF 返回 0，返回语义与老路径一致。
+   * 常驻环这套账一并作废，但**不在这里 abort** —— 会话边界那条收尾已经把
+   * 通道拆干净了（hw_stop/hw_shutdown 里"先看句柄状态"的 DMAStop 就在 post
+   * 之前），对着可能已被别人重新分配走的物理通道再 abort 一次是有害的。 */
+
+  if (priv->rx_aborted || !priv->running || gen != priv->session_gen)
+    {
+      priv->rx_aborted = false;
+      sf32lb52_audio_rx_once_reset(priv);
+      return 0;
+    }
+
+  rx_err = priv->rx_dma_err;
+  priv->rx_dma_err = false;
+
+  if (got)
+    {
+      /* 一帧真的到手了：把刚完成的那半块拷给调用者。
+       *
+       * 这一拷贝为什么不会和 DMA 抢同一块内存：环是 2 个 granule 的乒乓，
+       * 刚完成的那半块在接下来一整个 granule 周期里不会被 DMA 碰（它正在写
+       * 另一半）—— 见 sf32lb52_audio_rx_once_prepare 里武装时的说明。
+       * （按时间尺度也对得上：16k 单声道下 DMA 每秒才写 32 KB，一次 640 字节
+       * 的拷贝比它快三个数量级。） */
+
+      memcpy(buffer, (FAR const void *)(g_rx_once_ring + off), granule_bytes);
+
+      /* 中途漏过的帧：上层处理一帧要时间，这期间 DMA 一圈一圈在写。漏掉的帧
+       * 已经取不回来（被覆盖了），如实计数 —— 它一涨就说明"上层跟不上设备的
+       * 速度"，是上层的问题，不是通路的问题。 */
+
+      if (priv->rx_once_evt - evt_before > 1)
+        {
+          priv->rx_once_lost += (priv->rx_once_evt - evt_before) - 1u;
+        }
+
+      /* 这一帧交上去了 = "冻结形状分诊"的参照点就落在这里（与老路径同一套
+       * 快照、同一个位置：不能放到 read 开头，也不能放到上面那条 EOF 返回
+       * 0 的路上，理由见老路径末尾那段）。 */
+
+      priv->rx_ok_arm_seq   = priv->rx_arm_seq;
+      priv->rx_ok_time      = clock_systime_ticks();
+      priv->rx_ok_gen       = priv->session_gen;
+      priv->rx_ok_sreset    = priv->aprc_sreset_count;
+      priv->rx_ok_hwstop    = priv->hw_stop_count;
+      priv->rx_ok_playstart = priv->playstart_count;
+
+      priv->rx_stall_seen         = 0;
+      priv->rx_stall_logged       = false;
+      priv->rx_once_stall_periods = 0;
+
+      return buflen;
+    }
+
+  /* ---- 到这里：这一帧没等到（5 秒分片等完，或者是被 TE 提前结束的） ---- */
+
+  now = clock_systime_ticks();
+
+  /* 这一等跨过了多少个 granule 周期：slice 就是已经等完的 100ms 片数
+   * （循环是"先看有没有帧、再等一片"，所以 break 在第 i 片时刚好等了 i 片；
+   *  跑满就是 50 片 = 5 秒）。20ms 一帧、等满 5 秒 = 250 个周期。 */
+
+  bytes_per_sec = (uint32_t)priv->samplerate *
+                  (uint32_t)(priv->nchannels ? priv->nchannels : 1) *
+                  (uint32_t)(priv->bpsamp ? priv->bpsamp : 16) / 8u;
+  granule_ms = (bytes_per_sec != 0) ?
+               (1000u * granule_bytes / bytes_per_sec) : 0u;
+  if (granule_ms == 0)
+    {
+      granule_ms = 1u;      /* 参数没配好时退化：至少不要把周期数算成除零 */
+    }
+
+  periods = (uint32_t)slice * 100u / granule_ms;
+
+  /* 现场寄存器快照。arm-once 下没有"停 DMA 之前/之后"的区别（本来就没停），
+   * 所以直接在武装状态下读 —— 这比老路径更干净：读到的就是运行中的真值。
+   *
+   * 判读（字段含义与老路径同一套，只有 CNDTR 的满值不同）：
+   *   CNDTR 满值 = 2 × granule（20ms 帧 = 320 字），它停在哪个值就是这一圈
+   *     搬到了哪儿；
+   *   CNDTR 与上一次超时的 CNDTR 一模一样 + irq_delta=0 → 这两段 5 秒里
+   *     **DMA 一个字节都没动**，请求线死了的硬证据（老路径是"CNDTR 仍满值"）；
+   *   ISR 干干净净（0x0）→ 连一个待处理标志都没有，中断压根没产生；
+   *   hdma[RX].State 仍是 BUSY → 通道一直武装着，没人 abort 过它（arm-once
+   *     下这条几乎恒真，它保留的意义是"万一真被别人收走了就别做软复位"）。 */
+
+  cndtr_now      = (hdma_rx != NULL && hdma_rx->Instance != NULL) ?
+                    (uint32_t)hdma_rx->Instance->CNDTR : 0u;
+  ccr_now        = (hdma_rx != NULL && hdma_rx->Instance != NULL) ?
+                    (uint32_t)hdma_rx->Instance->CCR : 0u;
+  isr_now        = (hdma_rx != NULL && hdma_rx->DmaBaseAddress != NULL) ?
+                    (uint32_t)hdma_rx->DmaBaseAddress->ISR : 0u;
+  dma_err_code   = (hdma_rx != NULL) ? (uint32_t)hdma_rx->ErrorCode : 0u;
+  dma_state_now  = (hdma_rx != NULL) ? (uint32_t)hdma_rx->State : 0u;
+  aprc_state_now = (uint32_t)priv->aprc.State[SF32LB52_AUDIO_PRC_RX_CH];
+  aprc_cfg_now   = (uint32_t)priv->aprc.Instance->CFG;
+
+  irq_delta  = priv->rx_irq_count - irq_before;
+  half_delta = priv->rx_half_irq_count - half_before;
+
+  /* 日志限频与老路径同规矩：TE 让 read 立刻返回，持续性 TE 会刷屏；超时本身
+   * 就要等满 5 秒，天然每秒最多一条。 */
+
+  if (rx_err)
+    {
+      quiet = (int32_t)(now - priv->rx_dma_err_log_next) < 0;
+
+      if (quiet)
+        {
+          priv->rx_dma_err_silenced++;
+        }
+      else
+        {
+          priv->rx_dma_err_log_next = now + MSEC2TICK(SF32LB52_AUDIO_RECOVER_LOG_MS);
+        }
+    }
+  else
+    {
+      quiet = false;
+      priv->rx_timeout_count++;
+    }
+
+  if (!quiet)
+    {
+      syslog(LOG_WARNING,
+             "AUDIO: read 等 DMA 失败（arm-once ret=%d err_te=%d granule=%u 字）"
+             " irq=%u half=%u evt=%u lost=%u stall=%u"
+             " read=%u timeout=%u busy_fail=%u not_armed=%u"
+             " dma_err=%u dma_err_silenced=%u recov=%u irq_delta=%u half_delta=%u"
+             " CNDTR=%u CNDTR_prev=%u CCR=0x%x ISR=0x%x dma_err_code=0x%x CFG=0x%x"
+             " aprc.State[RX]=0x%x hdma[RX].State=0x%x"
+             " t=%u running=%d playback=%d"
+             " arm_sess=%u arm_boot=%u ok_arm=%u since_ok_ms=%u%s"
+             " hwstop=%u sreset=%u d_sreset=%u d_hwstop=%u d_gen=%u d_play=%u\n",
+             (int)(rx_err ? 0 : -ETIMEDOUT), (int)rx_err,
+             (unsigned)priv->rx_once_granule,
+             (unsigned)priv->rx_irq_count,
+             (unsigned)priv->rx_half_irq_count,
+             (unsigned)priv->rx_once_evt,
+             (unsigned)priv->rx_once_lost,
+             (unsigned)priv->rx_once_stall_periods,
+             (unsigned)priv->rx_read_count,
+             (unsigned)priv->rx_timeout_count,
+             (unsigned)priv->rx_dma_busy_fail,
+             (unsigned)priv->rx_dma_not_armed,
+             (unsigned)priv->rx_dma_err_count,
+             (unsigned)priv->rx_dma_err_silenced,
+             (unsigned)priv->rx_recover_count,
+             (unsigned)irq_delta,
+             (unsigned)half_delta,
+             (unsigned)cndtr_now,
+             (unsigned)priv->rx_once_cndtr_prev,
+             (unsigned)ccr_now,
+             (unsigned)isr_now,
+             (unsigned)dma_err_code,
+             (unsigned)aprc_cfg_now,
+             (unsigned)aprc_state_now,
+             (unsigned)dma_state_now,
+             (unsigned)TICK2MSEC(now),
+             (int)priv->running, (int)priv->playback,
+             (unsigned)priv->rx_arm_session,
+             (unsigned)priv->rx_arm_seq,
+             (unsigned)priv->rx_ok_arm_seq,
+             (priv->rx_ok_arm_seq != 0) ?
+               (unsigned)TICK2MSEC(now - priv->rx_ok_time) : 0u,
+             (priv->rx_ok_arm_seq != 0) ? "" : "（开机以来还没有成功帧）",
+             (unsigned)priv->hw_stop_count,
+             (unsigned)priv->aprc_sreset_count,
+             (unsigned)(priv->aprc_sreset_count - priv->rx_ok_sreset),
+             (unsigned)(priv->hw_stop_count - priv->rx_ok_hwstop),
+             (unsigned)(priv->session_gen - priv->rx_ok_gen),
+             (unsigned)(priv->playstart_count - priv->rx_ok_playstart));
+
+      if (rx_err)
+        {
+          priv->rx_dma_err_silenced = 0;
+        }
+    }
+
+  /* 自愈判据的 arm-once 等价形态（老路径那句"连续多少次 arm 一个字节都没搬"
+   * 在这里的同一条时间轴上的写法）：
+   *
+   *   老路径：irq_delta == 0（整整 5 秒一个完成中断都没来）
+   *           && hdma[RX].State == BUSY（停机前通道仍武装，没人 abort 过）
+   *   arm-once：irq_delta == 0 等价于"连着 periods 个 granule 周期没有新的
+   *           TC"（periods 就是上面按等待时长 / 周期算出来的数，20ms 一帧
+   *           等满 5 秒 = 250 个周期）；第二条照留 —— arm-once 下没人会去
+   *           abort 它，但万一真被别人收走了（TE 之外的异常），那就不该做
+   *           AUDPRC 软复位，那种情况下贸然复位反而把正常通路拆了。
+   *
+   *   TE 那一路（rx_err）不参与这套计数：它不是"等不到"，上面那条日志已经
+   *   把话说完了，混进来只会让"连续多少个周期没有 TC"这条线上多出 0 周期
+   *   的假账。 */
+
+  if (!rx_err && irq_delta == 0 && half_delta == 0)
+    {
+      priv->rx_stall_seen++;
+      priv->rx_once_stall_periods += periods;
+
+      if (!quiet && !priv->rx_stall_logged)
+        {
+          FAR const char *shape;
+
+          if (priv->rx_ok_arm_seq == 0)
+            {
+              shape = "无参照：开机以来还没有成功返回过的帧，分不出形状";
+            }
+          else if (priv->playstart_count != priv->rx_ok_playstart)
+            {
+              shape = "形状(c) 半双工切向：冻之前有播放会话把设备收走再放开";
+            }
+          else if (priv->aprc_sreset_count != priv->rx_ok_sreset ||
+                   priv->hw_stop_count != priv->rx_ok_hwstop ||
+                   priv->session_gen != priv->rx_ok_gen)
+            {
+              shape = "形状(b) 会话边界之后立刻冻：上一次成功帧之后有过 "
+                      "hw_stop/软复位/换会话 → 查复位序列与恢复完整性";
+            }
+          else
+            {
+              shape = "形状(a) 会话中间自己冻：距上次成功之间没有任何 "
+                      "stop/复位/换会话。arm-once 之后这条路径上已经**没有**"
+                      "每帧 abort/re-arm 了 —— 若仍出现，说明请求线断在 AUDPRC/"
+                      "ADC 侧，与 DMA 通道的拆装无关";
+            }
+
+          priv->rx_stall_logged = true;
+
+          syslog(LOG_WARNING,
+                 "AUDIO: RX 数据停了：连续 %u 个 granule 周期没有新的 TC"
+                 "（= 连续 %u 次等待一帧都没等到；HT 与 TC 这整段里一次都没来、"
+                 "CNDTR=%u/%u）；本会话第 %u 次 arm（arm-once 恒为 1）/ 开机第 %u 次；"
+                 "距上一帧成功 %u ms%s；期间 soft reset %u 次 / hw_stop %u 次 / "
+                 "换会话 %u 代 / 起播放会话 %u 次；CFG=0x%x（bit7=ADC_PATH_EN）"
+                 " → %s\n",
+                 (unsigned)priv->rx_once_stall_periods,
+                 (unsigned)priv->rx_stall_seen,
+                 (unsigned)cndtr_now,
+                 (unsigned)(priv->rx_once_granule * 2u),
+                 (unsigned)priv->rx_arm_session,
+                 (unsigned)priv->rx_arm_seq,
+                 (priv->rx_ok_arm_seq != 0) ?
+                   (unsigned)TICK2MSEC(now - priv->rx_ok_time) : 0u,
+                 (priv->rx_ok_arm_seq != 0) ? "" : "（开机以来还没有成功帧）",
+                 (unsigned)(priv->aprc_sreset_count - priv->rx_ok_sreset),
+                 (unsigned)(priv->hw_stop_count - priv->rx_ok_hwstop),
+                 (unsigned)(priv->session_gen - priv->rx_ok_gen),
+                 (unsigned)(priv->playstart_count - priv->rx_ok_playstart),
+                 (unsigned)aprc_cfg_now,
+                 shape);
+        }
+    }
+  else
+    {
+      /* 有字节在动（哪怕只是半满/TE 之外的正常流动）：不是在"停"这个状态里了，
+       * 计数器和"本回合已经打过日志"的旗一起归零 —— 下次真停会重新算、也会
+       * 重新打一条（否则只有开机那一次能看见）。TE 那一路也会落到这里（上面
+       * 的 `!rx_err` 把它挡在计算之外），正好顺带把这套账复位。 */
+
+      priv->rx_stall_seen         = 0;
+      priv->rx_stall_logged       = false;
+      priv->rx_once_stall_periods = 0;
+    }
+
+  priv->rx_once_cndtr_prev = cndtr_now;
+
+  /* 自愈：与老路径同一对判据的等价形态（见上面那段）。恢复完把常驻环这套账
+   * 作废 —— 下一次 read 会在恢复好的块上重新**只武装一次**。
+   * 本次 read 仍然按契约返回 -ETIMEDOUT（没等到就是没等到）。 */
+
+  if (rx_err ||
+      (irq_delta == 0 && dma_state_now == HAL_DMA_STATE_BUSY))
+    {
+      priv->rx_recover_count++;
+      sf32lb52_audio_recover_rx(priv);
+      sf32lb52_audio_rx_once_reset(priv);
+    }
+
+  return -ETIMEDOUT;
+}
+#endif /* SF32LB52_AUDIO_ARM_ONCE */
+
 /****************************************************************************
  * Name: sf32lb52_audio_read
  *
@@ -2563,6 +3207,21 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
              buflen, (int)priv->running);
       return 0;
     }
+
+#if SF32LB52_AUDIO_ARM_ONCE
+  /* M3：能走"整场会话只武装一次 DMA"就不要再走下面那条每帧 arm/abort 的老路。
+   *
+   * prepare 会把"能不能走"和"该不该在这一次武装"一起判掉（帧长不合 / 超过
+   * 常驻环 / 队列模式 → 返回 false，本条 read 逐字落回老路径，一行不差）。
+   * 返回 true 时 DMA 一定已经武装好，read_once 只等完成通知 + 拷走刚完成的
+   * 那半块 —— 每帧那次 HAL_DMA_Abort / DMA_FreeChannel / NVIC 关开 /
+   * 重新 Start_IT 在这条路上彻底不存在。 */
+
+  if (sf32lb52_audio_rx_once_prepare(priv, buflen))
+    {
+      return sf32lb52_audio_read_once(priv, buffer, buflen);
+    }
+#endif
 
   /* 记下"这次会话最近一次真的有人在读"（判残留时的一条证据，见
    * sf32lb52_audio_holder_alive）。起会话的线程可能早就退了、读数据的是另一个
@@ -3305,6 +3964,31 @@ void HAL_AUDPRC_RxCpltCallback(AUDPRC_HandleTypeDef *haprc, int cid)
 
   priv->rx_irq_count++;
 
+#if SF32LB52_AUDIO_ARM_ONCE
+  /* 常驻环（M3）：一个 TC = **第二半块**写完 = 一帧到手。
+   *
+   * 与老路径的区别就一条，但很关键：这里**不清 rx_busy**。老路径里那面旗是
+   * "等一次就清"的一次性闩（一次 read 只等一个完成中断），而 arm-once 下一次
+   * 会话要等几十上百个 TC —— 清了它就再也 post 不出去了。arm-once 下 rx_busy
+   * 的含义就是"有 read 正在等"，整条 read 期间都得立着。
+   *
+   * 顺序也不能反：先写偏移、再自增计数。read 只要看到 evt 变了，就一定能
+   * 看到与之配对的那个偏移（单核、且中间那次函数调用是编译屏障）。 */
+
+  if (priv->rx_once_armed)
+    {
+      priv->rx_once_off = priv->rx_once_granule;
+      priv->rx_once_evt++;
+
+      if (priv->rx_busy)
+        {
+          nxsem_post(&priv->rx_sem);
+        }
+
+      return;
+    }
+#endif
+
   if (priv->rx_busy)
     {
       priv->rx_busy = false;
@@ -3349,6 +4033,29 @@ void HAL_AUDPRC_RxHalfCpltCallback(AUDPRC_HandleTypeDef *haprc, int cid)
   /* 无条件自增（和 rx_irq_count 同一个规矩：这条只回答"来过没有"）。 */
 
   priv->rx_half_irq_count++;
+
+#if SF32LB52_AUDIO_ARM_ONCE
+  /* 常驻环（M3）：一个 HT = **第一半块**写完 = 一帧到手，和 TC 对称
+   * （TC 是第二半块，见 HAL_AUDPRC_RxCpltCallback）。
+   *
+   * 一帧一次通知正是这么来的：武装时给的是 2 个 granule，半满落在第一个
+   * granule 的末尾、完成落在第二个的末尾 —— 两个事件各对应一整帧，于是
+   * arm-once 下"等一帧"就是"等下一个 HT 或 TC"。
+   *
+   * 只记偏移 + 计数 + 叫醒正在等的那一次 read；不碰 rx_busy（理由见 TC 那边），
+   * 也不做任何会改变通路状态的事。 */
+
+  if (priv->rx_once_armed)
+    {
+      priv->rx_once_off = 0;
+      priv->rx_once_evt++;
+
+      if (priv->rx_busy)
+        {
+          nxsem_post(&priv->rx_sem);
+        }
+    }
+#endif
 }
 
 /****************************************************************************

@@ -2,10 +2,20 @@
 
 > 智爱陪伴 —— openvela 音频输入输出接口（成员一交付物）
 > 硬件：SF32LB52-DevKit-LCD（板载 MEMS 麦克风 + NS4150B Class-D 功放 + 外接喇叭）
-> 状态：**播放与录音均已在真机验证通过**（2026-09-10）
+> 状态：**播放与录音均已在真机验证通过**（2026-09-10），
+> 但**录音长跑会永久断流**（2026-09-15 定案，未根治）—— 见下面这条警告。
+>
+> ⚠️ **2026-09-15 定案的已知问题（头号风险）**：录音跑一段时间后 RX 会**永久停死**，
+> `read()` 固定 5 秒返回 `errno=ETIMEDOUT(110)`（驱动日志 `ret=-110`），软复位无效、
+> **只有真断电才能恢复**，期间还会把 USB/RNDIS 一起拖死。现象、判读指纹、已排除项、
+> 最小复现与现场建议全在 **第 11 节** —— 动录音之前先读它。
+>
 > 录音的应用层封装是板级模块 `board/contest_board/src/sf32lb52_audio_in.{h,c}`
-> （`audio_in_start/read/stop`，接口与示例见 **第 9 节**），原理与坑见 **3.1 / 3.2 节**；
+> （`audio_in_start/read/stop/abandon`，接口与示例见 **第 9 节**），原理与坑见 **3.1 / 3.2 节**；
 > 命令行自检：`audio_test record` / `hw_test audio`（后者已改成调这个封装）
+>
+> 本文里的 `sf32lb52_audio.c:` 行号按当前 HEAD 标注，会随提交漂移；
+> 对不上时**以函数名/注释为准**（驱动正文里的注释比行号详细得多）。
 
 ## 1. 概述
 
@@ -86,15 +96,17 @@ nsh> hw_test audio 2           # 录 2 秒，打印 peak/avg 和"是否检测到
 固定参数：**16 kHz / 单声道 / 16bit 小端（s16le）**，设备路径
 **`/dev/audio/audio0`（带 `audio/` 子目录）**。
 
-三个函数（签名与本模块头文件一致）：
+四个函数（签名与本模块头文件一致）：
 
 ```c
 int     audio_in_start(int sample_rate, int channels, int bits);  /* 0 = 成功 */
 ssize_t audio_in_read(FAR void *buf, size_t len);                 /* 实际字节数 */
 int     audio_in_stop(void);                                      /* 没录时是空操作 */
+int     audio_in_abandon(void);   /* 会话不是本层停的（read 返回 0）时的收尾入口 */
 ```
 
-典型用法（**1 秒一块读，读到 `<= 0` 必须跳出**）：
+典型用法（**1 秒一块读；`0` 要跳出，`-1` + `errno=ETIMEDOUT` 要接着读**，
+需 `#include <errno.h>`）：
 
 ```c
 int16_t *buf = malloc(nsamples * sizeof(int16_t));
@@ -111,21 +123,35 @@ while (offset < nsamples * 2)
         chunk = AUDIO_IN_CHUNK_BYTES;
       }
 
+    errno = 0;                                 /* 判超时只看 errno，必须先清 0 */
     n = audio_in_read((char *)buf + offset, chunk);
-    if (n <= 0)                                /* 0 / 负值都必须跳出，否则死循环 */
+
+    if (n == 0)                                /* 0 = 会话结束（被 STOP 打断）→ 跳出 */
       {
         break;
+      }
+
+    if (n < 0)                                 /* 负值：只有超时才是"跳过接着读" */
+      {
+        if (errno != ETIMEDOUT)
+          {
+            break;                             /* 别的错误才算这一代会话坏了 */
+          }
+
+        continue;                              /* 这一帧没等到数据，接着读下一帧 */
       }
 
     offset += (int)n;
   }
 
+/* 自己把设备停掉时用 audio_in_stop()；循环若是"被别人抢走/停掉"（read 返回 0）
+ * 而退出的，收尾该用 audio_in_abandon() —— 分工见第 9.1 节。 */
 audio_in_stop();
 free(buf);
 ```
 
 `app/audio_test/main.c` 是已经在真机跑通的参考实现，`app/hw_test/main.c` 的
-`hw_test audio` 现在也改成调这三个函数，所以那次自检本身就是对这个封装的验证。
+`hw_test audio` 现在也改成调这套函数，所以那次自检本身就是对这个封装的验证。
 
 ### 缓冲区大小怎么算
 
@@ -142,27 +168,29 @@ free(buf);
 
 - `read()`（以及 `audio_in_read()`）**会一直阻塞到读满你要求的字节数**，
   期间任务处于等待状态，不占 CPU。
-- 驱动下层一次 read 内部还有一个 **5 秒超时**
-  （`board/contest_board/src/sf32lb52_audio.c:1130`
-  的 `nxsem_tickwait_uninterruptible(..., MSEC2TICK(5000))`），
-  超时会**返回 0**，所以"读 6 秒"必须拆成 6 次 1 秒，不能一次读（坑 3）。
+- 驱动下层一次 read 内部还有一个 **5 秒上限**（现在是 50 片 × 100ms 的分片等待，
+  `sf32lb52_audio_read()` 里那个 `for (slice = 0; slice < 50; slice++)` 循环）。
+  **超时不再返回 0**：它返回 `-ETIMEDOUT`（经 POSIX `read()` 那层变成 `-1` +
+  `errno=110`，驱动日志里就是 `ret=-110`），语义是"**这一次没等到数据、会话还活着**"；
+  返回 **0** 才是"会话真的结束了"（被 STOP 打断 / 设备没在跑 / 换了新会话）。
+  两者必须分开处理，见 3.2 坑 2。"读 6 秒"仍然必须拆成 6 次 1 秒，不能一次读（坑 3）。
 - **从别的任务发 `AUDIOIOC_STOP` 能把阻塞中的 read 唤醒**
-  （驱动已修：`sf32lb52_audio.c:665-721` 的 `sf32lb52_audio_hw_stop()`，
-  先 `nxsem_post(&priv->rx_sem)`（`:686`），再把还挂在 DMA 上的 buffer
-  通过 `AUDIO_CALLBACK_DEQUEUE` 还给上层（`:698-704`），
-  于是 read 返回 0 而不是一直等满）。
+  （驱动已修：`sf32lb52_audio_hw_stop()` 里先 `nxsem_post(&priv->rx_sem)`
+  把等待放掉，再把还挂在 DMA 上的 buffer 通过 `AUDIO_CALLBACK_DEQUEUE`
+  还给上层，于是 read 返回 0 而不是一直等满）。
   这也是做"录音必须带超时/必须能取消"的基础。
   用 3.1 的封装时，就是**从别的任务调 `audio_in_stop()`**（内部先
   `AUDIOIOC_STOP` 再 `close`）；因为 `audio_in_read()` 阻塞期间**不持锁**，
   这个"救场"调用不会被锁挡住（见第 9 节）。
-- `read` 返回 **0 不是错误码，而是"这次没读到任何字节"**（被打断或超时），
-  上层必须跳出循环；返回正数才是读到的字节数。
+- `read` 返回 **0 不是超时、而是"这一代会话结束了"**，上层必须跳出循环；
+  返回正数是读到的字节数；返回 `-1` 且 `errno=ETIMEDOUT` 是"这一次没等到数据"，
+  跳过这一帧接着读（**别拿它去拆设备重录**）。
 
 ### 不能同时录放
 
 `AUDIOIOC_STOP` 会**同时关掉播放和录音两条通路**
-（`sf32lb52_audio_hw_stop()` 里 TX/RX DMA 一起停，
-`sf32lb52_audio.c:667-668`），而且 codec 通路在硬件上也是分时复用的。
+（`sf32lb52_audio_hw_stop()` 里 TX/RX DMA 一起停），
+而且 codec 通路在硬件上也是分时复用的。
 所以：
 - 不要一个任务 `write()`、另一个任务 `read()` 想全双工；
 - 要"边说边听"（打断识别）请**顺序做**：先录完 → 停止 → 再播。
@@ -173,14 +201,18 @@ free(buf);
 
 1. **设备路径带子目录**：是 `/dev/audio/audio0`。
    写成 `/dev/audio0` 一定 `open` 失败（`audio_register("audio0")` 的结果，
-   见 `sf32lb52_audio.c:1205`）。
-2. **`read` 返回 0 要立刻跳出**。0 = 被 `AUDIOIOC_STOP` 打断，
-   或下层 5 秒超时，或 `!priv->running` 的提前返回
-   （`sf32lb52_audio.c:1107-1112`）。**别把 0 当成"这次没数据、继续读"**，
-   否则就是死循环。
-3. **单次 read 不要超过 5 秒**（下层 `rx_sem` 超时是 5 秒，
-   `sf32lb52_audio.c:1130`）。建议一律拆成 1 秒（32000 字节）一块，
-   这也是 `audio_test` 验证过的大小。
+   见 `sf32lb52_audio.c` 的 `audio_register()` 那行）。
+2. **`read` 的 0 和负值语义不同，别混**：
+   - **0 = 这一代会话结束了**（被 `AUDIOIOC_STOP` 打断 / 设备没在跑 /
+     换了新会话）→ **立刻跳出**，别再当"这次没数据"继续读，否则就是死循环；
+   - **`-1` + `errno=ETIMEDOUT`（110）= 这次没等到数据、会话还活着** →
+     **跳过这一帧接着读**。真机上大约 10% 的读会走到这里，把它当"会话死了"
+     去拆设备重录，就会每 5 秒拆一次、一句话永远攒不齐（这正是修过的老 bug）。
+   调 `audio_in_read()` 前**先把 `errno` 清 0**，读后立刻取 `errno` 快照再判
+   （`sf32lb52_audio_in.c` 只是把 POSIX `read()` 的结果原样返回，超时判据全在
+   `errno` 上）；"连续超时到上限才算会话死"的完整策略见第 9 节。
+3. **单次 read 不要超过 5 秒**（下层分片等待总共等 5 秒）。
+   建议一律拆成 1 秒（32000 字节）一块，这也是 `audio_test` 验证过的大小。
 4. **必须能取消**：录音任务阻塞在 read 里时，只能由**另一个任务**
    发 `AUDIOIOC_STOP` 来救。所以"录 N 秒"要带看门狗：
    起一个读任务，主任务等 N + 余量秒，超时就 STOP。
@@ -189,7 +221,9 @@ free(buf);
 5. **不要在中断/DMA 回调里 printf**（会因控制台锁死锁整机，
    见下面第 4 节第 4 条）。
 6. **STOP 后要重新 CONFIGURE + START** 才能再录（`audio_test loop` 验证过
-   可以连续 open/config/start/stop/close）。
+   可以连续 open/config/start/stop/close）。但**别把"反复重开会话"当零成本**：
+   "每帧 DMA abort/re-arm + 每帧把 ADC 通路掰断一次"正是第 11 节那个 RX 永久
+   断流问题的嫌疑根因，长跑或高频重开会话前先读第 11 节。
 7. 音量接口用 `AUDIOIOC_CONFIGURE` + `AUDIO_TYPE_FEATURE` +
    `AUDIO_FU_VOLUME`（`ac_controls.hw[0]` = 0..1000，
    0 = -36dB、1000 = +6dB），录音时它改的是**麦克风数字增益**；
@@ -367,14 +401,27 @@ hw_test alarm 1|2|3   -> 各 4/4 PASS（见 docs/alarm_usage.md）
  * 已经在录音中返回 -EBUSY（**不会**先停再开，避免打断别人正在录的会话）。 */
 int audio_in_start(int sample_rate, int channels, int bits);
 
-/* 阻塞读一段 PCM，返回实际读到的字节数（<0 为负 errno，未 start 时 -EINVAL）。
- * 返回 0 = 被 AUDIOIOC_STOP 打断或下层 5 秒超时，**必须跳出循环**。
+/* 阻塞读一段 PCM，返回实际读到的字节数；负值 = POSIX read() 失败
+ *（返回 -1，原因看 errno），未 start 时直接返回 -EINVAL。
+ *
+ * 两种"读不到"必须分开：
+ *   返回 0                    = 这一代会话结束了（被 AUDIOIOC_STOP 打断 /
+ *                               设备没在跑 / 换了新会话）→ **跳出循环**；
+ *   -1 且 errno = ETIMEDOUT  = 只是这一次没等到数据、会话还活着
+ *                               → 跳过这一帧接着读，**不要**拆设备重录。
+ * 判超时**只能看 errno**：调用前先 errno = 0，调用后立刻取快照。
  * 单次不要超过 AUDIO_IN_CHUNK_BYTES（1 秒 = 32000 字节）。 */
 ssize_t audio_in_read(FAR void *buf, size_t len);
 
 /* STOP + close；没在录音时是安全的空操作，返回 OK。
  * 可以从别的任务调它，唤醒正阻塞在 audio_in_read() 里的任务。 */
 int audio_in_stop(void);
+
+/* 只清本层状态 + close 自己的 fd，**绝不发设备级 AUDIOIOC_STOP**。
+ * 用在"这次会话不是被本层停的"那类收尾路径上（read 返回 0/EOF，说明
+ * 设备已被别人停掉或抢走）—— 这时再发一次 STOP 会把刚接管设备的那个
+ * 会话一起打死。自己主动停设备仍然用 audio_in_stop()。 */
+int audio_in_abandon(void);
 ```
 
 参数约束（不做隐式纠正，非法直接 `-EINVAL`）：
@@ -442,13 +489,27 @@ int record_3s_to_file(const char *path)
       return -1;
     }
 
-  for (sec = 0; sec < REC_SECONDS; sec++)
+  for (sec = 0; sec < REC_SECONDS; )
     {
-      ssize_t n = audio_in_read(chunk, CHUNK_BYTES);
+      ssize_t n;
 
-      if (n <= 0)                            /* 0 = 被 STOP 打断/超时，必须跳出 */
+      errno = 0;                             /* 判超时只看 errno，先清 0 */
+      n = audio_in_read(chunk, CHUNK_BYTES);
+
+      if (n == 0)                            /* 0 = 会话结束（被 STOP 打断）→ 退出 */
         {
-          printf("read chunk %d failed: %zd\n", sec, n);
+          printf("read chunk %d: EOF（会话已结束）\n", sec);
+          break;
+        }
+
+      if (n < 0)
+        {
+          if (errno == ETIMEDOUT)            /* 只是这一帧没数据：跳过、不占这一秒 */
+            {
+              continue;
+            }
+
+          printf("read chunk %d failed: %d\n", sec, errno);
           break;
         }
 
@@ -459,6 +520,7 @@ int record_3s_to_file(const char *path)
         }
 
       printf("chunk %d: %zd bytes\n", sec, n);
+      sec++;                                 /* 只有真读到一秒才推进 */
     }
 
   ret = (sec == REC_SECONDS) ? 0 : -1;
@@ -477,8 +539,9 @@ int record_3s_to_file(const char *path)
   只是 `read` 次数更多。
 - 写文件就是标准 POSIX `open`/`write`，要挑一个**可写目录**
   （比如 `/data` 或 `/mnt`，取决于板子挂载了什么）。
-- 不管成功还是失败都要收尾：`close(fd)` + `audio_in_stop()`，
-  否则设备一直占着，`close()` 的 shutdown 路径也不会被触发。
+- 不管成功还是失败都要收尾：`close(fd)` + `audio_in_stop()`（若这次循环是因为
+  **read 返回 0、设备被别人停掉/抢走**而退出的，收尾该用 `audio_in_abandon()`，
+  见 9.1 节的入口分工），否则设备一直占着，`close()` 的 shutdown 路径也不会被触发。
 - 要"边说边听"的请**顺序做**（先录完 → `audio_in_stop()` → 再播），
   `AUDIOIOC_STOP` 会把播放和录音两条通路一起关掉（第 3.1 节末）。
 
@@ -513,3 +576,107 @@ ASR → 大模型 → TTS → 播放（实现见 `app/robot_ui/main.c` 的语音
 
 ⚠️ 麦克风是**半双工独占**的：录音和播放不能并行，两个 app 也不能同时占着
 `/dev/audio/audio0`（所以 `hello_app` 的开机自启被关掉了，界面所在的 `robot_ui` 当唯一入口）。
+
+---
+
+## 11. 已知问题：录音长跑后 RX 永久断流（2026-09-15 定案，**未根治**）
+
+> 本节是**上板实测**的定案（冻结现场原始日志 + 分诊仪表），不是推测。
+> 结论已经把范围收窄到一个具体动作，但**根因还没修掉**，一律按"会再犯"对待。
+> 现场碰到它，**唯一的恢复手段是真断电**。
+
+### 11.1 现象
+
+录音会话正常跑一段时间（M1 之前几秒~几十秒就中；M1 之后**拉长了 13~39 倍，但仍然会中**）
+之后，RX 通路**永久停住**：
+
+- `read()` 开始**每次固定等满 5 秒**才返回，`errno = ETIMEDOUT(110)`；
+  串口/驱动日志里的原文就是 `ret=-110`，而且**之后每一次读都这样，不会自己好**；
+- 驱动的两个心跳计数 `irq` / `half` **冻死**（不再增长）；
+- 驱动内建的自愈（`HAL_AUDPRC` **软复位** + 重建会话）**无效** ——
+  现场出现"复位风暴"（第 7 次自愈、距上次成功仅 7670ms），只压症状、压不住根因；
+- **唯一有效的恢复手段是真断电重新上电**。进了这个状态之后，
+  起新会话 / open / close / STOP 全都没用。
+
+**附带效应（查网络问题时极容易被带偏）**：断流之后板子的 USB/RNDIS 会一起废掉 ——
+Windows 侧网卡显示「**200Mbps 已连接**」，链路看着是好的，但**一个包都不通**；
+板子侧发起连接打印 `connect: Error 101`。这是"链路在、流量死"的典型形态：
+**先看串口有没有 `ret=-110` 在刷，再去怀疑 ICS/DNS/MQTT**
+（网络侧速查表也补了这一条，见 `docs/network_api_usage.md` 第 9 节）。
+
+### 11.2 判读指纹（现场日志原文 + 逐字段读法）
+
+实际是一条 `syslog`，这里按字段折行显示：
+
+```
+AUDIO: read 等 DMA 失败（ret=-110 err_te=0） irq=330 half=354 not_armed=0 dma_err=0
+       irq_delta=0 half_delta=0 CNDTR=160 CCR=0x2aaf ISR=0x0
+       aprc.State[RX]=0x8 hdma[RX].State=0x2 running=1
+```
+
+| 字段 | 值 | 读法 |
+|------|----|------|
+| `CNDTR` | **160**（满值） | 一帧 = 320 样本 = 640 字节 = **160 个 32bit 字**。160 表示这个 arm 周期**一个字节都没搬** ⇒ **DMA 的请求线从头到尾没被拉高**，坏在数据源头（AUDPRC 的 RX/ADC 一侧），和 DMA 通道本身无关 |
+| `irq_delta` | **0** | 这 5 秒里完成中断一次都没来（`irq=330` 是开机以来的累计值，看增量） |
+| `half_delta` | **0** | 半满中断也没来 ⇒ **排除**"数据其实在流、只是完成通知丢了" |
+| `hdma[RX].State` | `0x2` = **BUSY** | DMA 通道一直武装着，没被人 abort 掉 |
+| `not_armed` | **0** | 这一帧是**真的武装成功**了（不是"没起来"那条提前返回 0 的路） |
+| `err_te` / `dma_err` | **0** | **排除 DMA 侧传输错误（TE）** |
+| `CFG` bit7 | **1** | `CFG.ADC_PATH_EN` 是开的 —— M1 开关确实生效（见 11.4） |
+| `aprc.State[RX]` | `0x8` | `HAL_AUDPRC_STATE_BUSY_RX`，AUDPRC 自己也认为"还在收" |
+| `CCR` | `0x2aaf` | 停机这一刻通道还武装着：EN / TCIE / HTIE / TEIE / CIRC 都在，没人动过 |
+| `ISR` | `0x0` | 该通道连一条 TC/HT/TE 标志都没挂 ⇒ 中断**压根没产生**，不是"产生了没人处理" |
+
+一句话：**DMA 侧一切正常（武装着、无错误、状态机说在跑），但这 5 秒里
+AUDPRC 一个数据字都没往 DMA 送、连中断都没冒出来** ⇒ 停的不是 DMA，
+是 **AUDPRC 的 RX/ADC 侧不再发 DMA 请求**。
+
+驱动还会另打一条形状判词（只在状态变化时打，不是周期日志）：
+`AUDIO: RX 数据停了：连续 N 次 arm 一个字节都没搬到… → 形状(a|b|c)`。
+
+### 11.3 已经排除的（都做过实验）
+
+| 假设 | 证据 | 结论 |
+|------|------|------|
+| 内存不够（分配失败） | `free`：总 8.65 MB、只用了 938 KB | **排除** |
+| DMA 传输错误把通道打坏 | `err_te=0` / `dma_err=0`；TE 的错误回调与自愈路径都正常 | **排除** |
+| 会话边界 / 软复位 / 换会话 / 播放切向 | 冻结现场是**形状(a)**：`d_gen=0`、`d_sreset=0`、`d_hwstop=0`、`d_play=0`（四个计数全 0）⇒ 冻在**会话中间自己身上**，中间没有任何 stop、复位、换会话、起播放 | 这三种形状**排除** |
+| 每帧的 `ADCPATH` 闸门（每 20ms 把 ADC 通路关一次再开） | 去掉它（M1）之后，冻结出现前的时长**提升 13~39 倍**，但**没有消除** | 是**加速器**，不是唯一根因 |
+
+### 11.4 当前结论与方向
+
+- **剩下的唯一嫌疑：每帧的 DMA 通道 abort / re-arm。**
+  驱动现在每收一帧（20ms）做一次 `HAL_DMA_Abort()` + 通道 `FreeChannel()` +
+  NVIC 关/开，下一帧再重新武装；厂商参考驱动**整场会话都不做这件事**
+  （只在会话开始时武装、结束才收），我们的频率高了几个数量级。
+- **`SF32LB52_AUDIO_KEEP_ADCPATH_ON`（M1）已经算永久保留**
+  （`board/contest_board/src/sf32lb52_audio.c` 顶部有说明）：它去掉了每帧的
+  `ADCPATH` 关/开，明显拉长了冻结前的存活时间，**别再把它回退成 0**。
+  它没有根治问题，只是减轻。
+- **进一步的方向：整场只武装一次 DMA**（会话开始时武装，会话内不再逐帧
+  abort/re-arm）。这是**正在走的方向**，板级的具体开关与最终形态**以代码为准**，
+  本文不描述还没定案的实现。
+- 冻结落在哪一帧的"形状分诊"仪表已经在驱动里：失败日志会追加
+  `arm_sess` / `since_ok_ms` / `d_hwstop` / `d_sreset` / `d_gen` / `d_play` 与
+  `CFG=0x…`，下一轮上板按 11.2 的表读即可。
+
+### 11.5 最小复现
+
+两种都能触发，任选：
+
+1. **长录音**：让一个录音会话**连续跑超过 5 分钟**，期间一直循环
+   `audio_in_read()`（界面停在「语音聊天」不动，或敲
+   `hw_test audio 3600` 让它一口气录一小时），
+   盯串口有没有刷 `read 等 DMA 失败（ret=-110 …）`。
+2. **反复换会话**：反复"起录音 → 停止（或被播放切走）→ 再起"几十上百次
+   —— 命中的是"会话边界 + 多帧 abort"那个形态，通常更快。
+
+复现后按 11.2 的表确认是不是同一枚指纹。**恢复必须真断电**，
+别把时间耗在软复位或反复重开会话上。
+
+### 11.6 现场操作建议
+
+- 上台前**别让录音长时间空跑**（一直开着的会话最容易中招）；
+- 一旦看到 `ret=-110` 连续刷屏 + 网卡"已连接但一个包都不通"：**直接断电重上电**；
+- 因为恢复只有断电能做，**上电后先确认"录音正常 + 网络通"再开始演示**。
+
