@@ -3172,10 +3172,15 @@ static void sf32lb52_audio_rx_wait_timeout(wdparm_t arg)
 
   priv->rx_wait_to = true;
 
-  if (priv->rx_busy)
-    {
-      nxsem_post(&priv->rx_sem);
-    }
+  /* ★ 这里必须**无条件** post。心跳存在的唯一目的就是"到点把等待线程叫醒，
+   * 让它去检查超时预算"；一旦加上 `if (rx_busy)` 这类条件，只要那个标志不是真，
+   * 等待线程就永远醒不来 —— 超时机制被彻底废掉。
+   * 实测就是这么炸的：diag 里 `wait=311282 ms`（read 已经等了 311 秒），
+   * 表现为"录音会话活着但永远没有音频、VAD 不报、提交说没听到人说话"。
+   * 多 post 一次的代价只是那一轮循环多转一圈（计数没涨就继续等），
+   * 而少 post 一次的代价是**永久卡死**，两者完全不对称。 */
+
+  nxsem_post(&priv->rx_sem);
 }
 
 /****************************************************************************
@@ -3224,8 +3229,11 @@ static int sf32lb52_audio_rx_wait_slice(FAR struct sf32lb52_audio_s *priv)
  *
  *   与 rx 那记逐字同构，也是跑在 systick 中断里，只做两件**与 TCB 无关**的
  *   事：立 wr_wait_to 旗（告诉 write()"这次是到点了，不是播放完成"），
- *   以及 wr_busy 为真时 post 一次 wr_sem 把人叫醒。没人等时不 post —— 理由与
- *   rx 那边相同：空投一次计数就是给下一次 write 埋一个假唤醒。
+ *   以及**无条件** post 一次 wr_sem 把人叫醒。
+ *   ★ 早先这里是 `if (wr_busy) 才 post`，那是错的：心跳就是"到点叫醒去检查
+ *   超时预算"的那一下，加了条件之后只要标志不为真就叫不醒，超时机制被废掉，
+ *   write 会永久卡住（rx 那边实测就是这么炸的：diag 里 `wait=311282 ms`）。
+ *   多 post 一次只是让那一轮多转一圈，少 post 一次是永久卡死。
  *   **不打日志**（中断里碰串口会抢控制台锁把整机挂住）。
  *
  *   与内核那条 nxsem_timeout 的根本区别同样是：从不读 task_state，也从不读/
@@ -3238,10 +3246,7 @@ static void sf32lb52_audio_tx_wait_timeout(wdparm_t arg)
 
   priv->wr_wait_to = true;
 
-  if (priv->wr_busy)
-    {
-      nxsem_post(&priv->wr_sem);
-    }
+  nxsem_post(&priv->wr_sem);
 }
 
 /****************************************************************************
