@@ -654,8 +654,9 @@ AUDPRC 一个数据字都没往 DMA 送、连中断都没冒出来** ⇒ 停的�
   `ADCPATH` 关/开，明显拉长了冻结前的存活时间，**别再把它回退成 0**。
   它没有根治问题，只是减轻。
 - **进一步的方向：整场只武装一次 DMA**（会话开始时武装，会话内不再逐帧
-  abort/re-arm）。这是**正在走的方向**，板级的具体开关与最终形态**以代码为准**，
-  本文不描述还没定案的实现。
+  abort/re-arm）。**已经落地**（开关 `SF32LB52_AUDIO_ARM_ONCE`，见第 12.6 节的
+  对照清单）。而"为什么必须这么改、厂商到底怎么做、我们还错在哪"这一轮已经
+  定案，全在 **第 12 节**（厂商参考实现对照）—— 再碰录音驱动之前先读它。
 - 冻结落在哪一帧的"形状分诊"仪表已经在驱动里：失败日志会追加
   `arm_sess` / `since_ok_ms` / `d_hwstop` / `d_sreset` / `d_gen` / `d_play` 与
   `CFG=0x…`，下一轮上板按 11.2 的表读即可。
@@ -680,3 +681,169 @@ AUDPRC 一个数据字都没往 DMA 送、连中断都没冒出来** ⇒ 停的�
 - 一旦看到 `ret=-110` 连续刷屏 + 网卡"已连接但一个包都不通"：**直接断电重上电**；
 - 因为恢复只有断电能做，**上电后先确认"录音正常 + 网络通"再开始演示**。
 
+
+---
+
+## 12. 厂商参考实现对照：流级启停 ≠ 每帧取数（2026-09-15）
+
+> 这一节回答第 11 节那个"AUDPRC 不再拉 DMA 请求线"的坑。
+> **我们当初是没先读厂商实现就把驱动写出来的** —— 把厂商的**流级启停**
+> （`HAL_AUDPRC_DMAStop()` + `Receive_DMA()`）当成了**每帧取数**的 API 用，
+> 每 20 ms 把音频通路拆装一次，跑一阵之后外设不再拉 DMA 请求线，
+> 软复位救不回、只有断电能恢复。
+> 结论不重复第 11 节的现场指纹，只写"厂商怎么用、我们错在哪、怎么对齐"。
+
+### 12.1 参考实现在哪（同一颗芯片，三条独立来源）
+
+| 参考 | 路径 | 它回答什么 |
+|------|------|-----------|
+| 厂商 rt-thread 音频驱动 | `/home/youdian/SiFli-SDK/SiFli-SDK/rtos/rtthread/bsp/sifli/drivers/drv_audprc.c` | AUDPRC 数据通路**整场会话怎么维护**（本板 `sf32lb52_audio.c` 的直接对照物） |
+| 厂商 HAL | `/home/youdian/SiFli-SDK/SiFli-SDK/drivers/hal/bf0_hal_audprc.c` | 每个 HAL API 到底动了哪几个寄存器 |
+| 同芯片产品（小智） | `/home/youdian/xiaozhi/xiaozhi-sf32/app/src/xiaozhi_audio.c` | 上层真实产品怎么用：整个录音/放音交给 audio server（`audio_server.h` / `audio_write()`），**一次都没直接碰 AUDPRC 的 DMA API** |
+
+**行号偏移警告**：同一份 HAL 在 openvela 工作区里是
+`vendor/sifli/chips/drivers/hal/bf0_hal_audprc.c`，正文与上表那份**逐字节相同**，
+只是少了许可证头，**行号整体 −40**（`sf32lb52_audio.c` 注释里引的 `:774` /
+`:846` / `:850` 就是 openvela 这一份的号；第 12 节一律用上表 SiFli-SDK 那份的号）。
+对照时先认清手上是哪一份。
+
+### 12.2 厂商的正确用法（每条都有行号）
+
+**① 整场会话只武装一次循环 DMA。**
+录音的武装只在 `bf0_audio_start()` 里发生一次：`HAL_AUDPRC_Config_RChanel()`
+（`drv_audprc.c:1395`）+ `HAL_AUDPRC_Receive_DMA()`（`:1396`，RX1 在 `:1411`）。
+之后**整场会话再没有任何停/起动作** —— 数据靠 HT/TC 回调往上交，直到 stream
+stop 才 `HAL_AUDPRC_DMAStop()`（RX0 = `:1564`；8 条通道合计在 `:1564`–`:1654`，
+整段是 `bf0_audio_stop()` 的收尾，且开头 `:1542` 对"没开着的会话"直接早退）。
+
+**② 每个通知交半块。**
+TC 回调 `HAL_AUDPRC_RxCpltCallback()`（`drv_audprc.c:1941`）与 HT 回调
+`HAL_AUDPRC_RxHalfCpltCallback()`（`:1980`）各交 **`bufRxSize / 2`**
+（`:1959` / `:1962` / `:1967`、`:1994` / `:1999`）。回调里**只往上交数据**，
+不停任何东西。
+
+**③ 环路参数：640 字节的环 = 两个 320 字节半块 = 每 10 ms 一次通知。**
+`CFG_AUDIO_RECORD_PIPE_SIZE = 320`（`rtos/rtthread/components/drivers/include/drivers/audio.h:118`），
+`bufRxSize = CFG_AUDIO_RECORD_PIPE_SIZE * 2 = 640` 字节（`drv_audprc.c:1229`）。
+16k 单声道 16bit 下每个半块 = 320 字节 = 160 样本 = **10 ms**（整环 20 ms）——
+即"一次武装的循环 DMA，每半圈发一次通知"。
+
+**④ `ADCPATH` 的通、断各只有一处，都落在会话边界上。**
+整个 HAL 里 `ADCPATH` 的宏调用只有两处：`Receive_DMA()` 里使能
+（`bf0_hal_audprc.c:830`，仅 RX_CH0/RX_CH1）、`DMAStop()` 里关闭（`:886`）。
+按厂商的模型（①）读，就是**一个会话里"通一次、断一次"**。
+
+**⑤ 软复位（SRESET）不在会话中途发生。**
+只在会话收尾：`bf0_audio_stop()` 里先 `__HAL_AUDPRC_DISABLE()` + 清通道，
+**判到 `channel_ref == 0`**（`drv_audprc.c:1670`）才脉冲 SRESET（`:1676`–`:1677`）——
+即"整块 AUDPRC 上一条通道都不剩了"才复位；另一处是整机级的
+`bf0_audprc_stop()`（`:519`–`:520`）。两者都不是"跑着跑着复位一下试试"。
+
+### 12.3 我们的错误用法
+
+驱动原来每收一帧（20 ms）做一次：
+
+```
+HAL_AUDPRC_DMAStop(RX)   → HAL_DMA_Abort + 清该通道全部标志 + DMA_FreeChannel
+                           （含 HAL_NVIC_DisableIRQ + 通道池回收）
+                           + __HAL_AUDPRC_ADCPATH_DISABLE()      bf0_hal_audprc.c:832-889
+下一帧 HAL_AUDPRC_Receive_DMA(RX) → DMA_AllocChannel → Start_IT
+                           → 重写 CNDTR/CPAR/CM0AR/CCR → ADCPATH_ENABLE
+```
+
+**50 次/秒**地穿过"刚拆掉、刚装上"的窗口。
+
+**这在厂商 SDK 里一处都没有。** 把 SiFli-SDK（含 openvela 的 vendor 树、小智的
+SDK 树）整体 grep 一遍的实测结果：
+
+- `HAL_AUDPRC_DMAStop()` 的调用者**只有** `drv_audprc.c` 的 stream-stop 路径
+  （12.2 ① 那 8 行）；
+- `HAL_AUDPRC_Receive_DMA()` 的调用者**只有** `bf0_audio_start()`（`:1396` /
+  `:1411` / `:1423` / `:1435`），外加 `drv_audprc.c:1840` 一行被注释掉的；
+- 小智的产品代码连这两个 API 都没出现（它走上层 audio server）。
+- 同一份代码里 `drv_audprc.c` 并不孤单：同一个 `drivers/` 目录下还有
+  `drv_audcodec.c` / `drv_audcodec_m.c` / `drv_i2s_audio.c` / `drv_i2s_mic.c` /
+  `drv_pdm_audio.c` 五份并列的音频驱动，它们**一次都没碰 AUDPRC 的 DMA API**
+  —— 各自走 codec / I2S / PDM 自己的 DMA。所以"整场只武装一次"这条结论的
+  对照面不止一份驱动，是这一整层驱动的共同做法。
+
+所以"每帧停/起"是本驱动的发明，没有任何厂商先例可依。后果就是第 11 节那份
+指纹：窗口里落下的完成通知要么被丢、要么被提前服务；跑到某一刻，AUDPRC 的 RX
+侧干脆不再拉 DMA 请求线（CNDTR 满值、HT/TC 一次不来、无 TE）—— 坏的不是 DMA
+通道，是它上游。
+
+### 12.4 两个机制性坑（现象 + 判据）
+
+**坑 1：`HAL_AUDPRC_DMAStop()` 之后必须把 `aprc.State[RX]` 掰回 READY，
+否则下一次 `Receive_DMA()` 会静默地什么都不做。**
+
+- 闸门在 `bf0_hal_audprc.c:814`：`HAL_AUDPRC_Receive_DMA()` 一进门就查
+  `haprc->State[did] & HAL_AUDPRC_STATE_BUSY_RX`，命中直接 `return HAL_BUSY`
+  （`:816`）。
+- 而 `HAL_AUDPRC_DMAStop()` 里那行复位 **被注释掉了** ——
+  `bf0_hal_audprc.c:890` 原文就是 `//haprc->State = HAL_AUDPRC_STATE_READY;`：
+  abort 只清 DMA 句柄，`aprc.State` 会留在 BUSY。
+- 更阴的是**调用侧把返回值丢了**：`Receive_DMA()` 内部调 `HAL_DMA_Start_IT()` 时
+  没接返回值（`:818`），末尾无条件 `return HAL_OK`（`:828`）。所以"被 BUSY 挡下
+  这一帧"对外**和成功一模一样** —— 上层只会在 5 秒后看到 `-110`，看不到任何错误。
+- 厂商怎么绕过的：它的 stream stop 在收尾时**统一把 8 条通道的 State 刷成
+  READY**（`drv_audprc.c:1697`，`bf0_audio_stop()` 末尾那个 `for` 循环）。
+  本驱动对应的三处是 `hw_stop()` 的显式赋值、`hw_shutdown()` 的显式赋值，以及
+  read 入口那道兜底（`sf32lb52_audio.c:1760` / `:1961` / `:3567`）。
+
+**坑 2："复活一条卡死的 DMA"和"软复位整个模块"是两件事，别拿错。**
+
+- 厂商专门留了一个**窄口径**的复活原语：
+  `void bf0_audprc_dma_restart(uint16_t chann_used)`（`drv_audprc.c:2076`）。
+  它只做三件事：把 DMA 句柄 `State` 标回 `HAL_DMA_STATE_BUSY`（`:2081`）、
+  重开 TC/TE 中断（`:2082`）、**重设 CNDTR**（`:2089`，RX 用 `bufRxSize >> 2`）。
+  **它不 abort、不关通道、不关 ADC 通路，也不经过 `Receive_DMA()`** ——
+  所以坑 1 那道 `aprc.State` 闸门根本不参与。它假定通道本来就武装着，
+  只把"搬运计数 + 中断"重新摆正。（本树里没有调用者，注释写着
+  `//tc_drv_audprc.c used`；但它是官方给这条路径留的唯一直通手段。）
+- 我们的自愈走的是另一条：**整模块软复位**（`__HAL_AUDPRC_SRESET_START/STOP`，
+  `sf32lb52_audio.c:1158` 的 `sf32lb52_audio_aprc_soft_reset()`）。它复位的是
+  **整块 AUDPRC 数字模块**，包括 ADC 通路配置（`CFG.ADC_PATH_EN`、
+  `ADC_PATH_CFG0` 的录音数字增益、`RX_CH0_CFG` 的通道使能/格式、时钟分频）——
+  这些寄存器是 `hw_configure()` 那次写的，复位即丢。它**也不会**顺手把
+  `aprc.State[]`（软件数组）刷回 READY。
+- 于是铁律：**SRESET 之后必须按
+  `Config_ADCPath → Config_RChanel → Receive_DMA → __HAL_AUDPRC_ENABLE`
+  重建**，少一步就是"复位完更死"（DMA 起得来、数据通路是空的）。
+  本驱动已经把这条重建序列单独拎成
+  `sf32lb52_audio_aprc_restore_adc()`（`sf32lb52_audio.c:1194`），
+  并在 `hw_start()`（`:1486`）与自愈路径（`:1412`）里都调它，
+  而且与软复位**共用同一个"有没有配置可恢复"的判据**。
+
+### 12.5 给后来人的铁律
+
+**写驱动之前，先把厂商参考实现读一遍**（12.1 那三份，至少第 1、2 份）。
+具体到本项目一句话：**"流级启停 API"绝不能当"每帧取数 API"用。**
+
+判据很直白：`HAL_AUDPRC_Receive_DMA()` 的语义是"**武装一条流**"，
+配套的 `HAL_AUDPRC_DMAStop()` 是"**拆掉这条流**"，
+两者的正确频率是**每个会话各一次**；要"每帧取数"，正确机制是让**一次武装的
+循环 DMA 自己转**，靠 HT/TC 回调各交半块（12.2 ②③）。
+拿不准某个 HAL API 该多久调一次时，就去数厂商调用它的地方有几个 —— 这也是
+这次把两个坑认出来的方法本身。
+
+### 12.6 要对齐厂商，还差哪几件事
+
+| # | 事项 | 必须/可选 | 现状 |
+|---|------|-----------|------|
+| 1 | 会话内不再碰 `ADCPATH`（去掉每帧关/开） | **必须** | **已做**：M1 `SF32LB52_AUDIO_KEEP_ADCPATH_ON=1`（`sf32lb52_audio.c:136`），每帧收尾只停 DMA 通道 |
+| 2 | 整场会话只武装一次循环 DMA | **必须** | **已做**：M3 `SF32LB52_AUDIO_ARM_ONCE=1`（`sf32lb52_audio.c` 顶部那个开关）——会话内只武装一次循环 DMA，之后每帧靠 HT/TC 通知交半块，不再 `HAL_DMA_Abort` / `DMA_FreeChannel` / NVIC 关开 / 重新 `Start_IT`。开关的**具体落点**（granule 怎么定、`read(len)` 与 granule 怎么解耦）**以代码为准**；正因为它还在收敛，本节不锁死它的细节，只锁"每会话一次"这条语义 |
+| 3 | 停过 DMA 之后把 `aprc.State[RX]` 掰回 READY | **必须** | **已做**：`hw_stop` / `hw_shutdown` 显式赋值 + read 入口兜底（`:1760` / `:1961` / `:3567`，即 12.4 坑 1） |
+| 4 | 软复位只留在会话边界，且复位后按序重建 | **必须** | **已做**：SRESET 只在 `hw_stop` / `hw_shutdown` / 自愈三处；重建由 `sf32lb52_audio_aprc_restore_adc()` 负责（`:1194`，见 12.4 坑 2） |
+| 5 | 等待侧不借用内核的定时看门狗 | **必须** | **已做**：M4 `SF32LB52_AUDIO_CALM_WAIT=1`（`:248`）。这条与厂商对照无关，是上板硬崩的独立修复，但**同样别回退** |
+| 6 | 把每帧 abort/re-arm 的老路径整段删掉 | 可选 | 未做，**刻意**：老路径由 `#if` 编掉、一个字不进镜像，留着就是为了 `ARM_ONCE` 能一键回退；等第 11 节的问题彻底不再复发再删 |
+| 7 | 环路参数逐字对齐厂商（640 B 环 = 2×320 B 乒乓 = 每 10 ms 一次通知） | 可选 | 未做：本驱动的常驻环粒度与厂商的 640 B 不同（上限见 `SF32LB52_AUDIO_RX_ONCE_MAX_BYTES`），语义一致（都是"一次武装 + HT/TC 交半块"），只是粒度不同；没有证据表明粒度本身相关，**不动** |
+| 8 | 用 `bf0_audprc_dma_restart()` 做窄口径复活，替代整模块 SRESET 自愈 | 可选 | 未做：这是"如果第 11 节的冻结再次出现"时的下一步备选 —— 它不丢 ADC 通路配置、比 SRESET 窄得多（12.4 坑 2），但要真机验证，**没验证之前不要动自愈路径** |
+
+> 表里 1–5 都已经是默认配置（`=1`），全部设计成"改回 0 就逐字回到改动前"，
+> 所以上台前**不要**为了"试试老行为"把它们翻回去 —— 老行为正是第 11 节那个
+> 只有断电能恢复的故障。
+>
+> 本表与 12.4 里 `sf32lb52_audio.c` 的行号按 **HEAD `0e4f5e6`** 标注（和第 11 节
+> 同一口径）；那个文件的 M3 部分还在收敛，行号随时会漂 —— **对不上时以开关名
+> （`SF32LB52_AUDIO_*`）和函数名为准**。
