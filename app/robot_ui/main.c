@@ -71,6 +71,22 @@
  * 因为那三个东西是这里的 static，别处够不到。 */
 #include "robot_ui_bridge.h"
 
+/* 「疑似摔倒」事件链的唯一入口（fall_alarm.h，实现在本文件后半那一节）。
+ * 头文件是自给自足的：等队友的摔倒检测器（本地模型 / hello_app 那一侧）要接
+ * 进来时，include 它、在任务上下文里调一次 fall_alarm_trigger("...") 就行。 */
+#include "fall_alarm.h"
+
+/* 板级报警模块（alarm_trigger / alarm_clear）：报警声和"持续响到解除"由它负责，
+ * 这是安全功能里唯一不依赖界面线程、也不依赖网络的一段。
+ * 头文件路径由 CMakeLists.txt 的 ${NUTTX_BOARD_ABS_DIR}/src 提供
+ * （robot_ui.c 的报警按钮走的是同一个模块）。 */
+#include "sf32lb52_alarm.h"
+
+/* clock_gettime(CLOCK_MONOTONIC)：摔倒链的"等回答"超时用它计时。
+ * 不用 lv_tick_get()：那个 tick 由 LVGL 线程推进，而这里计时的是工作线程，
+ * 不该受界面刷新节奏影响。 */
+#include <time.h>
+
 /* LVGL 定时器 */
 static void lvgl_timer_handler(void)
 {
@@ -1562,6 +1578,11 @@ static void local_state_probe(local_state_t *out)
 
 /* ==================== AI 命令回调处理 ==================== */
 
+/* 摔倒链的"回答"入口（实现在文件后半的「疑似摔倒事件链」一节）。
+ * 提前声明在这里的原因：MQTT 自测动作 fall_answer 要用它，而那个动作的分发
+ * （on_ai_command_received）在文件前半。answer: 0 = 没有，1 = 有。 */
+static void fall_set_answer(int answer, const char *from);
+
 /**
  * 处理来自手机端或云端的 AI 命令
  * 成员二的 AI 模块可以通过此接口接收控制命令
@@ -1736,6 +1757,45 @@ static void on_ai_command_received(const char *action, const char *param)
 
         if (g_ai_initialized) {
             sm_handle_event(&g_sm_ctx, SM_EVENT_ALARM_CLEARED);
+        }
+    }
+    else if (strcmp(action, "fall_test") == 0) {
+        /* ★ 摔倒链的**上板自测入口**（不动硬件、不烧录就能把整条链走一遍）：
+         * 从 PC/手机往 zhi_ai/<client_id>/command 发
+         *   {"action":"fall_test"}
+         * 就等于"检测器报了疑似摔倒" —— 后面弹窗、语音询问、听回答、
+         * 取消或正式报警全部自己跑。将来检测器接进来调的就是同一个函数。
+         *
+         * 本回调在 network_task 线程里，而 fall_alarm_trigger() 只做
+         * 判重 + 起一条工作线程，立刻返回，不会把 MQTT 那条线程拖住。
+         * 幂等也在那里：链条没跑完时再发一次只会多一行"忽略本次触发"日志。 */
+        int fret = fall_alarm_trigger("mqtt_test");
+        printf("[Fall] 自测触发（action=fall_test）ret=%d\n", fret);
+    }
+    else if (strcmp(action, "fall_answer") == 0) {
+        /* ★ 摔倒链的自测入口 2：**代替用户回答**，用于不动屏幕就能验证
+         * "取消 / 正式报警"两条分支。param 取：
+         *   "no" / "没有" / "0"   -> 按「没有」处理（取消警报）
+         *   "yes" / "有" / "1"    -> 按「有」处理（正式报警）
+         * 真机演示时这条不用 —— 用户点弹窗按钮或直接说话即可。
+         *
+         * 只认这几个取值：别的（打错字、空参数）一律**忽略**并打日志。
+         * 这里不能"非 no 即 yes" —— 一条参数写错的测试命令不该变成一次正式报警。 */
+        int no   = (param != NULL) &&
+                   (strcmp(param, "no") == 0 || strcmp(param, "没有") == 0 ||
+                    strcmp(param, "0") == 0);
+        int yes  = (param != NULL) &&
+                   (strcmp(param, "yes") == 0 || strcmp(param, "有") == 0 ||
+                    strcmp(param, "1") == 0);
+
+        if (!no && !yes) {
+            printf("[Fall] 自测回答参数不认识（param=%s），忽略"
+                   "（只认 no/没有/0 和 yes/有/1）\n",
+                   (param != NULL) ? param : "-");
+        } else {
+            printf("[Fall] 自测回答（action=fall_answer param=%s）-> %s\n",
+                   param, no ? "没有" : "有");
+            fall_set_answer(no ? 0 : 1, "MQTT 自测");
         }
     }
     else if (strcmp(action, "light_on") == 0 || strcmp(action, "light_off") == 0) {
@@ -2908,6 +2968,757 @@ static int voice_add_reminder(const char *hhmm, const char *title)
     return 0;
 }
 
+/* ==================== 疑似摔倒事件链 ==================== */
+/*
+ * 用户要的时序（原话整理）：
+ *   检测到异常 -> 判断疑似摔倒
+ *     -> ① 手机收到「疑似摔倒」               （复用现成的 MQTT + BARK 通路）
+ *     -> ② 板子弹窗「您摔到了吗？」有 / 没有   （touch_ui 的摔倒询问面板）
+ *     -> ③ 同时语音问「您摔到了吗？」          （复用语音聊天那条 TTS 播放通路）
+ *     -> ④ 等回答：点按钮 或 说话回答（先到的算数）
+ *     -> ⑤ 答「没有」：撤弹窗 + 停响铃 + 手机收到「已取消」
+ *         答「有」/ 超时没回应：手机收到「机主摔倒！」+ 板子响铃 + 红色报警页
+ *
+ * 唯一入口：fall_alarm_trigger(const char *source)（声明在 fall_alarm.h）。
+ * **本文件不做摔倒判定**——判定方式还没定（本地模型 / 启发式 / 云端，由队友给），
+ * 检测器将来不论在哪一侧，报一次就行；重复报在链条没跑完时会被忽略（幂等）。
+ *
+ * 为什么整条链在一条**工作线程**里跑（而不是在触发它的那个线程、或 LVGL 线程里）：
+ *   - TTS 合成（云端 HTTPS）几百 ms 到几秒、ASR 识别同样、让路轮询上限 2.4 秒、
+ *     等回答最长 25 秒 —— 这些全在一个函数里串起来，压在触发者（可能是
+ *     MQTT 收包线程、将来是检测线程）或 LVGL 线程上都不可接受；
+ *   - 界面动作一个都不在这里直接做：全部走 touch_ui_* / ui_post_*，它们内部是
+ *     lv_async_call（见 ui_async.h）。
+ *
+ * 麦克风（半双工，这一步最容易漏）：
+ *   本板音频**半双工**、驱动状态整机一份，hello_app 的 ai_companion 是常开麦的
+ *   那一方。所以这一节做两件配套的事：
+ *     ① 问话**之前**先 ai_companion_audio_yield(true) 请它让开（非阻塞登记），
+ *        靠轮询 ai_companion_mic_released() 等它真的把设备交出来；
+ *     ② 让出去的麦克风**一直留着**（问话放完也不还），紧接着用来录用户的回答 ——
+ *        中间只要 reclaim 一次，hello_app 下一拍就会把常开麦抢回去，我们那一句
+ *        回答就录不到了。整条链只有一个 reclaim 出口（fall_mic_release()）。
+ *   这套记账和语音聊天那边的 g_voice_mic_yielded 是**各记各的**（各自只还自己
+ *   借的那一份），既有让路接口是"整机一份的电平、没有持有者概念"，两边同时借的
+ *   极端情况下仍有已知缺口，见 voice_mic_release() 那段说明 —— 这次不动它。
+ *
+ * 网络不通也必须能用：弹窗、响铃、等回答、报警页全部是本地动作，网络那几步
+ * （MQTT / 手机推送）失败只打日志。摔倒报警是安全功能，不能挂在一个公网来回上。
+ */
+
+/* 缓冲区（都走堆：320 KB 级的静态数组会把内核 SRAM 顶满，见 VOICE_PCM_MAX_BYTES 那段） */
+#define FALL_TTS_BUF_BYTES      (16000 * 2 * 20)  /* 一句话 20 秒封顶，绰绰有余 */
+#define FALL_PCM_MAX_BYTES      (16000 * 2 * 10)  /* 语音回答最多攒 10 秒 */
+#define FALL_PCM_MIN_BYTES      (16000 * 2 / 2)   /* 少于 0.5 秒不值得发一次 ASR */
+#define FALL_RATE_HZ            16000
+
+/* 让路轮询（和语音聊天那套同构，见 voice_wait_mic_released 的说明；参数更短：
+ * 摔倒这件事等不起，每多 1 秒都是在拖救援）。
+ * 上限：1500 + 300 + 600 = 2400 ms。 */
+#define FALL_YIELD_WAIT_MS         1500
+#define FALL_YIELD_POLL_MS           50
+#define FALL_YIELD_RETRY_GAP_MS     300
+#define FALL_YIELD_RETRY_WAIT_MS    600
+
+/* 听回答时的断句：老人答"没有"两个字，说完 1.5 秒静音就够判一句完了。
+ * 用 ai_audio 默认的 3 秒也不是不行，但那会让"答完到报警/取消"白等 1.5 秒；
+ * 也不敢再短（1.2 秒会在老人句中小停顿时把话截断，ASR 容易听成"没…"）。
+ * 最小语音长度 300ms：和默认一致（比这短的当噪声，不启动一句）。 */
+#define FALL_LISTEN_SILENCE_MS     1500
+#define FALL_LISTEN_MIN_SPEECH_MS   300
+
+/* 判定结果（fall_classify 的返回） */
+#define FALL_VERDICT_NO       0   /* 否定：取消警报 */
+#define FALL_VERDICT_YES      1   /* 肯定：正式报警 */
+#define FALL_VERDICT_UNCLEAR  2   /* 没听清 / 不认识：按"超时没回应"走 */
+
+/* 这条链的共享状态。写者是两条线程（链条工作线程 + LVGL 线程里的按钮回调）
+ * 和 MQTT 收包线程（自测动作），读法约定：
+ *   - 这几个标志都是"一置就不再改"的单向位，32 位对齐读写在这颗 Cortex-M 上
+ *     是原子的，所以不逐位加锁（和 g_voice_pcm_full 一个路子）；
+ *   - 只有"抢链条"这一件事必须原子，那一段用 g_fall_lock。 */
+static pthread_mutex_t g_fall_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile bool   g_fall_active = false;         /* 链条在跑（幂等闸门） */
+static volatile int    g_fall_state = FALL_ALARM_IDLE;/* fall_alarm_state_t 快照 */
+static volatile bool   g_fall_answer_ready = false;   /* 回答已定（按钮或语音） */
+static volatile int    g_fall_answer = -1;            /* -1 未定 / 0 没有 / 1 有 */
+static char            g_fall_answer_src[16];         /* 谁定的（日志用） */
+static volatile bool   g_fall_speech_started = false; /* VAD：听到有人开始说话 */
+static volatile bool   g_fall_speech_ended = false;   /* VAD：这一句说完了 */
+static volatile bool   g_fall_pcm_full = false;       /* 攒到上限，后面丢掉 */
+static unsigned char  *g_fall_pcm = NULL;             /* 语音回答累积缓冲（堆，首次用时分配） */
+static size_t          g_fall_pcm_len = 0;
+static volatile bool   g_fall_mic_yielded = false;    /* 本链登记过让路、还没还 */
+
+/* 毫秒时钟（自开机起，单调） */
+static uint32_t fall_now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)((uint32_t)ts.tv_sec * 1000u + (uint32_t)(ts.tv_nsec / 1000000));
+}
+
+/* 把麦克风还给 hello_app。**幂等**：没借过就什么都不做。
+ * 整条链只有这一处 reclaim（见本节头上那段"麦克风"）。 */
+static void fall_mic_release(const char *why)
+{
+    if (!g_fall_mic_yielded) {
+        return;
+    }
+
+    g_fall_mic_yielded = false;
+    printf("[Fall] 让路结束（%s）：把麦克风还给 hello_app\n", why);
+    ai_companion_mic_reclaim();     /* 非阻塞：只登记"收回"方向 */
+}
+
+/* 轮询等 hello_app 交出麦克风（首轮 + 一次补等，上限 2.4 秒）。
+ * 和 voice_wait_mic_released() 是同一套算法：为什么不抽成公共函数见那边
+ * （两边的等待策略/日志前缀各自成文，抽一个带一堆参数的公共函数反而更难读）。 */
+static bool fall_wait_mic_released(void)
+{
+    long waited_ms = 0;
+    int  attempt;
+
+    for (attempt = 0; attempt <= 1; attempt++) {
+        long limit = (attempt == 0) ? (long)FALL_YIELD_WAIT_MS
+                                    : (long)FALL_YIELD_RETRY_WAIT_MS;
+        long waited = 0;
+        bool released;
+
+        if (attempt > 0) {
+            usleep(FALL_YIELD_RETRY_GAP_MS * 1000);
+            waited_ms += FALL_YIELD_RETRY_GAP_MS;
+        }
+
+        /* waited == 0 也正常：hello_app 本来就没占着麦克风（没在跑 / 没在听），
+         * 接口直接报"不在它手里"，一秒都不用等。 */
+        released = ai_companion_mic_released();
+
+        while (!released && waited < limit) {
+            usleep(FALL_YIELD_POLL_MS * 1000);
+            waited += FALL_YIELD_POLL_MS;
+            released = ai_companion_mic_released();
+        }
+
+        waited_ms += waited;
+
+        if (released) {
+            printf("[Fall] hello_app 已交出麦克风（等了 %ld ms）\n", waited_ms);
+            return true;
+        }
+    }
+
+    printf("[Fall] 等让路共 %ld ms，hello_app 一直没交出麦克风"
+           "（为什么没让成看 hello_app 那边 [让路] 让路失败 那一行）\n", waited_ms);
+    return false;
+}
+
+/* 回答的判定表（用户要求"识别到什么算否定、什么算肯定"写成一张小表）
+ *
+ *   否定 -> 取消警报 ：没有 / 没摔 / 没跌 / 没事 / 不用 / 不需要 / 还好 /
+ *                     不疼 / 不痛 / 挺好 / 没关 / 别管 / 不碍事 / 没啥
+ *   肯定 -> 正式报警 ：摔倒 / 摔了 / 摔到 / 跌 / 起不来 / 站不起来 / 不能动 /
+ *                     动不了 / 救命 / 救 / 帮我 / 需要 / 疼 / 痛 / 难受 /
+ *                     不舒服 / 骨折 / 流血 / 头晕 / 恶心
+ *   其余（含空串、ASR 失败）-> 没听清，按"超时没回应"走正式报警（安全侧）
+ *
+ * ⚠️ 判定顺序**必须先否定再肯定**：肯定词表里的短词本身是很多否定回答的**子串**
+ *    ——「有」在「没有」里、「疼」在「不疼」里、「需要」在「不需要」里。反过来先
+ *    匹配肯定，就会把"没有"（含"有"）判成摔倒、"不疼"判成受伤，也就是把
+ *    "我没事"变成一次正式报警 —— 这条链最怕的方向。
+ * ⚠️ 表里都是整词/短句，**不用单字**（"救"是唯一例外，它是"救命/救我"的词根，
+ *    单独出现也确实是求救）：宁可判成没听清（会报警），不要猜。
+ * ⚠️ 判成"没听清"的后果是发正式报警，所以这张表只影响"会不会多报一次"，
+ *    不会影响"该报的时候报不报"。
+ */
+static const char *const g_fall_neg_keywords[] = {
+    "没有", "没摔", "没跌", "没事", "不用", "不需要", "还好", "不疼", "不痛",
+    "挺好", "没关", "别管", "不碍事", "没啥"
+};
+
+static const char *const g_fall_yes_keywords[] = {
+    "摔倒", "摔了", "摔到", "跌", "起不来", "站不起来", "不能动", "动不了",
+    "救命", "救", "帮我", "需要", "疼", "痛", "难受", "不舒服",
+    "骨折", "流血", "头晕", "恶心"
+};
+
+/* 按上面那张表判一句 ASR 原文。先否定、再肯定、最后留给"没听清"。 */
+static int fall_classify(const char *text)
+{
+    size_t i;
+
+    if (text == NULL || text[0] == '\0') {
+        return FALL_VERDICT_UNCLEAR;
+    }
+
+    for (i = 0; i < sizeof(g_fall_neg_keywords) / sizeof(g_fall_neg_keywords[0]); i++) {
+        if (strstr(text, g_fall_neg_keywords[i]) != NULL) {
+            printf("[Fall] ④ 判定：否定（命中「%s」）\n", g_fall_neg_keywords[i]);
+            return FALL_VERDICT_NO;
+        }
+    }
+
+    for (i = 0; i < sizeof(g_fall_yes_keywords) / sizeof(g_fall_yes_keywords[0]); i++) {
+        if (strstr(text, g_fall_yes_keywords[i]) != NULL) {
+            printf("[Fall] ④ 判定：肯定（命中「%s」）\n", g_fall_yes_keywords[i]);
+            return FALL_VERDICT_YES;
+        }
+    }
+
+    /* 兜最朴素的回答："有"。它落在所有否定词之外（"没有"上面已经命中），
+     * 但不在肯定表里（表里不用单字），所以单独认一下 —— 「您摔到了吗？」
+     * 对着问的最短回答就是它。 */
+    if (strstr(text, "有") != NULL && strstr(text, "没") == NULL) {
+        printf("[Fall] ④ 判定：肯定（整句里就一个「有」）\n");
+        return FALL_VERDICT_YES;
+    }
+
+    printf("[Fall] ④ 判定：没听清（表里没有能认的词）\n");
+    return FALL_VERDICT_UNCLEAR;
+}
+
+/* 定回答：**先到的算数**（按钮 / 语音 / 自测三条路都可能先到）。
+ * 任何线程可调，只写几个标志，不碰设备、不碰控件。 */
+static void fall_set_answer(int answer, const char *from)
+{
+    if (!g_fall_active) {
+        /* 链条没在跑（已经收完尾 / 或者根本没触发过）：这条回答没有归属，
+         * 丢掉。手机端误发一条 fall_answer 自测命令不会在几秒钟之后
+         * 莫名其妙地冒出一句"回答已定"。 */
+        printf("[Fall] 链条没在跑，这次回答（%s）丢掉\n", (from != NULL) ? from : "?");
+        return;
+    }
+
+    if (g_fall_answer_ready) {
+        printf("[Fall] 回答已经定过了，这次（%s）忽略\n", (from != NULL) ? from : "?");
+        return;
+    }
+
+    g_fall_answer = answer;
+    snprintf(g_fall_answer_src, sizeof(g_fall_answer_src), "%s",
+             (from != NULL) ? from : "?");
+
+    /* 先把来源写好再置"已定"：读的人看到 ready 时 src/answer 一定已经是最新的 */
+    g_fall_answer_ready = true;
+
+    printf("[Fall] 回答已定：%s（来自%s）\n",
+           (answer == 1) ? "有" : "没有", (from != NULL) ? from : "?");
+}
+
+/* 弹窗上的两个按钮（**在 LVGL 线程里被调**，见 touch_ui.h）：
+ * 只登记回答，立刻返回；后面的动作在链条工作线程里做。 */
+static void fall_answer_btn_cb(touch_fall_answer_t answer, void *user_data)
+{
+    (void)user_data;
+
+    fall_set_answer((answer == TOUCH_FALL_ANSWER_YES) ? 1 : 0, "弹窗按钮");
+}
+
+/* 录音数据回调（在 ai_audio 的**录音线程**里跑，每帧一次，不许阻塞） */
+static void fall_record_cb(const int16_t *data, size_t frames, void *user_data)
+{
+    size_t bytes = frames * sizeof(int16_t);
+
+    (void)user_data;
+
+    if (data == NULL || bytes == 0 || g_fall_pcm == NULL || g_fall_pcm_full) {
+        return;
+    }
+
+    if (g_fall_pcm_len + bytes > FALL_PCM_MAX_BYTES) {
+        if (!g_fall_speech_started) {
+            /* 还没听到人说话：这是干等时的静音，把缓冲滚掉重来 ——
+             * 不能在这里停手，老人可能再过几秒才开口。 */
+            g_fall_pcm_len = 0;
+        } else {
+            g_fall_pcm_full = true;
+            printf("[Fall] ④ 语音回答攒到 %u 秒上限，后面的丢掉\n",
+                   (unsigned)(FALL_PCM_MAX_BYTES / (FALL_RATE_HZ * 2)));
+            return;
+        }
+    }
+
+    memcpy(g_fall_pcm + g_fall_pcm_len, data, bytes);
+    g_fall_pcm_len += bytes;
+}
+
+/* VAD 回调（同样在录音线程里跑）：只置标志，**不许在这里调 ASR**
+ * （voice_asr_recognize 是阻塞 HTTPS，在这里调就把录音线程钉住了）。 */
+static void fall_vad_cb(bool speech_detected, void *user_data)
+{
+    (void)user_data;
+
+    if (speech_detected) {
+        if (!g_fall_speech_started) {
+            g_fall_speech_started = true;
+            printf("[Fall] ④ 听到有人说话（开始累积语音回答）\n");
+        }
+    } else {
+        if (!g_fall_speech_ended) {
+            g_fall_speech_ended = true;
+            printf("[Fall] ④ 用户说完了（静音 %u ms），准备送去识别\n",
+                   (unsigned)FALL_LISTEN_SILENCE_MS);
+        }
+    }
+}
+
+/* 播放完成回调（在 ai_audio 的播放线程里跑）：只置标志 */
+static void fall_play_done(void *user_data)
+{
+    *(bool *)user_data = true;
+}
+
+/* 语音问一句（工作线程里跑）。
+ *
+ * 顺序：先合成（这时 hello_app 还照常听着，不白占麦克风）-> 登记让路 -> 等让开 ->
+ * 出声 -> **不还麦克风**（紧接着就要录用户的回答，见本节头上那段）。
+ * 说话没成也照常往下走：老人还能点按钮，点不动还有超时那条路。
+ */
+static int fall_speak_question(void)
+{
+    unsigned char *pcm;
+    size_t pcm_len = 0;
+    bool done = false;
+    long rate_hz;
+    long wait_ms;
+    int rc;
+    int ret;
+
+    pcm = malloc(FALL_TTS_BUF_BYTES);
+    if (pcm == NULL) {
+        printf("[Fall] ③ 合成缓冲分配失败，这次不念了（弹窗和按钮照常）\n");
+        return -ENOMEM;
+    }
+
+    ret = voice_tts_speak(FALL_ALARM_QUESTION, pcm, FALL_TTS_BUF_BYTES, &pcm_len);
+    if (ret < 0 || pcm_len == 0) {
+        printf("[Fall] ③ 语音合成失败（%d），这次不念了（弹窗和按钮照常）\n", ret);
+        free(pcm);
+        return (ret < 0) ? ret : -EIO;
+    }
+
+    printf("[Fall] ③ 让路 —— 先请 hello_app 交出麦克风（非阻塞）\n");
+    ai_companion_audio_yield(true);
+    g_fall_mic_yielded = true;           /* 从这一行起，所有出口都要 fall_mic_release() */
+
+    if (!fall_wait_mic_released()) {
+        printf("[Fall] ③ 让路没等到，这句话可能没出声（照常试播，结果见下面那行）\n");
+    }
+
+    ret = audio_play_start(&g_audio_ctx, (const int16_t *)pcm, pcm_len / 2,
+                           fall_play_done, &done);
+    free(pcm);      /* audio_play_start 已经把 PCM 拷进自己的播放缓冲 */
+
+    if (ret < 0) {
+        rc = ret;
+    } else {
+        rate_hz = (long)g_audio_ctx.config.sample_rate;
+        if (rate_hz <= 0) {
+            rate_hz = FALL_RATE_HZ;
+        }
+
+        wait_ms = (long)((pcm_len / 2) * 1000 / (size_t)rate_hz) + 3000;
+
+        while (!done && wait_ms > 0) {
+            usleep(20000);
+            wait_ms -= 20;
+        }
+
+        rc = audio_play_last_result(&g_audio_ctx);
+
+        if (!done) {
+            rc = audio_is_playing(&g_audio_ctx) ? -ETIMEDOUT :
+                 ((rc == 0) ? -EIO : rc);
+        }
+    }
+
+    if (rc == 0) {
+        printf("[Fall] ③ 询问：放完了（麦克风先不还，接着听回答）\n");
+    } else {
+        printf("[Fall] ③ 询问：没响成（rc=%d），继续等回答（按钮 / 超时仍然生效）\n", rc);
+    }
+
+    return rc;
+}
+
+/* 开麦听回答（工作线程里跑）。返回 false 只表示"这一路没开起来"，
+ * 按钮和超时那两条路照常 —— 调用方不需要为此改变流程。 */
+static bool fall_listen_open(void)
+{
+    audio_record_config_t rec;
+    int ret;
+
+    /* 让路请求：正常路径上问话那一步已经登记过了（而且没归还），这里只是补一手 ——
+     * 如果问话那一步**连合成都没成功**（网络不通），它根本没走到"登记让路"，
+     * 那这里必须自己登记，否则麦克风还在 hello_app 手里，用户说什么都录不到。 */
+    if (!g_fall_mic_yielded) {
+        printf("[Fall] ④ 让路 —— 请 hello_app 交出麦克风（非阻塞）\n");
+        ai_companion_audio_yield(true);
+        g_fall_mic_yielded = true;
+    }
+
+    /* 麦克风此刻（应该）还在我们手里，这里再确认一次。没等到也照开 ——
+     * 设备真被占着就会开失败，那条路会打日志并按"听不到回答"往下走。 */
+    if (!fall_wait_mic_released()) {
+        printf("[Fall] ④ 让路没等到，这次可能听不到语音回答（按钮 / 超时仍然生效）\n");
+    }
+
+    if (audio_is_recording(&g_audio_ctx)) {
+        printf("[Fall] ④ 麦克风被别的路径占着，先停掉\n");
+        audio_record_stop(&g_audio_ctx);
+    }
+
+    /* 常态听音常驻占着麦克风（默认关，开了才有）：先按停再用设备
+     * （和 voice_open_thread 一样，pause() 返回即保证设备已放）。
+     * 恢复在链条收尾处（ambient_listen_resume），和语音聊天那条路一样成对。 */
+    ambient_listen_pause();
+
+    /* 语音回答缓冲：分配一次就留着（本链可能被触发很多次，而 320 KB 的
+     * malloc/free 每轮来一次只会多一处失败点）。**不 free 还有一个更硬的理由**：
+     * audio_record_stop() 回收录音线程是"有界等待 + 放弃"，返回时线程不一定
+     * 真死透了（见 ai_audio.h 里 record_exited 的说明），这时候 free 掉缓冲，
+     * 那条线程下一帧就会写进已释放的内存。 */
+    if (g_fall_pcm == NULL) {
+        g_fall_pcm = malloc(FALL_PCM_MAX_BYTES);
+        if (g_fall_pcm == NULL) {
+            printf("[Fall] ④ 语音缓冲分配失败，这次听不成（按钮 / 超时仍然生效）\n");
+            return false;
+        }
+    }
+
+    g_fall_pcm_len = 0;
+    g_fall_pcm_full = false;
+    g_fall_speech_started = false;
+    g_fall_speech_ended = false;
+
+    /* VAD 的回调是**整机一份**的槽位（ai_audio 里只有 ctx->vad_callback 一个）：
+     * 这一窗口换成我们自己的，收尾时（fall_listen_close）还原成 robot_ui 原来
+     * 那个 vad_callback。不还原的话，之后别处的 VAD 事件会打进这条已经结束的链。 */
+    audio_vad_enable(&g_audio_ctx, fall_vad_cb, NULL);
+
+    memset(&rec, 0, sizeof(rec));
+    rec.enable_vad = true;
+    rec.silence_timeout_ms = FALL_LISTEN_SILENCE_MS;
+    rec.min_speech_ms = FALL_LISTEN_MIN_SPEECH_MS;
+    rec.data_callback = fall_record_cb;
+    rec.user_data = NULL;
+
+    ret = audio_record_start(&g_audio_ctx, &rec);
+    if (ret != 0) {
+        printf("[Fall] ④ 开麦失败: %d，这次听不成语音回答（按钮 / 超时仍然生效）\n", ret);
+        audio_vad_enable(&g_audio_ctx, vad_callback, NULL);   /* 槽位还原 */
+        return false;
+    }
+
+    printf("[Fall] ④ 开始限时听回答（最多 %u 秒；说完静音 %u ms 就送去识别）\n",
+           (unsigned)(FALL_ALARM_ANSWER_TIMEOUT_MS / 1000),
+           (unsigned)FALL_LISTEN_SILENCE_MS);
+    return true;
+}
+
+/* 收麦（工作线程里跑）。**不含还麦克风** —— 那是 fall_mic_release() 的事
+ * （单出口，见本节头上那段）；这里只把设备和 VAD 槽位收干净。 */
+static void fall_listen_close(void)
+{
+    if (audio_is_recording(&g_audio_ctx)) {
+        audio_record_stop(&g_audio_ctx);
+    }
+
+    audio_vad_enable(&g_audio_ctx, vad_callback, NULL);       /* VAD 槽位还原 */
+}
+
+/* ⑤ 正式报警：手机收到「机主摔倒！」+ 板子响铃（+ 红色报警页）。
+ * 顺序按既有教训排：**先切画面、再响铃、最后上网** —— 网络（TLS/推送）慢或卡住
+ * 时，用户至少已经能看到报警页、也已经听到铃声。 */
+static void fall_escalate(const char *why)
+{
+    int ret;
+
+    printf("[Fall] ⑤ 正式报警：机主摔倒！（判定依据：%s）\n", why);
+
+    /* ① 报警页（投递到 LVGL 线程；它内部自己会切 scr_alarm 并响铃，见
+     *    robot_ui_show_alarm —— 那里还顺手报了一次 report_alarm_queued("ui")）。 */
+    touch_ui_hide_fall_ask();
+    ui_post_alarm("机主摔倒！");
+
+    /* ② 板子响铃：板级报警模块（非阻塞，自己开 /dev/audio/audio0）。
+     *    这里**再显式报一次**，是因为它是唯一不依赖界面线程的一段 ——
+     *    界面那一路万一卡住，报警声也必须响。同级重复触发只更新 reason/text
+     *    （见 alarm_trigger 的说明），不会响两遍。reason 用 "fall"：
+     *    docs/alarm_usage.md 里给摔倒留的就是这个标识。 */
+    ret = alarm_trigger(ALARM_LEVEL_EMERGENCY, "fall", "机主摔倒！");
+    if (ret != OK) {
+        printf("[Fall] ⑤ alarm_trigger 失败: %d（报警声可能没响）\n", ret);
+    }
+
+    /* ③ MQTT 上报 + 手机推送。排队发布：本函数在工作线程里，不是 network_task
+     *    的 task group，直发必然失败（见 mqtt_publish_queued 的说明）。
+     *    report_alarm_queued() 内部已经带了一次 push_send_alarm。 */
+    ret = report_alarm_queued("fall", "机主摔倒！");
+    if (ret < 0) {
+        printf("[Fall] ⑤ MQTT 上报没入队: %d（报警页和铃声不受影响）\n", ret);
+    }
+
+    /* 手机上最醒目的那一条：标题就是这句话（report_alarm_queued 那条推送的标题
+     * 是 "[ALARM] fall"，正文里才有"机主摔倒！"，对家属不够直白）。 */
+    if (push_send_notification("机主摔倒！", "检测到机主摔倒，请立即查看！", "alarm") < 0) {
+        printf("[Fall] ⑤ 手机推送没发出去（推送没开或没配 key）\n");
+    }
+
+    /* 状态机：和"声音检测到异常"走同一个事件（本工程的状态机没有"摔倒确认"
+     * 这个态，也不为此新增一个 —— 报警就是报警，多一个态只会多一处要维护）。 */
+    sm_handle_event(&g_sm_ctx, SM_EVENT_ALARM_DETECTED);
+
+    printf("[Fall] ⑤ 报警已完成：报警页 + 响铃 + MQTT(alarm) + 手机推送「机主摔倒！」\n");
+}
+
+/* ⑤ 取消警报：撤下弹窗 + 停止响铃 + 手机收到「已取消」 */
+static void fall_cancel(const char *why)
+{
+    printf("[Fall] ⑤ 取消警报：撤弹窗 + 停响铃 + 通知手机「已取消」（判定依据：%s）\n", why);
+
+    touch_ui_hide_fall_ask();
+
+    /* 没在响时是安全空操作。这里会连同**别的来源**正在响的报警一起停掉
+     * （报警模块只有一个状态），这是刻意的：机主刚亲口说"没有摔倒"，
+     * 现场不该继续响铃。 */
+    if (alarm_clear() != OK) {
+        printf("[Fall] ⑤ alarm_clear 返回非 OK（本来就没在响也是正常的）\n");
+    }
+
+    /* MQTT 侧留一条痕（复用的 sound_alarm 通道，sound_type 带 _cancelled 后缀，
+     * 一眼能看出这不是新报警） */
+    if (report_abnormal_sound_queued("fall_cancelled", 0) < 0) {
+        printf("[Fall] ⑤ MQTT「已取消」没入队（网络不通不影响取消动作本身）\n");
+    }
+
+    if (push_send_notification("已取消", "机主已确认没有摔倒，报警已取消。", "fall") < 0) {
+        printf("[Fall] ⑤ 手机推送没发出去（推送没开或没配 key）\n");
+    }
+
+    sm_handle_event(&g_sm_ctx, SM_EVENT_ALARM_CLEARED);
+
+    printf("[Fall] ⑤ 已取消：弹窗已撤下，铃声已停，手机收到「已取消」\n");
+}
+
+/* 链条工作线程：①②③④⑤ 全在这里串行做（单出口，任何一步失败都往下走） */
+static void *fall_chain_thread(void *arg)
+{
+    char *source = (char *)arg;
+    char why[80];
+    char text[256];
+    uint32_t t0;
+    int answer = -1;
+
+    printf("[Fall] ===== 链条开始（source=%s）=====\n",
+           (source != NULL) ? source : "-");
+
+    /* ① 弹窗。先弹它、再上网（这个工程踩过"先上网后弹窗"的坑：网络一慢，
+     *    用户什么都看不到）。弹窗是投递出去的，LVGL 线程下一拍就画出来。
+     *    闸门：界面还没起来（robot_ui 没在跑 / 还在初始化）时不投 ——
+     *    那时候投进去的 lv_async_call 没人消费（见 robot_ui_bridge.h 那张闸门
+     *    的说明）。报警和响铃不受这个闸门影响，照常走。 */
+    if (robot_ui_bridge_is_ready()) {
+        touch_ui_show_fall_ask();
+        printf("[Fall] ① 弹窗（已投递）：%s —— 有 / 没有\n", FALL_ALARM_QUESTION);
+    } else {
+        printf("[Fall] ① 界面还没就绪，这次不弹窗（报警/响铃/推送照常）\n");
+    }
+
+    /* ② 手机 + MQTT：一条「疑似摔倒」。
+     *    MQTT 走 sound_alarm 这条**既有**通道（sound_type 取文档里已有的 "fall"，
+     *    语义正好是"异常声音/疑似事件"），手机通知走现成的 BARK 推送。
+     *    两条都是非阻塞排队，网络不通只打日志。 */
+    if (report_abnormal_sound_queued("fall", 100) < 0) {
+        printf("[Fall] ② MQTT「疑似摔倒」没入队（网络不通不影响弹窗和问话）\n");
+    }
+
+    if (push_send_notification("疑似摔倒", "检测到疑似摔倒，正在询问机主是否安全…", "fall") < 0) {
+        printf("[Fall] ② 手机推送没发出去（推送没开或没配 key）\n");
+    }
+
+    printf("[Fall] ② 已上报「疑似摔倒」：MQTT(sound_alarm=fall) + 手机推送\n");
+
+    /* ③ 语音问一句（同时把麦克风留在我们手里，紧接着要听回答） */
+    printf("[Fall] ③ 语音询问：%s\n", FALL_ALARM_QUESTION);
+    fall_speak_question();
+
+    /* ④ 限时听回答：点按钮 / 说话，先到的算数；都没有就等超时。
+     * 状态行如实反映"能不能听到你说话"—— 开不了麦时别骗用户对着板子说。 */
+    if (fall_listen_open()) {
+        touch_ui_set_fall_status("我在听，请说「有」或「没有」");
+    } else {
+        touch_ui_set_fall_status("请点「有」或「没有」");
+    }
+
+    t0 = fall_now_ms();
+
+    while (1) {
+        if (g_fall_answer_ready) {
+            break;                       /* 按钮（或自测）已经回答 */
+        }
+
+        if (g_fall_speech_ended) {
+            break;                       /* 说完了，下面去识别 */
+        }
+
+        if ((uint32_t)(fall_now_ms() - t0) >= (uint32_t)FALL_ALARM_ANSWER_TIMEOUT_MS) {
+            printf("[Fall] ④ 等回答超时（%u 秒内没有任何回应），按最坏情况处理\n",
+                   (unsigned)(FALL_ALARM_ANSWER_TIMEOUT_MS / 1000));
+            break;
+        }
+
+        usleep(50 * 1000);
+    }
+
+    /* 收麦（还麦克风在后面那一处单出口） */
+    fall_listen_close();
+
+    /* 语音那条路：说完了、而按钮还没点过 -> 把攒下来的 PCM 送去识别。
+     * ASR 是阻塞 HTTPS（秒级），在本工作线程里做，别处都不合适。 */
+    if (!g_fall_answer_ready && g_fall_speech_ended) {
+        if (g_fall_pcm_len < FALL_PCM_MIN_BYTES) {
+            printf("[Fall] ④ 语音只有 %u 字节（不足 %u），当成没听清\n",
+                   (unsigned)g_fall_pcm_len, (unsigned)FALL_PCM_MIN_BYTES);
+        } else {
+            int ret = voice_asr_recognize(g_fall_pcm, g_fall_pcm_len,
+                                          text, sizeof(text));
+
+            if (ret < 0) {
+                printf("[Fall] ④ ASR 失败: %d（按没听清处理 -> 正式报警）\n", ret);
+            } else {
+                printf("[Fall] ④ ASR 结果：「%s」\n", text);
+
+                int verdict = fall_classify(text);
+
+                if (verdict == FALL_VERDICT_NO) {
+                    fall_set_answer(0, "语音回答");
+                } else if (verdict == FALL_VERDICT_YES) {
+                    fall_set_answer(1, "语音回答");
+                } else {
+                    printf("[Fall] ④ 没听清（按超时没回应处理 -> 正式报警）\n");
+                }
+            }
+        }
+    }
+
+    /* 麦克风还给 hello_app —— **不管走哪条出口都要还**（不还它就永久聋了）。
+     * 紧接着把常态听音放回来（默认关，开了才有；和 fall_listen_open 里的
+     * pause() 成对，顺序也照抄语音聊天那条路：先还麦克风、再恢复常听）。 */
+    fall_mic_release("摔倒链收尾");
+    ambient_listen_resume();
+
+    /* ⑤ 判定：只有"明确答没有"才取消，其余（有 / 没听清 / 超时没回应）一律正式报警。
+     *    这是安全功能的取舍：宁可多报一次（家属白跑一趟），也不漏报一次。 */
+    if (g_fall_answer_ready) {
+        answer = g_fall_answer;
+    }
+
+    if (answer == 0) {
+        snprintf(why, sizeof(why), "机主答「没有」，来自%s",
+                 g_fall_answer_src[0] ? g_fall_answer_src : "?");
+        fall_cancel(why);
+    } else if (answer == 1) {
+        snprintf(why, sizeof(why), "机主答「有」，来自%s",
+                 g_fall_answer_src[0] ? g_fall_answer_src : "?");
+        fall_escalate(why);
+    } else {
+        fall_escalate("超时没回应（也含没听清 / 说不出来）");
+    }
+
+    /* 收尾：状态落定 + 放行下一次触发（下一个 fall_alarm_trigger 才能进来） */
+    pthread_mutex_lock(&g_fall_lock);
+    g_fall_state  = (answer == 0) ? FALL_ALARM_CANCELLED : FALL_ALARM_ALARMED;
+    g_fall_active = false;
+    pthread_mutex_unlock(&g_fall_lock);
+
+    printf("[Fall] ===== 链条结束：%s =====\n",
+           (answer == 0) ? "已取消警报" : "已正式报警（机主摔倒！）");
+
+    free(source);
+    return NULL;
+}
+
+/* ==================== 上面的链条的公开入口（fall_alarm.h） ==================== */
+
+int fall_alarm_trigger(const char *source)
+{
+    pthread_attr_t attr;
+    pthread_t tid;
+    char *copy;
+
+    /* 中断里不能做：要 malloc、要起线程（和 robot_ui_bridge 那道
+     * up_interrupt_context() 检查同一类原因） */
+    if (up_interrupt_context()) {
+        printf("[Fall] 在中断上下文里，不触发（要起线程、要 malloc）\n");
+        return FALL_ALARM_TRIGGER_ERROR;
+    }
+
+    /* 幂等闸门：链条没跑完时重复触发一律忽略（不叠弹窗、不发第二条报警） */
+    pthread_mutex_lock(&g_fall_lock);
+
+    if (g_fall_active) {
+        pthread_mutex_unlock(&g_fall_lock);
+        printf("[Fall] 已在处理中，忽略本次触发（source=%s）\n",
+               (source != NULL) ? source : "-");
+        return FALL_ALARM_TRIGGER_BUSY;
+    }
+
+    g_fall_active = true;
+    g_fall_state  = FALL_ALARM_ASKING;
+
+    /* 上一轮的残留在这里清（上一轮线程已经收完尾才会放开 active，见线程末尾） */
+    g_fall_answer_ready = false;
+    g_fall_answer       = -1;
+    g_fall_answer_src[0] = '\0';
+    g_fall_speech_started = false;
+    g_fall_speech_ended   = false;
+    g_fall_pcm_full       = false;
+
+    pthread_mutex_unlock(&g_fall_lock);
+
+    copy = ui_strdup((source != NULL) ? source : "-");
+    if (copy == NULL) {
+        pthread_mutex_lock(&g_fall_lock);
+        g_fall_active = false;
+        g_fall_state  = FALL_ALARM_IDLE;
+        pthread_mutex_unlock(&g_fall_lock);
+        printf("[Fall] 内存不够，这次触发没跑起来\n");
+        return FALL_ALARM_TRIGGER_ERROR;
+    }
+
+    printf("[Fall] 收到「疑似摔倒」上报：source=%s（开始跑事件链）\n", copy);
+
+    /* detached + 32 KB 栈：里面要跑 TTS 合成和 ASR 识别（都含完整的 TLS 握手，
+     * 栈小到压着边界时症状是 TLS 随机报 -0x7200，见 reminder_start_announce）。
+     * 起失败也要把闸门放开，否则这条链就再也进不来了。 */
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&attr, 32768);
+
+    if (pthread_create(&tid, &attr, fall_chain_thread, copy) != 0) {
+        pthread_attr_destroy(&attr);
+        free(copy);
+
+        pthread_mutex_lock(&g_fall_lock);
+        g_fall_active = false;
+        g_fall_state  = FALL_ALARM_IDLE;
+        pthread_mutex_unlock(&g_fall_lock);
+
+        printf("[Fall] 工作线程起不来，这次不跑（等下一次触发）\n");
+        return FALL_ALARM_TRIGGER_ERROR;
+    }
+
+    pthread_attr_destroy(&attr);
+    return FALL_ALARM_TRIGGER_OK;
+}
+
+fall_alarm_state_t fall_alarm_get_state(void)
+{
+    return (fall_alarm_state_t)g_fall_state;
+}
+
 /* 主函数 */
 /* 后台对时线程：等网络通了再取时间。
  *
@@ -3108,6 +3919,12 @@ int main(int argc, char *argv[])
     /* 镜像面板（常开麦那一套的显示器）底部的「提交」：只转发一次"请立刻收尾
      * 这一段"给 hello_app，不起线程、不碰音频设备（见 voice_mirror_submit_handler）。 */
     touch_ui_set_voice_mirror_submit_cb(voice_mirror_submit_handler, NULL);
+
+    /* ===== 摔倒询问面板的两个按钮（有 / 没有）=====
+     * 面板本身是 touch_ui 的（touch_ui_show_fall_ask），点下去只回调一个
+     * "回答是哪个"过来；真正的动作在摔倒链的工作线程里做（本回调跑在 LVGL
+     * 线程里，里面只置标志，见 fall_answer_btn_cb）。 */
+    touch_ui_set_fall_answer_cb(fall_answer_btn_cb, NULL);
 
     /* ===== 注册提醒的到点回调 ===== */
     /* 必须在添加提醒之前注册：注册完下面 touch_ui_add_reminder() 会立刻

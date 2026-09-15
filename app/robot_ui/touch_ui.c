@@ -18,6 +18,11 @@
  * 不再自己存一份（以前那份 static reminder_t reminders[] 只会显示、到点不响）。 */
 #include "reminder_sched.h"
 
+/* 摔倒事件链的公共定义（app/robot_ui/fall_alarm.h）：
+ * 这里只用它的两个常量 —— 问的那句话（屏幕上的字和 TTS 念的话必须是同一句，
+ * 所以字符串只留一份在那边）和等回答的超时（面板上要如实告诉用户"多久之内回答"）。 */
+#include "fall_alarm.h"
+
 /* 跨线程投递口（app/robot_ui/ui_async.c）。本文件里所有"投到 LVGL 线程"的
  * 动作都走它，不直接调 lv_async_call() —— 原因见 ui_async.h 开头：
  * lv_async_call() 内部往 LVGL 的全局定时器链表插节点，而那次插入在 LVGL
@@ -2702,4 +2707,254 @@ void touch_ui_hide_checkin(void)
     checkin_confirmed = false;
     checkin_cb = NULL;
     checkin_cb_user_data = NULL;
+}
+
+/* ==================== 摔倒询问面板（「您摔到了吗？」+ 有/没有） ==================== */
+/*
+ * 谁在用：main.c 的「疑似摔倒事件链」（fall_alarm_trigger()）。检测器报到
+ * "疑似摔倒"之后，板子要一边弹这一块、一边语音问同一句话、一边等用户回答
+ * （点按钮或说话，先到的那个算数）。
+ *
+ * 结构是照着上面「关怀确认面板」抄的：**面板就是活动屏上的普通容器**，两个大按钮
+ * 是它的直接孩子，没有单独的全屏 backdrop —— 这个工程踩过"backdrop 吃掉触摸 /
+ * 弹窗关不掉"的坑，关怀面板那套写法已经上板验收过（按钮点得动、面板撤得掉），
+ * 别改成 msgbox + backdrop。
+ *
+ * 和关怀面板只有两处不同：
+ *   ① 文案不同（问题句只在 fall_alarm.h 里留一份，屏幕上和 TTS 念的是同一句）；
+ *   ② 创建时用 lv_scr_act()（**当下**的活动屏），不是 touch_ui_init() 时记下的
+ *      current_screen —— 报警页会换屏（scr_alarm），摔倒链完全可能在红色报警页上
+ *      被触发，挂到老的 current_screen 上就一眼也看不见，而这是安全功能。
+ *
+ * 三个入口都走 ui_async_call 投到 LVGL 线程（"点按钮"的回调本身就在 LVGL 线程里
+ * 被调，约定见 touch_ui.h）。面板没开着时 set_status / hide 都是安全空转。
+ */
+
+static lv_obj_t *fall_panel = NULL;
+static lv_obj_t *fall_status_lbl = NULL;
+static lv_obj_t *fall_btn_no = NULL;       /* 「没有」 */
+static lv_obj_t *fall_btn_yes = NULL;      /* 「有」 */
+static bool fall_answered = false;         /* 这块面板上已经点过一次，防连点 */
+static fall_answer_cb_t fall_answer_cb = NULL;
+static void *fall_answer_cb_ud = NULL;
+
+/* 撤面板（只能在 LVGL 线程里跑） */
+static void fall_panel_destroy(void)
+{
+    if (fall_panel != NULL) {
+        lv_obj_del(fall_panel);
+        printf("[Fall] 弹窗已撤下\n");
+    }
+
+    fall_panel = NULL;
+    fall_status_lbl = NULL;
+    fall_btn_no = NULL;
+    fall_btn_yes = NULL;
+    fall_answered = false;
+}
+
+/* 两个按钮点下去走同一段：只认第一次（第二次点是连点，忽略）。
+ * 这里**只置状态 + 回调**，一个设备都不碰 —— 报警/取消是 main.c 那条
+ * 工作线程的事（本函数在 LVGL 线程里，不能阻塞）。 */
+static void fall_handle_answer(touch_fall_answer_t answer)
+{
+    if (fall_answered) {
+        return;
+    }
+
+    fall_answered = true;
+
+    if (fall_btn_no != NULL)  lv_obj_add_state(fall_btn_no, LV_STATE_DISABLED);
+    if (fall_btn_yes != NULL) lv_obj_add_state(fall_btn_yes, LV_STATE_DISABLED);
+
+    if (fall_status_lbl != NULL) {
+        if (answer == TOUCH_FALL_ANSWER_YES) {
+            lv_label_set_text(fall_status_lbl, "正在报警，请稍候…");
+            lv_obj_set_style_text_color(fall_status_lbl, lv_color_hex(0xFF5252), 0);
+        } else {
+            lv_label_set_text(fall_status_lbl, "好的，已取消");
+            lv_obj_set_style_text_color(fall_status_lbl, lv_color_hex(0x4CAF50), 0);
+        }
+    }
+
+    touch_ui_play_sound("click");
+
+    printf("[Fall] 弹窗按钮：%s\n",
+           answer == TOUCH_FALL_ANSWER_YES ? "有（正式报警）" : "没有（取消警报）");
+
+    if (fall_answer_cb != NULL) {
+        fall_answer_cb(answer, fall_answer_cb_ud);
+    }
+}
+
+static void fall_btn_no_handler(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+        return;
+    }
+
+    fall_handle_answer(TOUCH_FALL_ANSWER_NO);
+}
+
+static void fall_btn_yes_handler(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+        return;
+    }
+
+    fall_handle_answer(TOUCH_FALL_ANSWER_YES);
+}
+
+/* 造面板（只能在 LVGL 线程里跑）。重复调用先收上一块，不叠罗汉。 */
+static void fall_panel_build(void)
+{
+    lv_obj_t *screen;
+    lv_obj_t *title;
+    lv_obj_t *question;
+    lv_obj_t *lbl;
+    char hint[80];
+
+    fall_panel_destroy();
+
+    screen = lv_scr_act();
+    if (screen == NULL) {
+        printf("[Fall] 活动屏还没建好，这次弹窗没弹出来\n");
+        return;
+    }
+
+    fall_panel = lv_obj_create(screen);
+    lv_obj_set_size(fall_panel, LV_PCT(92), LV_PCT(80));
+    lv_obj_align(fall_panel, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(fall_panel, lv_color_hex(0x1A1A2E), 0);
+    lv_obj_set_style_bg_opa(fall_panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(fall_panel, 20, 0);
+    lv_obj_set_style_border_width(fall_panel, 3, 0);
+    lv_obj_set_style_border_color(fall_panel, lv_color_hex(0xFF9800), 0);
+    lv_obj_set_flex_flow(fall_panel, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(fall_panel, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(fall_panel, 16, 0);
+    lv_obj_set_style_pad_row(fall_panel, 14, 0);
+    /* 面板不滚动：老人不小心划一下就把按钮划出屏幕，那是最糟的 */
+    lv_obj_remove_flag(fall_panel, LV_OBJ_FLAG_SCROLLABLE);
+
+    title = lv_label_create(fall_panel);
+    lv_label_set_text(title, "摔倒确认");
+    lv_obj_set_style_text_font(title, &lv_font_ui_24, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(0xFFEB3B), 0);
+
+    /* 问的就是这一句：和 TTS 念的是同一个常量（fall_alarm.h） */
+    question = lv_label_create(fall_panel);
+    lv_label_set_text(question, FALL_ALARM_QUESTION);
+    lv_obj_set_width(question, LV_PCT(100));
+    lv_label_set_long_mode(question, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(question, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(question, &lv_font_ui_24, 0);
+    lv_obj_set_style_text_color(question, lv_color_hex(0xFFFFFF), 0);
+
+    fall_status_lbl = lv_label_create(fall_panel);
+    snprintf(hint, sizeof(hint), "请回答「有」或「没有」（%u 秒内）",
+             (unsigned)(FALL_ALARM_ANSWER_TIMEOUT_MS / 1000));
+    lv_label_set_text(fall_status_lbl, hint);
+    lv_obj_set_width(fall_status_lbl, LV_PCT(100));
+    lv_label_set_long_mode(fall_status_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(fall_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(fall_status_lbl, &lv_font_ui_20, 0);
+    lv_obj_set_style_text_color(fall_status_lbl, lv_color_hex(0xCCCCCC), 0);
+
+    /* 「没有」—— 绿色，左边/上面那个（老人最可能的回答，先看到） */
+    fall_btn_no = lv_btn_create(fall_panel);
+    lv_obj_set_size(fall_btn_no, LV_PCT(80), 70);
+    lv_obj_set_style_bg_color(fall_btn_no, lv_color_hex(0x4CAF50), 0);
+    lv_obj_set_style_radius(fall_btn_no, 30, 0);
+    lv_obj_add_event_cb(fall_btn_no, fall_btn_no_handler, LV_EVENT_CLICKED, NULL);
+
+    lbl = lv_label_create(fall_btn_no);
+    lv_label_set_text(lbl, "没有");
+    lv_obj_set_style_text_font(lbl, &lv_font_ui_24, 0);
+    lv_obj_center(lbl);
+
+    /* 「有」—— 红色，下面那个 */
+    fall_btn_yes = lv_btn_create(fall_panel);
+    lv_obj_set_size(fall_btn_yes, LV_PCT(80), 70);
+    lv_obj_set_style_bg_color(fall_btn_yes, lv_color_hex(0xF44336), 0);
+    lv_obj_set_style_radius(fall_btn_yes, 30, 0);
+    lv_obj_add_event_cb(fall_btn_yes, fall_btn_yes_handler, LV_EVENT_CLICKED, NULL);
+
+    lbl = lv_label_create(fall_btn_yes);
+    lv_label_set_text(lbl, "有");
+    lv_obj_set_style_text_font(lbl, &lv_font_ui_24, 0);
+    lv_obj_center(lbl);
+
+    printf("[Fall] 弹窗已显示：%s（有 / 没有，%u 秒内）\n",
+           FALL_ALARM_QUESTION, (unsigned)(FALL_ALARM_ANSWER_TIMEOUT_MS / 1000));
+}
+
+static void fall_show_async(void *arg)
+{
+    (void)arg;
+    fall_panel_build();
+}
+
+static void fall_hide_async(void *arg)
+{
+    (void)arg;
+    fall_panel_destroy();
+}
+
+static void fall_status_async(void *arg)
+{
+    char *text = (char *)arg;
+
+    /* 面板已经被撤掉了：这条状态没地方写，丢掉（不是错误：撤面板和写状态
+     * 都是投递过来的，顺序由调用方定，撤在前就不会写）。 */
+    if (fall_panel != NULL && fall_status_lbl != NULL) {
+        lv_label_set_text(fall_status_lbl, text);
+        lv_obj_set_style_text_color(fall_status_lbl, lv_color_hex(0xFFEB3B), 0);
+    }
+
+    free(text);
+}
+
+void touch_ui_set_fall_answer_cb(fall_answer_cb_t cb, void *user_data)
+{
+    fall_answer_cb = cb;
+    fall_answer_cb_ud = user_data;
+}
+
+void touch_ui_show_fall_ask(void)
+{
+    if (ui_async_call(fall_show_async, NULL) != LV_RESULT_OK) {
+        printf("[Fall] 弹窗投递失败（内存不足？），这次没弹出来\n");
+    }
+}
+
+void touch_ui_hide_fall_ask(void)
+{
+    ui_async_call(fall_hide_async, NULL);
+}
+
+void touch_ui_set_fall_status(const char *text)
+{
+    char *copy;
+
+    if (text == NULL) {
+        return;
+    }
+
+    copy = malloc(strlen(text) + 1);
+    if (copy == NULL) {
+        return;
+    }
+
+    strcpy(copy, text);
+
+    if (ui_async_call(fall_status_async, copy) != LV_RESULT_OK) {
+        free(copy);
+    }
+}
+
+bool touch_ui_fall_ask_active(void)
+{
+    return (fall_panel != NULL);
 }

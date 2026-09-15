@@ -203,4 +203,49 @@ void touch_ui_hide_checkin(void);
 /* 给 lv_msgbox 加右上角「×」关闭按钮（不用 LVGL 内置符号字体，那不在本工程字库里） */
 void touch_ui_msgbox_add_close_x(lv_obj_t *mbox);
 
+/* ==================== 摔倒询问面板（「您摔到了吗？」+ 有/没有） ==================== */
+/*
+ * 出处：main.c 的「疑似摔倒事件链」（fall_alarm_trigger()）。检测器报"疑似摔倒"
+ * 之后，板子要同时：弹窗问一句、语音问一句、等用户回答（点按钮或说话）。
+ *
+ * 和上面「关怀确认面板」的关系：那是给主动关怀用的（我没事 / 需要帮助），
+ * 这一层是给摔倒确认用的（没有 / 有）。**刻意不复用同一个面板**：
+ *   - 文案和语义不同（关怀是"您还好吗"，摔倒是"您摔到了吗"），
+ *     共用一个 label 会让两处都要按参数分叉；
+ *   - 关怀那条路在 companion 侧还有 ai_checkin_* 要落地，动它会牵一片。
+ * 结构（面板 + 两个大按钮 + 状态行）是从关怀面板抄的，那套写法已经上板验证过
+ * 「点得动、关得掉」：**面板本身是活动屏上的普通容器**，没有全屏 backdrop
+ * 去吃触摸，按钮就是面板的直接孩子。
+ *
+ * 三个入口都**任何线程可调**（内部走 ui_async_call 投到 LVGL 线程，见 ui_async.h），
+ * 但都不许在中断上下文调用。
+ */
+
+/* 用户点的是哪个按钮。
+ * 语义对应 main.c 的三条回答路径：点按钮、语音说"没有"、语音说"有"。
+ * 命名不用 yes/no 而用 NO/YES 对应中文的「没有 / 有」。 */
+typedef enum {
+    TOUCH_FALL_ANSWER_NO  = 0,   /* 「没有」-> 取消警报 */
+    TOUCH_FALL_ANSWER_YES = 1    /* 「有」  -> 正式报警 */
+} touch_fall_answer_t;
+
+/* 点按钮的回调。
+ * ⚠️ **在 LVGL 线程里被调**：里面只能置标志、立刻返回，不许阻塞
+ * （真正的动作在 main.c 的摔倒链工作线程里做）。 */
+typedef void (*fall_answer_cb_t)(touch_fall_answer_t answer, void *user_data);
+
+void touch_ui_set_fall_answer_cb(fall_answer_cb_t cb, void *user_data);
+
+/* 弹面板（任何线程可调）。重复调用会先把上一块收干净，不会叠罗汉。 */
+void touch_ui_show_fall_ask(void);
+
+/* 撤面板（任何线程可调）。取消警报、进了报警页都要调它。 */
+void touch_ui_hide_fall_ask(void);
+
+/* 改状态行（任何线程可调；面板没开着时空操作）。 */
+void touch_ui_set_fall_status(const char *text);
+
+/* 面板此刻开着没有（可跨线程读，用于日志/判重） */
+bool touch_ui_fall_ask_active(void);
+
 #endif /* TOUCH_UI_H */
