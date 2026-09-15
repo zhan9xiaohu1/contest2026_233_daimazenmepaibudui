@@ -3,12 +3,15 @@
  *
  * 头文件里写了"为什么要有这个文件"。这里只补三件实现上的事：
  *
- * 1) 本文件里**没有一处**直接碰 LVGL 控件。四个入口只做
+ * 1) 四个语音入口**不直接碰 LVGL 控件**，只做
  *    「清洗文本 -> 调 touch_ui_xxx() / robot_ui_bridge_post_status()」，
  *    后两者内部全是 lv_async_call，真正的控件操作发生在 LVGL 线程。
  *    所以 ai_companion 的录音线程、主循环任务随便调都不会踩
  *    `_lv_inv_area: Invalidate area is not allowed during rendering` 那个断言
  *    （2026-09-14 就是被这个断言把整个 app 打死的）。
+ *    本文件里唯一直接碰 LVGL 的是结尾那个 robot_ui_bridge_panel_reinit() 的
+ *    重绘回调 —— 它自己也跑在 LVGL 线程里（lv_async_call 投过去），
+ *    同样是安全的。
  *
  * 2) 闸门（g_ui_ready）之外还有一道 up_interrupt_context() 检查：万一以后有人
  *    图省事在音频回调/中断里调进来，宁可丢一次显示也不能在中断里 malloc + 取锁。
@@ -23,11 +26,21 @@
 #include <stdio.h>
 #include <string.h>
 #include <stddef.h>
+#include <errno.h>
 
 #include "robot_ui_bridge.h"
 
 #include "robot_ui.h"
 #include "touch_ui.h"
+
+/* 跨线程"投到 LVGL 线程"的唯一投递口（ui_async.c）。面板重初始化后要请界面
+ * 重画一整屏，那一跳必须走它 —— 理由见 ui_async.h 开头。 */
+#include "ui_async.h"
+
+/* 面板重新初始化（sf32lb_lcd_panel_reinit）的声明在板级头文件里，
+ * 实现在 vendor/sifli/boards/sf32lb52/drivers/lcd/sf32lb_lcd.c。
+ * 头文件路径由 CMakeLists.txt 的 ${NUTTX_BOARD_ABS_DIR}/src 提供。 */
+#include "sf32lb52_devkit_lcd.h"
 
 /****************************************************************************
  * Private Data
@@ -234,4 +247,67 @@ void robot_ui_bridge_voice_panel_open(void)
     }
 
   robot_ui_bridge_panel_autoshow();
+}
+
+/****************************************************************************
+ * 面板重新初始化（黑屏救回）
+ ****************************************************************************/
+
+/**
+ * @brief  面板重初始化之后，把整屏判成脏区重推一次
+ *
+ * 跑在 LVGL 线程里（ui_async_call 投过来的），所以这里碰控件是安全的。
+ *
+ * 为什么必须显式 invalidate 整屏：面板被复位过，GRAM 里的内容是随机的，
+ * 面板侧"配置修好了"不等于"画面对了"。LVGL 只重画脏区，而黑屏期间界面
+ * 往往已经没有脏区了（用户没在操作），光靠"下一帧"可能什么都等不到。
+ *
+ * 不在这里调 lv_refr_now()：没必要要求"投递后立刻刷完"，
+ * LVGL 自己的刷新定时器几十毫秒内就会跑，不值得为省这几十毫秒去冒
+ * 从定时器回调里再进一次刷新的风险。
+ */
+
+static void panel_reinit_full_redraw(void *arg)
+{
+  (void)arg;
+
+  lv_obj_invalidate(lv_screen_active());
+}
+
+int robot_ui_bridge_panel_reinit(void)
+{
+  int ret;
+
+  if (up_interrupt_context())
+    {
+      printf("[Bridge] 面板重初始化被挡（在中断上下文里）\n");
+      return -EINVAL;
+    }
+
+  /* 面板侧：重发初始化序列 + 拉一次 RESET 脚 + 重设像素格式/亮度/DisplayOn。
+   * 驱动里用 panel_lock 和刷新路径互斥，所以 LVGL 正在推屏也不会打架。 */
+  ret = sf32lb_lcd_panel_reinit();
+  if (ret < 0)
+    {
+      printf("[Bridge] 面板重初始化失败: %d"
+             "（-19=面板驱动还没绑上，-38=这个固件里编掉了）\n", ret);
+      return ret;
+    }
+
+  if (!g_ui_ready)
+    {
+      printf("[Bridge] 面板已重初始化；界面还没就绪，"
+             "全屏重绘等 LVGL 自己刷\n");
+      return 0;
+    }
+
+  if (ui_async_call(panel_reinit_full_redraw, NULL) != LV_RESULT_OK)
+    {
+      printf("[Bridge] 面板已重初始化，但全屏重绘投递失败（内存不够？）"
+             "—— 先等下一个脏区\n");
+      return -ENOMEM;
+    }
+
+  printf("[Bridge] 面板已重初始化，已投一次全屏重绘\n");
+  return 0;
 }

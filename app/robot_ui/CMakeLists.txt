@@ -56,6 +56,10 @@ if(CONFIG_LVX_USE_CONTEST2026_233_ZHI_AI)
          # 语音链路推界面的跨 app 直调入口（ai_companion 直接函数调用，不再只靠
          # MQTT 绕公网）。头文件是自给自足的，hello_app 那边只 include 它。
          robot_ui_bridge.c
+         # 刷屏/渲染耗时仪表（工作用）：只把慢 flush 和慢帧打到串口。总开关在
+         # ui_perf.h 的 UI_PERF_LOG，置 0 时这个文件编译成空翻译单元，main.c 里
+         # 那几处调用也被 #if 掉。不想要了就删这一行 + 删两个文件。
+         ui_perf.c
          lv_font_ui_16.c lv_font_ui_20.c lv_font_ui_24.c
     STACKSIZE 32768
     PRIORITY 100

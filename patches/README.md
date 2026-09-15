@@ -7,7 +7,7 @@
 |------|---------|---------|-------------|
 | `vendor_sifli-boot-fixes.patch` | `vendor/sifli` | `chips/sf32lb52/{sifli_uart,sifli_irq,sf32lb_flash}.c` | **要**：不修编不过/起不来 |
 | `vendor_sifli-rtc-alarm-fix.patch` | `vendor/sifli` | `chips/sf32lb52/sf32lb_rtc.c` | **要**：不修 RTC alarm 永不触发 |
-| `vendor_sifli-lcd-brightness.patch` | `vendor/sifli` | `boards/sf32lb52/drivers/lcd/sf32lb_lcd.c` | **要**：不修亮度只有 0/100 |
+| `vendor_sifli-lcd-brightness.patch` | `vendor/sifli` | `boards/sf32lb52/drivers/lcd/sf32lb_lcd.c` | **要**：不修亮度只有 0/100。**2026-09-16 起还带上"面板重新初始化 `sf32lb_lcd_panel_reinit()`"**（黑屏救回，`hw_test lcdreinit`），见下 |
 | `vendor_sifli-usb-rndis.patch` | `vendor/sifli` | `chips/sf32lb52/sf32lb_usbdev.c` | **要**：不修 USB 枚举失败（Code 10） |
 | `nuttx-usbdev-rndis.patch` | `nuttx` | `drivers/usbdev/rndis.c` | **要**：不修 RX 会永久停摆 |
 | `nuttx-usbdev-rndis-nomem.patch` | `nuttx` | `drivers/usbdev/rndis.c` | **要**：不修 -ENOMEM 会把 USB 栈打死（需在上一条之后） |
@@ -134,9 +134,14 @@
   这条分支只有写入 1900~1969 才会进，本项目的对时路径不会写这种年份，
   暂不处理。
 
-## vendor_sifli-lcd-brightness.patch（2026-09-13 新增，屏幕百分比亮度）
+## vendor_sifli-lcd-brightness.patch（2026-09-13 新增，屏幕百分比亮度；2026-09-16 追加"面板重新初始化"）
 
-改 `boards/sf32lb52/drivers/lcd/sf32lb_lcd.c`（行号都是**改前**的）。
+改 `boards/sf32lb52/drivers/lcd/sf32lb_lcd.c`（下面"现象/根因/修改"三节的行号
+都是 2026-09-13 那版的，即**改前**的；2026-09-16 的新增在最后一节）。
+
+补丁文件名**没有改**，但它现在装两件事：亮度百分比（下面前四节）+ 面板重新
+初始化（最后一节）。分成两个文件也行，但两者改的是同一段代码、同一个文件，
+分开打还得保证顺序，不如留一个。
 
 ### 现象
 
@@ -191,6 +196,37 @@
   `return -ENOSYS`，不往下发 ioctl"）会自己把中间值挡掉，`hw_test lcd 30`
   报的 `-38` 是它编的，跟驱动无关。改完封装（走 `LCDDEVIO_SETCONTRAST`）
   之后四档才真的 PASS。
+
+### 2026-09-16 追加：面板重新初始化 `sf32lb_lcd_panel_reinit()`
+
+**治的是**：整屏黑，但应用/驱动都正常 —— LVGL 还在响应触摸、还在 20~30 帧/s
+往面板推画面（`[ui]` 仪表 `最慢 flush 10 ms`），`hw_test lcd 80` 下发亮度也成功，
+可屏幕就是不亮；`reset` 无效，**只有真断电才恢复**。用户观察到的复现规律是
+"开机后第一次点「提醒」/「主菜单」容易黑"、"短时间快速点右上角菜单会频繁黑闪、
+最后长时间黑屏"，像是**面板自己丢了配置**。救法就是重发一遍初始化序列。
+
+**加了什么**（都在同一份 `sf32lb_lcd.c` 里）：
+
+| 改动 | 说明 |
+|------|------|
+| `#define SF32LB_LCD_PANEL_REINIT 1` | **一键回退开关**。改 0 之后 `sf32lb_lcd_panel_reinit()` 直接回 `-ENOSYS`、`panel_lock` 的两个宏变空操作，**刷新路径一行不多** |
+| `sf32lb_lcd_lcdc_setup()` | 把原来只写在 `lcd_hw_setup_thread_entry()` 里的"背景色 / 层复位 / 层像素格式"抽成函数，**开机路径和新入口调的是同一个**（不出现两份初始化） |
+| `s_drv_lcd.panel_lock` | 二值信号量当互斥：`putrun` / `putarea` 推像素和重初始化拿同一把，避免"一边推像素一边插寄存器写" |
+| `sf32lb_lcd_panel_reinit()` | 公开入口：`BSP_LCD_PowerUp()` → `p_ops->Init()`（**拉 RESET 脚 PA00 + 整串面板寄存器 + 0x29 DisplayOn**）→ LCDC setup → 重设像素格式/亮度 → 对齐 `priv->power`。返回 `OK` / `-ENODEV` / `-EINVAL` / `-ENOSYS` |
+
+`co5300.c` **一个字没改** —— 既有的 `LCD_Drv_Init()` 本来就是一个函数，
+开机路径（`LCD_Init()`）和这个新入口调的都是它。
+
+驱动侧只动面板和 LCDC，**不碰 LVGL**；"重初始化之后全屏重绘"由调用方负责：
+`app/robot_ui/robot_ui_bridge.c` 的 `robot_ui_bridge_panel_reinit()` 在调完驱动
+之后用 `ui_async_call()` 往 LVGL 线程投一次整屏 `lv_obj_invalidate()`。
+`hw_test lcdreinit` 调的就是它。
+
+用法、期望输出（正例/反例）、已知边界见
+`docs/display_touch_gpio_usage.md` 第 3.4 节。
+
+**这个补丁没有板上实测过**（2026-09-16 只做了语法检查 + 编译期开关两个位置
+都编得过）：黑屏那次现场还没敲过 `hw_test lcdreinit`。
 
 ## 应用方式
 

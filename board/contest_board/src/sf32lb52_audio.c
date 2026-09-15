@@ -267,6 +267,44 @@
  *   处理方式与 read 逐字同构，**不新开开关**。 */
 #define SF32LB52_AUDIO_CALM_WAIT   1
 
+/* M5 可回退开关：AUDIO_TYPE_FEATURE + AUDIO_FU_VOLUME 该落到哪一条通路上。
+ *
+ *   1 = 本次改动之后的行为（默认）：只有**这条录音会话自己的读取线程**来设
+ *       音量，才认作"录音方向的音量配置"（改 ADC 数字增益）；其余一律按
+ *       播放音量处理 —— 记进 playback_db，DAC 模拟通路真开着才顺手写寄存器。
+ *   0 = 逐字回到改动之前：sf32lb52_audio_configure 里那句
+ *       `if (!priv->pending_playback && priv->adc_path_on)` 的原判据。
+ *
+ * 为什么要改（报一次警就把麦克风按掉 14dB）：
+ *   老判据把"没有播放意图 + 录音通路开着"当成"这次音量是给录音方向的"。
+ *   可"没有播放意图"根本不是"想改麦克风增益"的证据：NuttX 上层 audio_configure
+ *   （nuttx/audio/audio.c:479 那第二个条件）只在 AUDIO_STATE_OPEN 时才把
+ *   INPUT/OUTPUT 的 CONFIGURE 放下去，而 AUDIO_TYPE_FEATURE 是**无条件**放行的。
+ *   于是报警模块（sf32lb52_alarm.c:283 先 CONFIGURE(OUTPUT)、:295 再
+ *   CONFIGURE(FEATURE 音量)）在 hello_app 常开麦录音期间下来时，那记
+ *   CONFIGURE(OUTPUT) 被上层静默吞掉 —— 驱动看到的 pending_playback 还是
+ *   false、adc_path_on 是 true，一次**播放**音量就被当成录音音量：ADC 数字增益
+ *   从 +12dB（SF32LB52_AUDIO_ADC_VOL）改成 −2.4dB（ALARM_PLAYBACK_VOLUME=800 →
+ *   −36 + 42×0.8），还写进了 aprc.Init.adc_cfg（之后每次 hw_start 的
+ *   sf32lb52_audio_aprc_restore_adc 都复用它），于是报过一次警之后麦克风一直
+ *   安静约 14dB，直到下一次 CONFIGURE(INPUT) 走 hw_configure 才恢复。
+ *
+ * 为什么"必须是读取线程自己来"这个判据成立：
+ *   - 麦克风增益是**某一条正在录的通路**的属性，只有正在消费这条通路的那个
+ *     线程（read() 每次记下的 priv->user_tid，且与起这条会话的任务组
+ *     holder_pid 同组）才有资格代表"录音方向"；
+ *   - 播放方向的音量配置必然来自别的线程（robot_ui 的音量滑块、报警模块），
+ *     它们**绝不允许**借"没人在标播放意图"溜进 ADC 分支 —— 上层会把它们的
+ *     CONFIGURE(OUTPUT) 吞掉，所以它们标不出播放意图，这一条只能由身份来兜；
+ *   - 本板唯一真的想改麦克风增益的用法是手动工具（audio_test vol 那种录音时
+ *     调增益），它本来就在没有会话或由读数据的线程下发，不受影响。
+ *   - 反过来（身份对不上时）一律退到 playback_db：退错的代价只是"这次麦克风
+ *     增益没变、播放音量记下来了"，而落错通路的代价是"麦克风被按掉 14dB"，
+ *     两边不对称，宁可退。
+ *
+ * 开关 = 0 时那一整段判据与限频告警一起编掉，逐字回到原行为。 */
+#define SF32LB52_AUDIO_VOL_OWNER_GUARD  1
+
 /* read() 每片的超时长度（毫秒）。语义与内核 tickwait 的那一片完全一致：
  * 只决定"没人 post 时多久回来看一眼 running/stop/会话代号"，不决定总预算
  * （总预算 = 这个值 × 50 片，仍然是 5 秒）。 */
@@ -302,6 +340,14 @@ struct sf32lb52_audio_s
   bool                    playback;     /* 已提交方向：true=播放 false=录音（只在 running 为真时有意义） */
   bool                    pending_playback; /* 最近一次 CONFIGURE 记下的方向意图，START 成功才提交 */
   int                     playback_db; /* 当前播放音量(dB)，标准接口可改 */
+
+#if SF32LB52_AUDIO_VOL_OWNER_GUARD
+  /* 上一次报"音量本该落错通路、被挡住"的时刻（tick），只做限频用。
+   * 场景就是 M5 说的那一种：录音会话期间别的线程下播放音量（报警一次一条，
+   * 拖音量滑块时一秒一条）。kmm_zalloc 出来是 0 = 还没报过。 */
+
+  clock_t                 vol_block_log;
+#endif
 
   /* 会话持有者身份 —— 用来区分"反方向那条通路是真的被别人占着"和"上一个
    * 持有者早就死了、只剩一堆没人清的状态"。
@@ -2504,12 +2550,35 @@ static int sf32lb52_audio_configure(FAR struct audio_lowerhalf_s *dev,
              * 按方向生效：播放改 DAC 音量，录音改 ADC 数字增益
              * （这套 feature unit 里没有单独的麦克风增益控制，只能这样暴露）。
              *
-             * 判据用"刚 CONFIGURE 的方向意图 + 那条通路真的开着"，
-             * 不再用 running + playback 这个方向标签：
-             *   - playback 只在 START 成功时才提交，别的 app 一次 CONFIGURE
-             *     就能改掉它，拿它分方向会把音量下到错的通路上；
-             *   - running 也可能是残留（上一个持有者已死），拿它当"真在录"
-             *     会去改根本没在用的 ADC 增益。
+             * **怎么判"这一次是给哪个方向的"**（M5，见文件顶部
+             * SF32LB52_AUDIO_VOL_OWNER_GUARD）：只有**正在读这条录音通路的
+             * 那条线程自己**来设，才算录音方向的配置、才去改 ADC 数字增益；
+             * 其余一律按播放音量处理（写 playback_db，DAC 通路真开着才顺手写
+             * 寄存器）。
+             *
+             *   原来为什么会落错：老判据 `!pending_playback && adc_path_on`
+             *   把"没人在标播放意图"当成了"这次是给录音方向的"。可是上面
+             *   audio_configure 只在 AUDIO_STATE_OPEN 时才放行 INPUT/OUTPUT 的
+             *   CONFIGURE，FEATURE 是无条件放行的，所以录音会话期间下来的播放
+             *   音量，它那记 CONFIGURE(OUTPUT) 被上层静默吞掉、驱动看到的
+             *   pending_playback 仍是 false —— 一次**播放**音量就这样被当成录音
+             *   音量写进麦克风增益（报警模块那次就是：+12dB → −2.4dB，
+             *   报过一次警之后麦克风一直安静约 14dB）。
+             *
+             * 判据里那几位各自管什么：
+             *   - running && !playback && adc_path_on：这条通路此刻真的在录
+             *     （playback 是 START 成功才提交的已提交方向，这里只借它"这一刻
+             *     硬件真在录"的意思；单拿它当方向标签会翻车，和身份一起用不会）；
+             *   - !pending_playback：刚有人标过播放意图，不抢 —— 但上层会把别的
+             *     app 那记 CONFIGURE(OUTPUT) 吞掉，所以它只能当"排除项"，
+             *     不能当"这次是录音方向"的证据；
+             *   - user_tid == 调用者 && getpid() == holder_pid：**唯一能证明
+             *     "这次配置是给录音方向的"**的证据 —— 麦克风增益是这条正在录的
+             *     通路的属性，只有**这条会话自己**正在把它的数据读走的那条线程
+             *     才有资格代表它来调（user_tid 是 read() 每次记下的读取线程；
+             *     再要求任务组等于 holder_pid，是挡住"别的 app 往本会话插一次
+             *     write() 把 user_tid 翻成它自己"这一种绕法）。
+             *
              * 音量的数值先记进 playback_db（下一次播放启动时由 hw_start 应用），
              * 只有 DAC 模拟通路真开着才顺手把音量写进寄存器 —— 通路没开时写它
              * 等于去碰一条没打开的模拟级，没有必要。
@@ -2527,7 +2596,42 @@ static int sf32lb52_audio_configure(FAR struct audio_lowerhalf_s *dev,
                          (SF32LB52_AUDIO_VOL_MAX - SF32LB52_AUDIO_VOL_MIN) *
                          (int)volume / AUDIO_VOLUME_MAX;
 
-                if (!priv->pending_playback && priv->adc_path_on)
+#if SF32LB52_AUDIO_VOL_OWNER_GUARD
+                bool rec_dir = priv->running && !priv->playback &&
+                               priv->adc_path_on && !priv->pending_playback &&
+                               priv->user_tid >= 0 &&
+                               priv->user_tid == nxsched_gettid() &&
+                               priv->holder_pid >= 0 &&
+                               getpid() == priv->holder_pid;
+
+                /* 老判据会去改 ADC、而这次其实不是录音方向的那一种（报警 /
+                 * UI 在别人录音期间下播放音量）：报一行，限频一秒一条
+                 * （拖音量滑块时最坏就是每秒一行），板子上靠它确认没落错通路。 */
+
+                if (!rec_dir && priv->adc_path_on && !priv->pending_playback)
+                  {
+                    clock_t now = clock_systime_ticks();
+
+                    if (priv->vol_block_log == 0 ||
+                        TICK2MSEC(now - priv->vol_block_log) >= 1000)
+                      {
+                        priv->vol_block_log = now;
+
+                        syslog(LOG_WARNING,
+                               "AUDIO: 音量 %d/1000 -> %d dB 记成播放音量，"
+                               "不动麦克风增益（录音通路读取线程 %d，"
+                               "本次线程 %d）\n",
+                               volume, db, (int)priv->user_tid,
+                               (int)nxsched_gettid());
+                      }
+                  }
+#else
+                /* 一键回退：逐字回到改动之前那一个判据 */
+
+                bool rec_dir = !priv->pending_playback && priv->adc_path_on;
+#endif
+
+                if (rec_dir)
                   {
                     priv->aprc.Init.adc_cfg.vol_l = db;
                     priv->aprc.Init.adc_cfg.vol_r = db;
@@ -2545,7 +2649,8 @@ static int sf32lb52_audio_configure(FAR struct audio_lowerhalf_s *dev,
                       }
                   }
 
-                audinfo("volume %d/1000 -> %d dB\n", volume, db);
+                audinfo("volume %d/1000 -> %d dB (%s)\n", volume, db,
+                        rec_dir ? "adc" : "dac");
               }
           }
         break;

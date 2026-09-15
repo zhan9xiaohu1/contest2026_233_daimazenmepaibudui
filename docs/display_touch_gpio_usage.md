@@ -267,6 +267,117 @@ git apply <本仓库>/patches/vendor_sifli-lcd-brightness.patch
 3. 别用 `/dev/pwm0` 调背光：本配置 `CONFIG_PWM=n`，节点根本不存在
    （第 7.2 节那段示例只在 `CONFIG_PWM=y` 时可用）。
 
+### 3.4 黑屏救回：面板重新初始化 `hw_test lcdreinit`
+
+#### 3.4.1 它治的是哪一种黑屏
+
+**整屏黑，但应用一切正常**：LVGL 还在响应触摸、还在以 20~30 帧/s 往面板推画面
+（`[ui]` 计时仪表能看到 `最慢 flush 10 ms`），`hw_test lcd 80` 下发亮度也成功、
+能回读，可屏幕就是不亮。`reset` 无效，**只有真断电才恢复**（有时过一会儿自己好）。
+
+复现规律：开机后第一次点「提醒」/「主菜单」容易黑；短时间快速点右上角菜单会频繁
+黑闪、最后长时间黑屏 —— 像是**面板自己丢了配置**（一次是偶发，反复操作会累积），
+不是 CPU / LCDC / 应用挂了。所以救法是**重发一遍面板初始化序列**，不是重启系统。
+
+#### 3.4.2 敲什么
+
+在 NSH 里（串口）：
+
+```
+hw_test lcdreinit
+```
+
+单独运行（不跑那套 5 步自检）。耗时约 0.5 秒，期间画面会闪一下、触摸停约 0.5 秒，
+都是正常的。
+
+#### 3.4.3 期望看到什么
+
+**救回来了**：
+
+```
+[LCD ] 面板重新初始化（整屏黑的救回动作）
+      会做的事：重发一遍面板初始化序列（含拉一次 RESET 脚）+ 重设像素格式/亮度/DisplayOn，
+                然后请 LVGL 线程把整屏重绘一次。期间画面会闪一下、触摸停约 0.5 秒，正常。
+[Bridge] 面板已重初始化，已投一次全屏重绘
+      robot_ui_bridge_panel_reinit() -> 0，耗时 420 ms
+      [PASS] 面板重新初始化  (初始化序列已下发（亮不亮要看屏幕）)
+      看屏幕：
+        救回来了 -> 1~2 秒内整屏闪一下然后恢复画面，触摸也恢复响应；
+                   这时不用再敲别的，界面自己会继续刷。
+        没救回来 -> 屏幕仍然全黑。串口里应该能看到
+                   `[Bridge] 面板已重初始化，已投一次全屏重绘`
+                   + 驱动侧的 `panel reinit: 完成，亮度 N%`；
+                   要是这两行也在、屏幕还是黑的，那基本是硬件侧（面板供电/排线）。
+```
+
+串口里还有驱动那两行（`lcdinfo`，看日志等级）：
+
+```
+panel reinit: 开始 (co5300)
+panel reinit: 完成，亮度 100%
+```
+
+屏幕表现：**1~2 秒内整屏闪一下然后恢复画面**，触摸也恢复响应，之后界面照常刷。
+不需要再敲别的命令。
+
+**没救回来**：打印仍然是 `[PASS] 面板重新初始化`（因为"下发成功"确实成功了），
+**屏幕仍然全黑**。这类要按下面分：
+
+| 串口里看到 | 说明 |
+|-----------|------|
+| `[Bridge] 面板已重初始化，已投一次全屏重绘` + `panel reinit: 完成` | 面板配置确实重下发了、界面也确实要重绘了 —— 屏幕还黑基本是**硬件侧**（面板供电 / 排线 / VADD_EN） |
+| `[Bridge] 面板重初始化失败: -19` | 面板驱动还没绑上（开机 `lcd_init` 线程没跑完），过几秒再敲一次 |
+| `[Bridge] 面板重初始化失败: -38` | 本固件把 `SF32LB_LCD_PANEL_REINIT` 编成了 0（见 3.4.5） |
+| 只有 `panel reinit: 面板驱动还没绑上…` | 同上，`-ENODEV` 那条路 |
+| 敲下去什么都不打、NSH 也没回来 | 见 3.4.5 的"已知边界" |
+
+#### 3.4.4 它到底做了什么（以及为什么）
+
+| 步骤 | 在哪 | 说明 |
+|------|------|------|
+| ① `BSP_LCD_PowerUp()` | `board/contest_board/src/bsp_lcd_tp.c:29` | VADD_EN 拉高 + LCD 那几根脚重新 pinmux（幂等） |
+| ② 拉一次面板 RESET 脚 + 重发整串面板寄存器 | `co5300.c:200` `LCD_Drv_Init()` | RESET 是 **PA00**（`bsp_lcd_tp.c:5` `LCD_RESET_PIN (0)` → `BSP_GPIO_Set()`），复位时序 `1→0→1`（`co5300.c:212-217`）；寄存器串含 0xFE 页切换、密码锁、0xC4 SPI 模式、0x3A 像素格式、0x2A/0x2B 窗口、0x11 出睡眠、**0x29 DisplayOn** |
+| ③ LCDC 侧：背景色 / 层复位 / 层像素格式 | `sf32lb_lcd.c` `sf32lb_lcd_lcdc_setup()` | 这段原来只写在开机线程里，现在抽成函数，**开机路径和重初始化调的是同一个** |
+| ④ 重设像素格式 + 重下亮度 | `SetColorMode()` / `SetBrightness()` | 面板复位后 `0x51 WBRIGHT` 会回到上电默认值，按驱动里记着的百分比重下 |
+| ⑤ 重发 DisplayOn 并把 `priv->power` 对齐 | 驱动内 | 免得"面板已经 0x29 了、驱动还以为关着" |
+| ⑥ 请 LVGL 全屏重绘 | `app/robot_ui/robot_ui_bridge.c` | 面板被复位过、GRAM 里是随机内容，**光修面板它不会自己重画**。`lv_obj_invalidate(lv_screen_active())` 必须投到 LVGL 线程（`ui_async_call`），在 NSH 线程里直接碰控件会撞 `Invalidate area is not allowed during rendering` 断言 |
+
+调用链就一条：
+
+```
+hw_test lcdreinit
+  -> robot_ui_bridge_panel_reinit()          (app/robot_ui/robot_ui_bridge.c)
+       -> sf32lb_lcd_panel_reinit()          (vendor/sifli/.../drivers/lcd/sf32lb_lcd.c，①~⑤)
+       -> ui_async_call(全屏 invalidate)      (⑥，跑在 LVGL 线程)
+```
+
+**线程安全**：LVGL 线程一直在刷（20~30 帧/s），而 `lcdreinit` 是从 NSH 任务里调的。
+驱动里加了一把 `panel_lock`，`putrun` / `putarea` 推像素和重初始化拿的是同一把，
+所以"重发配置"和"推一帧像素"不会同时在 QSPI 上跑。重初始化这 ~0.4 秒里刷新会
+卡住 —— 面板本来就在复位，卡住是应该的。
+
+`hw_test lcdreinit` 的另一半用途是**验根因**：如果敲了它屏幕就回来，就证明原来那次
+黑屏是"面板丢配置"，而不是 CPU / LCDC 挂了；如果敲十次八次都能救回来，那下一步
+该查的是"什么操作把面板弄丢了配置"（大概率是快速连点时某条 SPI 时序出了问题），
+而不是继续在 LVGL / 应用这一侧找。
+
+#### 3.4.5 回退开关 / 已知边界
+
+- **一键回退**：`vendor/sifli/boards/sf32lb52/drivers/lcd/sf32lb_lcd.c` 顶部
+  `#define SF32LB_LCD_PANEL_REINIT 1` 改成 `0` —— `sf32lb_lcd_panel_reinit()`
+  直接回 `-ENOSYS`，`panel_lock` 的两个宏变成空操作，**刷新路径一行不多**，
+  等于完全没加过这个功能（`hw_test lcdreinit` 还在，只是会报
+  `-38`/`本固件把 SF32LB_LCD_PANEL_REINIT 编成了 0`）。
+- **只治"面板丢配置"这一种黑屏**。LVGL 没起来（连 `/dev/lcd0` 都开不了）、
+  LCDC 没出帧（`[ui]` 仪表根本没有 flush 日志）、或者面板真的没供电，
+  这个命令都不解决 —— 它不会替你判断，只会如实报下发结果。
+- **重初始化**期间**不要**并发敲 `hw_test lcdcolor` / `hw_test lcd`：那几条也会
+  走 `/dev/lcd0`。真要连着敲，等上一条打印完。
+- 驱动里会先把 HAL 句柄的 `Lock` 位清成 `HAL_UNLOCKED` 再重走初始化 ——
+  防的是"上一次传输把 HAL 锁留在 `LOCKED`、之后每次写寄存器都在
+  `HAL_LCDC_ASSERT(0)` 上死等"。这条路径**没有实测过**（正常黑屏时 flush 是
+  10 ms 级、`draw_sem` 都能等到，说明锁没被留住），属于兜底。
+
 ## 4. 触摸：`/dev/input0`
 
 ### 4.1 推荐路线：LVGL indev
@@ -702,6 +813,7 @@ nsh> hw_test
 | `hw_test audio [秒]` | 录 N 秒到内存（默认 2），打印 peak/avg 与是否检测到声音，不写文件。**单独运行**；走板级封装 `audio_in_*`，见 `docs/audio_driver_usage.md` 第 9 节 |
 | `hw_test button [秒]` | 等按键按下（默认 15 秒）：按到 `PA11(KEY)` 或 `PA34(HOME)` 会打印**键名 + 事件类型 + 按住时长**并报 `[PASS] 按键`，**超时 FAIL**。走板级 `sf32lb52_boardbtn`（GPIO），**不读 `/dev/buttons`**，见第 5 节。**单独运行** |
 | `hw_test lcd [0..100]` | 设屏幕亮度（默认 100）再回读。**单独运行**；0..100 全档都应 PASS（板级封装走 `SETCONTRAST`，依赖 vendor 亮度补丁），见第 3.3 节 |
+| `hw_test lcdreinit` | 面板重新初始化（**黑屏救回**）：重发面板初始化序列（含拉一次 RESET 脚）+ 重设像素格式/亮度/DisplayOn，再请界面全屏重绘一次。**单独运行**；整屏黑但串口还活着时敲它，见第 3.4 节 |
 | `hw_test status` | 打一份统一外设状态（`board_status_get` / `board_status_dump`）：网络 / MQTT / ROM 素材 / `/data` / 音频 / 显示 / 触摸 / 按键 / RTC / 运行时间。**只有"网络拿到非回环 IPv4 地址"算 PASS/FAIL**，其它设备缺失只打印 `[提示]`，见 `docs/board_status_usage.md`。**单独运行** |
 
 说明：

@@ -27,6 +27,9 @@
  * 里完全没有锁，多个工作线程同时插会把链表插坏，一旦 LVGL 线程遍历到半初始
  * 化的节点（timer_cb 还是垃圾）就会跳到非法地址，整机硬故障、串口静默。 */
 #include "ui_async.h"
+/* 刷屏/渲染耗时仪表（app/robot_ui/ui_perf.c）：只在慢的时候打日志，用来回答
+ * "黑屏那一下到底黑在哪一段"。总开关是头文件里的 UI_PERF_LOG，置 0 即完全摘掉。 */
+#include "ui_perf.h"
 #include <netutils/cJSON.h>
 
 /* AI 模块头文件 (成员二) */
@@ -3767,6 +3770,11 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+#if UI_PERF_LOG
+    /* 刷屏计时仪表（ui_perf.c）：挂上后只在"慢"的时候打日志。 */
+    ui_perf_attach_display(lv_result.disp);
+#endif
+
     /* 触摸采样周期:默认跟随 LV_DEF_REFR_PERIOD（33ms ~ 30Hz），手感偏迟钝。
      * 这里只把输入设备读取定时器提到 10ms，屏幕刷新节奏不变。 */
     if (lv_result.indev != NULL)
@@ -3969,7 +3977,16 @@ int main(int argc, char *argv[])
         static int  time_tick = 0;
         static int  reminder_tick = 0;
 
+        /* 计时仪表：量这一轮 lv_timer_handler 的耗时（一帧的"渲染 + 刷屏"都在里面）。
+         * 正常时它什么都不打，只有"慢"才由 ui_perf_frame_end() 打一行。 */
+#if UI_PERF_LOG
+        ui_perf_frame_begin();
+#endif
         lvgl_timer_handler();
+
+#if UI_PERF_LOG
+        ui_perf_frame_end();
+#endif
 
         /* 每 ~200ms 刷新一次状态栏上的网络状态。
          * LVGL 不是线程安全的，所以只在这个任务里改控件；network_task 那边

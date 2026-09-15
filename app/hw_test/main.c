@@ -40,6 +40,9 @@
  *                            直接改 —— 单独运行
  *   hw_test kws live [秒]    实时听唤醒词，命中就打一行（默认 10 秒）
  *                            —— 单独运行，且必须先停掉 ai_companion
+ *   hw_test lcdreinit        面板重新初始化（黑屏救回）：重发一遍面板初始化
+ *                            序列 + 拉一次 RESET 脚，再请界面全屏重绘一次
+ *                            —— 单独运行；整屏黑但串口/触摸还活着时敲它
  *
  * 设计约定：
  *   - 每一步失败都只打印 FAIL，不中断后面的步骤，也不会卡死
@@ -109,6 +112,12 @@
 #include "sf32lb52_backlight.h"        /* 板级亮度封装 backlight_set/get */
 #include "sf32lb52_boardbtn.h"         /* 板级按键：GPIO 轮询 + 回调（不用 /dev/buttons） */
 #include "sf32lb52_status.h"           /* 板级统一外设状态 board_status_get/dump */
+/* 面板重新初始化（黑屏救回）：实现在 robot_ui 那个 app 的 robot_ui_bridge.c，
+ * 它自己再去调 vendor 面板驱动的 sf32lb_lcd_panel_reinit()。
+ * 走 robot_ui 这一跳而不是在 hw_test 里直接调驱动，是因为"重初始化之后要重绘"
+ * 必须由 LVGL 线程去做（lv_async_call 投递），而 LVGL 只有 robot_ui 在跑。
+ * 头文件路径由 CMakeLists.txt 的 `../robot_ui` 提供。 */
+#include "robot_ui_bridge.h"
 
 /* tts 子命令要**播**声音：板级只封了录音（sf32lb52_audio_in），所以这里直接开
  * /dev/audio/audio0，ioctl 顺序照 app/audio_test 和 ai_audio.c 真机验证过的那套
@@ -438,6 +447,10 @@ static void usage(void)
          "持续秒数默认 3（单独运行）\n");
   printf("  hw_test lcd [0..100]  设屏幕亮度并回读，默认 100（单独运行）；"
          "中间值走面板亮度寄存器（需 vendor 补丁，见 patches/README.md）\n");
+  printf("  hw_test lcdreinit    面板重新初始化（黑屏救回）：重发面板初始化"
+         "序列 + 拉一次 RESET 脚，\n"
+         "                       再请界面全屏重绘一次。整屏黑、"
+         "但串口还活着时敲它（单独运行）\n");
   printf("  hw_test button [秒]  等按键按下（板级 GPIO：PA11=KEY / PA34=HOME），"
          "默认 15 秒，超时算 FAIL（单独运行）\n");
   printf("  hw_test status       打印统一外设状态（board_status_get/dump）；"
@@ -3401,6 +3414,72 @@ static int step_backlight(int percent)
 }
 
 /****************************************************************************
+ * Name: step_panel_reinit
+ *
+ * Description:
+ *   lcdreinit 子命令：面板重新初始化（黑屏救回）。
+ *
+ *   救的是哪一种黑屏：**整屏黑，但应用完全正常** —— LVGL 还在响应触摸、
+ *   还在 20~30 帧/s 往面板推画面（`hw_test status` / [ui] 仪表都能证明），
+ *   `hw_test lcd 80` 下发亮度也成功，可屏幕就是不亮；reset 无效，只有真断电
+ *   才恢复。那是"面板自己丢了配置"，不是 CPU/LCDC 挂了，所以重发一遍面板
+ *   初始化序列就该回来。
+ *
+ *   这个子命令做的就是：调 robot_ui_bridge_panel_reinit() —— 面板侧重发配置
+ *   （含拉一次 RESET 脚）+ 请 LVGL 线程把整屏判脏重推一次。
+ *
+ *   打印里那句"看屏幕"是给用户看的判断依据：这个命令**没法自己知道**屏幕
+ *   亮没亮（面板没有回读"我在显示"的寄存器），所以只能报告下发是否成功，
+ *   亮不亮得用户自己看。
+ *
+ ****************************************************************************/
+
+static int step_panel_reinit(void)
+{
+  clock_t  t0;
+  uint32_t elapsed_ms;
+  int      ret;
+
+  printf("[LCD ] 面板重新初始化（整屏黑的救回动作）\n");
+  printf("      会做的事：重发一遍面板初始化序列（含拉一次 RESET 脚）"
+         "+ 重设像素格式/亮度/DisplayOn，\n");
+  printf("                然后请 LVGL 线程把整屏重绘一次。"
+         "期间画面会闪一下、触摸停约 0.5 秒，正常。\n");
+
+  t0  = clock_systime_ticks();
+  ret = robot_ui_bridge_panel_reinit();
+  elapsed_ms = (uint32_t)TICK2MSEC(clock_systime_ticks() - t0);
+
+  printf("      robot_ui_bridge_panel_reinit() -> %d，耗时 %u ms\n",
+         ret, (unsigned)elapsed_ms);
+
+  if (ret != OK)
+    {
+      report("面板重新初始化", 0,
+             ret == -ENODEV
+                 ? "面板驱动还没绑上（开机 lcd_init 线程没跑完？）"
+                 : (ret == -ENOSYS
+                        ? "本固件把 SF32LB_LCD_PANEL_REINIT 编成了 0"
+                        : "驱动侧拒绝了这次调用（见上面 [Bridge] 日志）"));
+      return -1;
+    }
+
+  report("面板重新初始化", 1, "初始化序列已下发（亮不亮要看屏幕）");
+
+  printf("      看屏幕：\n");
+  printf("        救回来了 -> 1~2 秒内整屏闪一下然后恢复画面，"
+         "触摸也恢复响应；\n");
+  printf("                   这时不用再敲别的，界面自己会继续刷。\n");
+  printf("        没救回来 -> 屏幕仍然全黑。串口里应该能看到\n");
+  printf("                   `[Bridge] 面板已重初始化，已投一次全屏重绘`\n");
+  printf("                   + 驱动侧的 `panel reinit: 完成，亮度 N%%`；\n");
+  printf("                   要是这两行也在、屏幕还是黑的，"
+         "那基本是硬件侧（面板供电/排线）。\n");
+
+  return OK;
+}
+
+/****************************************************************************
  * Name: step_status
  *
  * Description:
@@ -3526,6 +3605,7 @@ int main(int argc, FAR char *argv[])
   int do_alarm      = 0;
   int do_button     = 0;
   int do_backlight  = 0;
+  int do_lcdreinit  = 0;
   int do_status     = 0;
   int do_tts        = 0;
   int do_asr        = 0;
@@ -3616,6 +3696,10 @@ int main(int argc, FAR char *argv[])
         {
           do_button  = 1;
           button_sec = (i + 1 < argc) ? atoi(argv[++i]) : BTN_DEFAULT_WAIT_SEC;
+        }
+      else if (strcmp(argv[i], "lcdreinit") == 0)
+        {
+          do_lcdreinit = 1;
         }
       else if (strcmp(argv[i], "status") == 0)
         {
@@ -3746,13 +3830,13 @@ int main(int argc, FAR char *argv[])
         }
     }
 
-  /* imu / rtc / rtcday / audio / alarm / lcd / button / status / tts / asr /
-   * kws 是各自独立的子命令：只跑自己，不跑那套 5 步自检
+  /* imu / rtc / rtcday / audio / alarm / lcd / lcdreinit / button / status /
+   * tts / asr / kws 是各自独立的子命令：只跑自己，不跑那套 5 步自检
    * （tts / asr 要联网，是全自检里唯一会等网络的，所以也放单独模式）。 */
 
   standalone = do_imu || do_rtc || do_rtcday || do_audio || do_alarm ||
-               do_backlight || do_button || do_status || do_tts || do_asr ||
-               do_kws;
+               do_backlight || do_lcdreinit || do_button || do_status ||
+               do_tts || do_asr || do_kws;
 
   /* lcdcolor 只是刷个屏，别让它再干等 10 秒触摸 */
 
@@ -3766,8 +3850,8 @@ int main(int argc, FAR char *argv[])
   printf("   SF32LB52-DevKit-LCD 硬件自检 (hw_test)\n");
   if (standalone)
     {
-      printf("   子命令模式：只跑 imu/rtc/rtcday/audio/alarm/lcd/button/status/"
-             "tts/asr/kws，不做 5 步自检\n");
+      printf("   子命令模式：只跑 imu/rtc/rtcday/audio/alarm/lcd/lcdreinit/"
+             "button/status/tts/asr/kws，不做 5 步自检\n");
     }
   else
     {
@@ -3811,6 +3895,12 @@ int main(int argc, FAR char *argv[])
       if (do_backlight)
         {
           step_backlight(lcd_percent);
+          printf("\n");
+        }
+
+      if (do_lcdreinit)
+        {
+          step_panel_reinit();
           printf("\n");
         }
 

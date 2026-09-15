@@ -1,8 +1,8 @@
 diff --git a/boards/sf32lb52/drivers/lcd/sf32lb_lcd.c b/boards/sf32lb52/drivers/lcd/sf32lb_lcd.c
-index 66fcfc6..a93f21c 100644
+index 66fcfc6..a727128 100644
 --- a/boards/sf32lb52/drivers/lcd/sf32lb_lcd.c
 +++ b/boards/sf32lb52/drivers/lcd/sf32lb_lcd.c
-@@ -73,6 +73,12 @@ const void *_lcd_drv_ref_ili8688e
+@@ -73,6 +73,23 @@ const void *_lcd_drv_ref_ili8688e
   ****************************************************************************/
  #define lcd_debug_print lcdinfo
  
@@ -12,18 +12,130 @@ index 66fcfc6..a93f21c 100644
 +
 +#define SF32LB_LCD_BRIGHTNESS_MAX 100
 +
++/* ==================== 面板重新初始化（黑屏救回）总开关 ====================
++ * 1 = 编出 sf32lb_lcd_panel_reinit()，并把刷新路径上的 panel_lock 打开
++ *     （hw_test lcdreinit 用它把"面板丢了配置"导致的整屏黑救回来）；
++ * 0 = 退回没加这个功能之前：sf32lb_lcd_panel_reinit() 直接回 -ENOSYS，
++ *     panel_lock 的两个宏变成空操作，刷新路径一行不多。
++ *
++ * 为什么需要它 / 上板怎么用：docs/display_touch_gpio_usage.md 第 3.4 节。
++ */
++
++#define SF32LB_LCD_PANEL_REINIT 1
++
  struct sf32lb_lcd_dev_s
  {
      struct lcd_dev_s dev;
-@@ -85,6 +91,7 @@ struct sf32lb_lcd_dev_s
+@@ -84,10 +101,26 @@ struct sf32lb_lcd_dev_s
+     FAR sem_t init_sem;
      FAR sem_t draw_sem;
  
++    /* "面板访问"互斥：putrun / putarea 推像素时和 sf32lb_lcd_panel_reinit()
++     * 重发面板配置时都要拿它。LVGL 线程一直在刷（真机 20~30 帧/s），
++     * 而 hw_test lcdreinit 是从 NSH 任务里调的 —— 不隔开的话，QSPI 上会
++     * 一边推像素一边插寄存器写，谁都不该指望结果。关掉 SF32LB_LCD_PANEL_REINIT
++     * 时这两个宏是空操作，热路径和改动前完全一样。 */
++    FAR sem_t panel_lock;
++
      int power;
 +    int contrast;               /* 亮度百分比 0..100，见 setcontrast/getcontrast */
      uint8_t bpp;
  };
  
-@@ -676,29 +683,56 @@ static int sf32lb_lcd_setpower(FAR struct lcd_dev_s *dev, int power)
++#if SF32LB_LCD_PANEL_REINIT
++#define SF32LB_LCD_PANEL_LOCK()   (void)sem_wait(&s_drv_lcd.panel_lock)
++#define SF32LB_LCD_PANEL_UNLOCK() (void)sem_post(&s_drv_lcd.panel_lock)
++#else
++#define SF32LB_LCD_PANEL_LOCK()   do { } while (0)
++#define SF32LB_LCD_PANEL_UNLOCK() do { } while (0)
++#endif
++
+ /* Configuration ************************************************************/
+ 
+ /****************************************************************************
+@@ -337,6 +370,8 @@ static int sf32lb_lcd_putrun(FAR struct lcd_dev_s *dev,
+   lcd_debug_print("row: %d col: %d npixels: %d\n", row, col, npixels);
+   DEBUGASSERT(buffer && ((uintptr_t)buffer & 1) == 0);
+ 
++  SF32LB_LCD_PANEL_LOCK();
++
+   if (priv->bpp == 8)
+     {
+       FAR uint16_t *conv;
+@@ -345,6 +380,7 @@ static int sf32lb_lcd_putrun(FAR struct lcd_dev_s *dev,
+       conv = kmm_malloc(npixels * sizeof(uint16_t));
+       if (conv == NULL)
+         {
++          SF32LB_LCD_PANEL_UNLOCK();
+           return -ENOMEM;
+         }
+ 
+@@ -365,6 +401,7 @@ static int sf32lb_lcd_putrun(FAR struct lcd_dev_s *dev,
+                        col, row, col + npixels - 1, row);
+       sf32lb_lcd_ensure_display_on(priv);
+       kmm_free(conv);
++      SF32LB_LCD_PANEL_UNLOCK();
+       return OK;
+     }
+ 
+@@ -372,6 +409,8 @@ static int sf32lb_lcd_putrun(FAR struct lcd_dev_s *dev,
+   sf32lb_lcd_wrram(priv, buffer, col, row, col + npixels - 1, row);
+   sf32lb_lcd_ensure_display_on(priv);
+ 
++  SF32LB_LCD_PANEL_UNLOCK();
++
+   return OK;
+ }
+ 
+@@ -417,6 +456,8 @@ static int sf32lb_lcd_putarea(FAR struct lcd_dev_s *dev,
+ 
+   DEBUGASSERT(buffer && ((uintptr_t)buffer & 1) == 0);
+ 
++  SF32LB_LCD_PANEL_LOCK();
++
+   if (priv->bpp == 8)
+     {
+       fb_coord_t y;
+@@ -425,6 +466,7 @@ static int sf32lb_lcd_putarea(FAR struct lcd_dev_s *dev,
+ 
+       if (conv == NULL)
+         {
++          SF32LB_LCD_PANEL_UNLOCK();
+           return -ENOMEM;
+         }
+ 
+@@ -452,6 +494,7 @@ static int sf32lb_lcd_putarea(FAR struct lcd_dev_s *dev,
+ 
+       sf32lb_lcd_ensure_display_on(priv);
+       kmm_free(conv);
++      SF32LB_LCD_PANEL_UNLOCK();
+       return OK;
+     }
+ 
+@@ -495,6 +538,8 @@ static int sf32lb_lcd_putarea(FAR struct lcd_dev_s *dev,
+ 
+   sf32lb_lcd_ensure_display_on(priv);
+ 
++  SF32LB_LCD_PANEL_UNLOCK();
++
+   return OK;
+ }
+ 
+@@ -524,8 +569,13 @@ static int sf32lb_lcd_getrun(FAR struct lcd_dev_s *dev,
+   lcdinfo("row: %d col: %d npixels: %d\n", row, col, npixels);
+   DEBUGASSERT(buffer && ((uintptr_t)buffer & 1) == 0);
+ 
++  SF32LB_LCD_PANEL_LOCK();
++
+   sf32lb_lcd_setarea(priv, col, row, col + npixels - 1, row);
+   //sf32lb_lcd_rdram(priv, dest, npixels);
++
++  SF32LB_LCD_PANEL_UNLOCK();
++
+   DEBUGASSERT(0);
+   return OK;
+ }
+@@ -676,29 +726,56 @@ static int sf32lb_lcd_setpower(FAR struct lcd_dev_s *dev, int power)
   * Name:  sf32lb_lcd_getcontrast
   *
   * Description:
@@ -86,7 +198,46 @@ index 66fcfc6..a93f21c 100644
  }
  
                                
-@@ -922,6 +956,11 @@ int board_lcd_initialize(void)
+@@ -725,6 +802,26 @@ static int lcdc1_isr(int irq, void *context, void *arg)
+     return OK;
+ }
+ 
++/****************************************************************************
++ * Name:  sf32lb_lcd_lcdc_setup
++ *
++ * Description:
++ *   LCDC 侧那几步"面板初始化之后必须跟着做"的设置：背景色清零、默认层复位、
++ *   默认层像素格式设成 RGB565。开机路径（lcd_hw_setup_thread_entry）和
++ *   sf32lb_lcd_panel_reinit() 都调这一个函数 —— 抽出来就是为了不出现两份。
++ *
++ *   不含 irq_attach/up_enable_irq：中断只在开机时接一次，重复接没有意义。
++ *
++ ****************************************************************************/
++
++static void sf32lb_lcd_lcdc_setup(void)
++{
++    HAL_LCDC_SetBgColor(&s_drv_lcd.hlcdc, 0, 0, 0);
++    HAL_LCDC_LayerReset(&s_drv_lcd.hlcdc, HAL_LCDC_LAYER_DEFAULT);
++    HAL_LCDC_LayerSetFormat(&s_drv_lcd.hlcdc, HAL_LCDC_LAYER_DEFAULT,
++                            LCDC_PIXEL_FORMAT_RGB565);
++}
++
+ static int lcd_hw_setup_thread_entry(int argc, FAR char *argv[])
+ {
+     lcd_drv_desc_t *p_drv_ops = s_drv_lcd.p_drv_ops;
+@@ -765,10 +862,7 @@ static int lcd_hw_setup_thread_entry(int argc, FAR char *argv[])
+     up_enable_irq(NX_IRQ(LCDC1_IRQn));
+ #endif /* SOC_BF0_HCPU */
+ 
+-    HAL_LCDC_SetBgColor(&s_drv_lcd.hlcdc, 0, 0, 0);
+-    HAL_LCDC_LayerReset(&s_drv_lcd.hlcdc, HAL_LCDC_LAYER_DEFAULT);
+-    HAL_LCDC_LayerSetFormat(&s_drv_lcd.hlcdc, HAL_LCDC_LAYER_DEFAULT,
+-                            LCDC_PIXEL_FORMAT_RGB565);
++    sf32lb_lcd_lcdc_setup();
+ 
+     s_lcd_hw_ready = true;
+ 
+@@ -922,6 +1016,11 @@ int board_lcd_initialize(void)
      
      memset(&s_drv_lcd, 0, sizeof(s_drv_lcd));
  
@@ -98,3 +249,119 @@ index 66fcfc6..a93f21c 100644
      s_drv_lcd.hlcdc.Instance = LCDC1;
  
      s_drv_lcd.select_layer = HAL_LCDC_LAYER_DEFAULT;
+@@ -929,6 +1028,9 @@ int board_lcd_initialize(void)
+ 
+     sem_init(&(s_drv_lcd.init_sem), 0, 0);
+     sem_init(&(s_drv_lcd.draw_sem), 0, 0);
++    /* 计数 1 = 二值信号量当互斥用。关掉 SF32LB_LCD_PANEL_REINIT 时它没人用，
++     * 初始化这一步本身无害，就不加 #if 了。 */
++    sem_init(&(s_drv_lcd.panel_lock), 0, 1);
+ 
+     /* Keep bringup non-blocking; init/register devices in a worker task. */
+ 
+@@ -947,6 +1049,105 @@ int board_lcd_initialize(void)
+     return OK;
+ }
+ 
++/****************************************************************************
++ * Name:  sf32lb_lcd_panel_reinit
++ *
++ * Description:
++ *   面板重新初始化 —— 把"面板丢了配置"造成的整屏黑救回来的唯一入口
++ *   （复位不生效、只有真断电才好的那种黑，见 docs/display_touch_gpio_usage.md
++ *   第 3.4 节）。
++ *
++ *   做的事，就是开机那条路重走一遍（顺序也一样）：
++ *     ① BSP_LCD_PowerUp()：VADD_EN 拉高、LCD 那几根脚重新 pinmux（幂等）；
++ *     ② p_ops->Init()：**拉一次面板 RESET 脚**（co5300.c 的 LCD_Drv_Init 开头
++ *        BSP_LCD_Reset(1/0/1)）+ 重发整串面板寄存器（0xFE 页切换、密码锁、
++ *        SPI 模式、0x3A 像素格式、0x2A/0x2B 窗口、0x11 出睡眠、0x29 DisplayOn）；
++ *     ③ sf32lb_lcd_lcdc_setup()：LCDC 侧背景色/层复位/层像素格式；
++ *     ④ 再按当前 bpp 显式设一次像素格式（SetColorMode），把亮度按驱动里
++ *        记着的值重新下发（面板复位后 WBRIGHT 会回到上电默认值）；
++ *     ⑤ 清掉 power 再 DisplayOn 一次，让 priv->power 和面板实际状态对齐
++ *        （之后第一次刷像素不会再重复发一遍 0x29）。
++ *
++ *   怎么和"正在刷屏的 LVGL 线程"共存：整个 ②~⑤ 都拿 s_drv_lcd.panel_lock，
++ *   而 putrun/putarea 推像素时拿的是同一把锁 —— 所以"重发配置"和"推一帧像素"
++ *   不会同时在 QSPI 上跑。代价是重初始化这 ~0.4 秒里刷新会卡住（面板本来
++ *   就在复位，卡住是应该的）。
++ *
++ *   **只动面板和 LCDC，不碰 LVGL**：屏幕重绘由调用方负责
++ *   （robot_ui 的 robot_ui_bridge_panel_reinit() 会往 LVGL 线程投一次全屏失效）。
++ *
++ *   Returned Value:
++ *     OK       重新初始化下发完成
++ *     -ENODEV  面板驱动还没绑上（开机 lcd_init 线程还没跑到）
++ *     -EINVAL  在中断上下文里调的
++ *     -ENOSYS  编译期关掉了（SF32LB_LCD_PANEL_REINIT = 0）
++ *
++ ****************************************************************************/
++
++int sf32lb_lcd_panel_reinit(void)
++{
++#if !SF32LB_LCD_PANEL_REINIT
++  lcdwarn("sf32lb_lcd_panel_reinit: 编译期已关闭\n");
++  return -ENOSYS;
++#else
++  lcd_drv_desc_t *p_drv_ops = s_drv_lcd.p_drv_ops;
++
++  if (p_drv_ops == NULL || p_drv_ops->p_ops == NULL ||
++      p_drv_ops->p_ops->Init == NULL)
++    {
++      lcderr("panel reinit: 面板驱动还没绑上，先等开机初始化跑完\n");
++      return -ENODEV;
++    }
++
++  if (up_interrupt_context())
++    {
++      lcderr("panel reinit: 不能在中断上下文里调\n");
++      return -EINVAL;
++    }
++
++  lcdinfo("panel reinit: 开始 (%s)", p_drv_ops->name);
++
++  SF32LB_LCD_PANEL_LOCK();
++
++  /* 万一上一次传输把 HAL 句柄的 Lock 留在了 HAL_LOCKED，那之后任何一次
++   * HAL_LCDC_WriteDatas() 都会在 __HAL_LCDC_LOCK 里的
++   * `HAL_LCDC_ASSERT(0)`（= `if(0==0) while(1)`）上死等，整条 NSH 命令就挂了。
++   * 这里先解开这一位再重走初始化 —— 这一步本来就是"从坏状态里往外捞"，
++   * 不该被上一次的残留状态卡住。State 不用管：HAL_LCDC_Init() 自己会置回
++   * HAL_LCDC_STATE_READY。 */
++  s_drv_lcd.hlcdc.Lock = HAL_UNLOCKED;
++
++  BSP_LCD_PowerUp();
++
++  p_drv_ops->p_ops->Init(&s_drv_lcd.hlcdc);
++
++  sf32lb_lcd_lcdc_setup();
++
++  if (p_drv_ops->p_ops->SetColorMode != NULL)
++    {
++      p_drv_ops->p_ops->SetColorMode(&s_drv_lcd.hlcdc,
++                                     s_drv_lcd.bpp == 24
++                                         ? LCDC_PIXEL_FORMAT_RGB888
++                                         : LCDC_PIXEL_FORMAT_RGB565);
++    }
++
++  if (p_drv_ops->p_ops->SetBrightness != NULL)
++    {
++      p_drv_ops->p_ops->SetBrightness(&s_drv_lcd.hlcdc,
++                                      (uint8_t)s_drv_lcd.contrast);
++    }
++
++  s_drv_lcd.power = 0;
++  sf32lb_lcd_ensure_display_on(&s_drv_lcd);
++
++  SF32LB_LCD_PANEL_UNLOCK();
++
++  lcdinfo("panel reinit: 完成，亮度 %d%%", s_drv_lcd.contrast);
++
++  return OK;
++#endif /* !SF32LB_LCD_PANEL_REINIT */
++}
++
+ /****************************************************************************
+  * Name:  board_lcd_getdev
+  *

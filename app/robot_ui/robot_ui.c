@@ -9,6 +9,19 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>             /* time() / localtime_r()：状态栏时钟用 */
+#include <stdbool.h>
+#include <unistd.h>           /* usleep()：等 hello_app 交出麦克风时的轮询/续租间隔 */
+#include <pthread.h>          /* 报警出声线程（报警声不能做在 LVGL 线程里，见下面那节） */
+
+/* 让 hello_app 交出麦克风（ai_companion_audio_yield(true)）/ 收回
+ * （ai_companion_mic_reclaim()），用法和理由与 app/robot_ui/main.c 里提醒那条路
+ * 完全一样（那边是 reminder_play_exclusive / reminder_wait_mic_released）：
+ * 两个入口都**非阻塞**，只登记请求，真正的停/开设备由 hello_app 自己的线程做，
+ * 这里靠轮询 ai_companion_mic_released() 知道让没让成。
+ * 头文件是自给自足的（只依赖 stdbool/stdint），实现在 app/hello_app 里，
+ * 符号在最终链接时解析（单一大镜像）；头文件路径由 CMakeLists.txt 的
+ * INCLUDE_DIRECTORIES `../hello_app` 提供，无需改构建脚本。 */
+#include "ai_companion_yield.h"
 
 /* 状态栏时钟：定义在本文件后面（ui_clock_refresh / ui_clock_timer_cb），
  * 状态栏创建时立刻刷新一次，并挂一个定时器周期刷新。 */
@@ -49,9 +62,14 @@ static lv_obj_t *btn_remind = NULL;    // 提醒按钮
 static lv_obj_t *btn_setting = NULL;   // 设置按钮
 static lv_obj_t *btn_alarm = NULL;     // 报警按钮
 
+/* 报警页的 "!!!" 图标：闪烁只动它一个（原来动的是整屏，见 alarm_blink_timer_cb） */
+static lv_obj_t *lbl_alarm_icon = NULL;
+
 /* 动画 */
 static lv_anim_t anim_face = {0};      // 表情动画
-static lv_anim_t anim_blink = {0};     // 闪烁动画
+
+/* 报警闪烁：低频定时器，创建后先暂停，报警时 resume（见 robot_ui_show_alarm） */
+static lv_timer_t *alarm_blink_timer = NULL;
 
 /* 当前状态 */
 static robot_face_t current_face = ROBOT_FACE_HAPPY;
@@ -84,7 +102,7 @@ static void create_face_area(lv_obj_t *parent);
 static void create_ai_reply_area(lv_obj_t *parent);
 static void create_bottom_buttons(lv_obj_t *parent);
 static void btn_event_handler(lv_event_t *e);
-static void anim_blink_update(void *var, int32_t val);
+static void alarm_blink_timer_cb(lv_timer_t *t);
 
 /* ==================== 初始化样式 ==================== */
 static void init_styles(void)
@@ -444,12 +462,23 @@ static void btn_event_handler(lv_event_t *e)
 
 /* ==================== 创建报警屏幕 ==================== */
 
-/* 报警闪烁动画回调:lv_anim 的 exec_cb 只有 (var, val) 两个参数，
- * 而 lv_obj_set_style_bg_opa 需要 selector 参数，必须包一层显式传 0，
- * 不能直接强转 3 参函数（否则 selector 为垃圾值导致 assert）。 */
-static void anim_blink_update(void *var, int32_t val)
+/* 报警闪烁回调：在"满不透明"和"半透明"之间切换 "!!!" 图标的整体不透明度。
+ *
+ * 原来这里是绑在 **整个 scr_alarm** 上的无限 lv_anim（改 bg_opa）：每帧都让
+ * 整屏（390x450）失效，实测一秒 80 次全屏重绘（正常空闲 20~30），用户看到的
+ * 就是报警页一直在闪、而且整屏半透明时画面发暗。现在失效面积只剩一个小图标，
+ * 频率也从 80Hz 降到 2Hz（500ms 一次）。 */
+static void alarm_blink_timer_cb(lv_timer_t *t)
 {
-    lv_obj_set_style_bg_opa((lv_obj_t *)var, (lv_opa_t)val, 0);
+    (void)t;
+
+    if (lbl_alarm_icon == NULL)
+    {
+        return;
+    }
+
+    lv_opa_t opa = lv_obj_get_style_opa(lbl_alarm_icon, 0);
+    lv_obj_set_style_opa(lbl_alarm_icon, (opa == LV_OPA_COVER) ? LV_OPA_50 : LV_OPA_COVER, 0);
 }
 
 static void create_alarm_screen(void)
@@ -459,12 +488,12 @@ static void create_alarm_screen(void)
     lv_obj_set_style_bg_color(scr_alarm, lv_color_hex(0xF44336), 0);
     lv_obj_set_style_bg_opa(scr_alarm, LV_OPA_COVER, 0);
 
-    /* 报警图标 */
-    lv_obj_t *icon = lv_label_create(scr_alarm);
-    lv_label_set_text(icon, "!!!");
-    lv_obj_set_style_text_font(icon, &lv_font_ui_24, 0);
-    lv_obj_set_style_text_color(icon, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_align(icon, LV_ALIGN_CENTER, 0, -60);
+    /* 报警图标（闪烁只动它，不透明度的切换见 alarm_blink_timer_cb） */
+    lbl_alarm_icon = lv_label_create(scr_alarm);
+    lv_label_set_text(lbl_alarm_icon, "!!!");
+    lv_obj_set_style_text_font(lbl_alarm_icon, &lv_font_ui_24, 0);
+    lv_obj_set_style_text_color(lbl_alarm_icon, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(lbl_alarm_icon, LV_ALIGN_CENTER, 0, -60);
 
     /* 报警文字 */
     lv_obj_t *text = lv_label_create(scr_alarm);
@@ -494,16 +523,10 @@ static void create_alarm_screen(void)
     lv_obj_set_style_text_font(lbl_back, &lv_font_ui_24, 0);
     lv_obj_center(lbl_back);
 
-    /* 报警闪烁动画 */
-    lv_anim_init(&anim_blink);
-    lv_anim_set_var(&anim_blink, scr_alarm);
-    lv_anim_set_values(&anim_blink, LV_OPA_COVER, LV_OPA_50);
-    lv_anim_set_time(&anim_blink, 500);
-    lv_anim_set_playback_time(&anim_blink, 500);
-    lv_anim_set_repeat_count(&anim_blink, LV_ANIM_REPEAT_INFINITE);
-    lv_anim_set_exec_cb(&anim_blink, anim_blink_update);
-    /* 启动闪烁动画 */
-    lv_anim_start(&anim_blink);
+    /* 报警闪烁：2Hz 低频定时器，创建后先暂停（报警页还没显示，不必闪）。
+     * 报警时由 robot_ui_show_alarm() resume。 */
+    alarm_blink_timer = lv_timer_create(alarm_blink_timer_cb, 500, NULL);
+    lv_timer_pause(alarm_blink_timer);
 }
 
 /* ==================== 初始化 UI ==================== */
@@ -694,11 +717,319 @@ void robot_ui_show_error(const char *title, const char *content)
            (title != NULL) ? title : "", (content != NULL) ? content : "");
 }
 
-/* ==================== 显示报警 ==================== */
-void robot_ui_show_alarm(const char *content)
+/* ==================== 报警出声：先请 hello_app 让路 ====================
+ *
+ * 根因（2026-09-15 定案，含现场串口实证）：**报警这条路一次让路都没做**。
+ *   - hello_app 的 ai_companion 是常开麦：开机起就占着 /dev/audio/audio0 的录音
+ *     通路；本板音频是**半双工**、驱动里只有一个方向标志。
+ *   - 板级报警模块 alarm_audio_open() 走 open -> CONFIGURE -> CONFIGURE(音量)
+ *     -> START（board/contest_board/src/sf32lb52_alarm.c）。录音会话还是 RUNNING
+ *     时，NuttX 音频上层（nuttx/audio/audio.c）那两处判断会**静默跳过** ——
+ *     只有 state==OPEN 才把 CONFIGURE 转给驱动、只有 PREPARED/XRUN 才调下层
+ *     start —— 最后照样 `return OK`：报警模块以为成功了，一行日志都没有。
+ *   - 于是报警的 PCM 全写在录音会话上，DAC/功放从未打开、DMA 永不完成 →
+ *     驱动每 5 秒打一条 `AUDIO: 等播放完成超时（buflen=1600），本块丢弃`，
+ *     报警音一块都出不去，**全程无声**（现场日志实证）。
+ *   - 对照：robot_ui 自己的提醒/播报**有完整让路**（app/robot_ui/main.c 的
+ *     reminder_play_exclusive → ai_companion_audio_yield + 轮询 + reclaim），
+ *     所以它们正常出声 —— 只有报警这条漏了。
+ *
+ * 做法：照机器人这边现成的提醒那条路，**同一套调用、同一组超时档位**：
+ *     ai_companion_audio_yield(true)                      （登记让路，非阻塞）
+ *     -> 有界轮询 ai_companion_mic_released()             （首轮 1.5s + 补等两次）
+ *     -> alarm_trigger() + report_alarm_queued()          （出声 + 上报）
+ *     -> ai_companion_mic_reclaim()                       （close_alarm 时还回去）
+ * 三个入口都只登记请求/读状态，一个设备都不碰；真正的停/开设备在 hello_app
+ * 自己的线程里（协议细节和三次踩坑史见 app/hello_app/ai_companion_yield.h）。
+ *
+ * ⚠️ 为什么"等让路 + 出声"要放进一条**工作线程**，而不是就地做在
+ * robot_ui_show_alarm() 里：
+ *   show_alarm() 跑在 **LVGL 线程**（报警按钮的回调 / main.c 里 ui_post_panel 的
+ *   投递）。那套让路协议**禁止在 LVGL 线程里轮询**（最长 3.3 秒，在 LVGL 线程里等
+ *   就是把界面冻住 —— 这个项目已经因为同类问题冻过一次，见 ai_companion_yield.h
+ *   的第二条约束）。所以这里拆成两半：
+ *     ① LVGL 线程（robot_ui_show_alarm）：切页面 -> 登记让路请求 + 起出声线程；
+ *     ② 工作线程（alarm_sound_worker）：有界等麦克风 -> 出声 + 上报 -> 报警期间
+ *        续租，直到报警页关掉才收摊。
+ *   出声/上报因此比原来晚"让路那一下"（通常 100~400ms，最坏 3.3 秒）：
+ *   页面仍然是第一步切出来的（"先切页面"那条踩坑教训不动），只有声音在等麦克风。
+ *   这一步不能省：报警声若抢在让路之前出声，第一轮就撞上上面那个"静默跳过"，
+ *   而那一轮里每块 1600 字节都要等驱动 5 秒超时（20 块 ≈ 100 秒），连 60 秒的
+ *   自动解除都过去了 —— 现场看到的正是"全程无声"。
+ *
+ * ⚠️ 为什么报警期间要**续租**（每 1 秒把 yield(true) 再登记一次）：
+ *   hello_app 对让路有一道 10 秒的收回看门狗（MIC_HOLD_WATCHDOG_MS）：让出去之后
+ *   10 秒没收到新的登记，它就认定调用方漏了回收，把麦克风**强制收回去**并重开常开麦
+ *   （见 ai_companion_yield.h 的"可选的续租"那段）。而报警页是模态的，用户点了
+ *   "返回"才结束，中间可能十几秒到几十秒（报警本身最长 60 秒才自动解除）：
+ *   不续租的话 10 秒一到 hello_app 重开麦，报警后面几轮 open 又撞上录音 → 又没声。
+ *   续租只是把同一个方向再登记一次（接口是**电平语义、幂等**，重复登记不会叠出
+ *   多次让路）；本模块自己的让路状态仍然是**只申请一次、只释放一次**
+ *   （alarm_yield_held 那两个布尔量），不看调了几次。
+ */
+
+/* 有界等待的档位：和提醒那条路（app/robot_ui/main.c 的 REMINDER_YIELD_*）**同一组
+ * 取值、同一个理由** —— 都是"登记请求 + 对方下一拍动手"：首轮 1.5 秒等不到多半只是
+ * 对方那一拍正好在忙别的事，补等两次给它机会（间隔 400ms 是给 hello_app 一拍 100ms
+ * 留四拍余量）。上限 1.5 + 2×(0.4+0.5) = 3.3 秒，到点就照常出声：报警是安全功能，
+ * **等不到也必须响**（宁可撞一下，也不能因为没有麦克风就不出声）。 */
+#define ALARM_YIELD_WAIT_MS        1500   /* = REMINDER_YIELD_WAIT_MS */
+#define ALARM_YIELD_RETRY_TIMES       2   /* = REMINDER_YIELD_RETRY_TIMES */
+#define ALARM_YIELD_RETRY_GAP_MS    400   /* = REMINDER_YIELD_RETRY_GAP_MS */
+#define ALARM_YIELD_RETRY_WAIT_MS   500   /* = REMINDER_YIELD_RETRY_WAIT_MS */
+#define ALARM_YIELD_POLL_MS          50   /* 轮询粒度 = REMINDER_YIELD_POLL_MS */
+
+/* 续租周期：看门狗 10 秒，1 秒一次留足余量。每次续租只是一次变量写 +（方向没变时）
+ * 一次信号量唤醒，代价可以忽略；报警最长 60 秒，这条线程自己也是睡着的。 */
+#define ALARM_YIELD_RENEW_MS       1000
+
+/* 出声线程的栈：它在等让路那一小段里只做轮询 / printf 和两个非阻塞调用，
+ * 但 printf 和让路查询本身都要吃一些栈，照 main.c 里等价的那条线程
+ * （voice_open_thread，同样"等让路 + 开麦"）给 16 KB，创建写法也一致
+ * （pthread_attr + DETACHED）。 */
+#define ALARM_WORKER_STACK_SIZE    16384
+
+/* 报警让路的共享状态。写者有两条线程：LVGL 线程（show_alarm / close_alarm）和
+ * 报警出声线程，所以用一把锁护住，判据只看这三个布尔量。
+ *   alarm_yield_held    —— 这次报警借了麦克风、还没还（申请一次、释放一次都以它为准）
+ *   alarm_sound_pending —— 有一次"出声 + 上报"还没做（show_alarm 每次调用置位）
+ *   alarm_worker_up     —— 出声线程活着（活着就不再起第二条） */
+static pthread_mutex_t alarm_audio_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool alarm_yield_held    = false;
+static bool alarm_sound_pending = false;
+static bool alarm_worker_up     = false;
+
+/**
+ * @brief  轮询等 hello_app 交出麦克风（首轮 + 补等），上限 3.3 秒
+ *         —— app/robot_ui/main.c 的 reminder_wait_mic_released() 的同款写法
+ *
+ * @return true  = 麦克风已经不在 hello_app 手里，可以出声；
+ *         false = 补等全用完还没让开，调用方**照常出声**（报警不能因为等不到就不响）。
+ *
+ * ⚠️ 只能在**工作线程**里调（最长会让当前线程等 3.3 秒，见本节头上那条约束）。
+ */
+static bool alarm_wait_mic_released(void)
+{
+    long waited_ms = 0;
+    int  attempt;
+
+    /* attempt 0 = 首轮（上限 ALARM_YIELD_WAIT_MS），之后是补等 */
+
+    for (attempt = 0; attempt <= ALARM_YIELD_RETRY_TIMES; attempt++) {
+        long limit = (attempt == 0) ? (long)ALARM_YIELD_WAIT_MS
+                                    : (long)ALARM_YIELD_RETRY_WAIT_MS;
+        long waited = 0;
+        bool released;
+
+        if (attempt > 0) {
+            usleep(ALARM_YIELD_RETRY_GAP_MS * 1000);
+            waited_ms += ALARM_YIELD_RETRY_GAP_MS;
+        }
+
+        /* waited == 0 也是正常情况：hello_app 压根没占着麦克风（没在跑 /
+         * 本来就没开麦），接口直接报"不在它手里"，一秒都不用等。 */
+        released = ai_companion_mic_released();
+
+        while (!released && waited < limit) {
+            usleep(ALARM_YIELD_POLL_MS * 1000);   /* 50 ms 一探：够细，也不占 CPU */
+            waited += ALARM_YIELD_POLL_MS;
+            released = ai_companion_mic_released();
+        }
+
+        waited_ms += waited;
+
+        if (released) {
+            printf("[Alarm] 麦克风不在 hello_app 手里（等了 %ld ms），可以出声\n",
+                   waited_ms);
+            return true;
+        }
+    }
+
+    /* "没让成"的明细只在这里打一次（补等各打一行的话，真出问题时串口上会连出
+     * 三行一样的字，反而看不出等了多久、试了几次）。为什么没让成看 hello_app
+     * 那边 `[让路] 让路失败：…` 那一行。 */
+    printf("[Alarm] 让路轮询了 %d 次、共 %ld ms，hello_app 一直没交出麦克风"
+           "（照常出声，这一声可能不响）\n",
+           ALARM_YIELD_RETRY_TIMES + 1, waited_ms);
+    return false;
+}
+
+/**
+ * @brief  出声 + 上报（原样搬过来的两句，参数、顺序一个字都没改）
+ *
+ * 顺序是踩坑换来的：**先出声、再上报**（上报走网络 MQTT/TLS，慢或卡住时声音
+ * 必须已经出去了）。页面那一步在调用方（robot_ui_show_alarm）里，仍然排在最前面。
+ *
+ * ⚠️ 只许工作线程调（出声要动设备，见本节头上那段）。
+ */
+static void alarm_sound_do(void)
 {
     int ret;
 
+    ret = alarm_trigger(ALARM_LEVEL_EMERGENCY, "ui",
+                        "报警已触发，请尽快确认");
+    if (ret != OK) {
+        printf("robot_ui: alarm_trigger failed: %d\n", ret);
+    }
+
+    /* 上报：MQTT 发到 zhi_ai/<client_id>/alarm（+ 手机推送）。
+     * 用**排队版** report_alarm_queued()，不能用 report_alarm()：本线程不是
+     * network_task 的 task group，跨组直接 send() 那个 fd 必然失败（真机日志：
+     * `[ALARM] report_alarm type=ui … ret=-1` 紧跟 `MQTT publish failed: -1`）。
+     * 排队版只把消息拷进队列、由 network_task 去发，可从任意线程调。 */
+    ret = report_alarm_queued("ui", "用户按下报警按钮");
+    if (ret < 0) {
+        /* 排队口的负值只表示**这条没进队列**：-EINVAL topic 空、-ENOSPC 队列满、
+         * -EMSGSIZE 载荷超长（语义见 mqtt_publish_queued()）。跟 MQTT 连没连上
+         * 无关 —— 连接由 network_task 自己维持，连不上是它那边重连的事。 */
+        printf("robot_ui: report_alarm_queued 没入队: %d"
+               "（队列满或载荷超长，这条不会发出去）\n", ret);
+    }
+}
+
+/**
+ * @brief  报警出声线程：等让路 -> 出声 + 上报 -> 报警期间续租，直到报警结束
+ *
+ * 存活期 = 一次报警：close_alarm 会把 alarm_yield_held 清掉，本线程据此收摊。
+ * 等让路、出声、上报、续租**全在这一条线程里串行**（设备动作只有一条线程在做）。
+ */
+static void *alarm_sound_worker(void *arg)
+{
+    (void)arg;
+
+    /* ① 有界等麦克风真的交出来。等不到也照常往下走：报警是安全功能，
+     *    宁可撞一下（这一声可能不响），也不能因为对方没让就不响。 */
+    alarm_wait_mic_released();
+
+    for (;;) {
+        bool pending;
+
+        pthread_mutex_lock(&alarm_audio_lock);
+
+        /* ② 出声 + 上报。show_alarm 每调用一次置一次 pending，这里认领；
+         *    报警页还开着时又来新的触发（声音检测 / MQTT 反复调 show_alarm）
+         *    就再走一遍 —— alarm_trigger 对同级重复触发只更新 reason/text，
+         *    不会响两遍（见 board/contest_board/src/sf32lb52_alarm.c）。
+         *    判据带上 alarm_yield_held：用户很快点了"返回"（页面已经关了）
+         *    就不要在这时候再补一声铃出来。两个判据在同一把锁里读，不会看串。 */
+        pending = alarm_sound_pending && alarm_yield_held;
+        alarm_sound_pending = false;
+
+        if (!alarm_yield_held) {
+            /* 报警页已经关了：收摊。和 show_alarm 共用这把锁 —— "收摊"和
+             * "刚关掉就又被 show_alarm 拉起来"只差一步，两边都在锁里改状态，
+             * 就不会出现"线程走了、新的触发挂在那里没人做"（那一声报警就永远
+             * 不响了）：show_alarm 要么先看到 worker_up 还是真（那它就把 held
+             * 置回去，本线程下面那一圈照常出声），要么看到 worker_up 已经是假
+             * （那它自己会起一条新线程）。 */
+            alarm_worker_up = false;
+            pthread_mutex_unlock(&alarm_audio_lock);
+            return NULL;
+        }
+
+        pthread_mutex_unlock(&alarm_audio_lock);
+
+        if (pending) {
+            alarm_sound_do();
+        }
+
+        /* ③ 续租（理由见本节头上那段），顺带让出 CPU。 */
+        usleep(ALARM_YIELD_RENEW_MS * 1000);
+        ai_companion_audio_yield(true);
+    }
+}
+
+/**
+ * @brief  LVGL 线程侧：登记让路请求（只登记一次）并保证出声线程活着
+ *
+ * 幂等：让路请求只在第一次登记（alarm_yield_held 那道判据），重复调用不会叠出
+ * 多次让路、也不会起第二条线程；每次调用只把"这一次要出声 + 上报"挂到 pending。
+ * 线程起不来时在这里就地出声兜底 —— 不能因为线程起不来就让这次报警一声不响。
+ */
+static void alarm_yield_begin(void)
+{
+    pthread_attr_t attr;
+    pthread_t      tid;
+    bool           need_yield = false;
+    bool           need_start = false;
+
+    pthread_mutex_lock(&alarm_audio_lock);
+
+    if (!alarm_yield_held) {
+        alarm_yield_held = true;
+        need_yield = true;
+    }
+
+    alarm_sound_pending = true;
+
+    if (!alarm_worker_up) {
+        alarm_worker_up = true;
+        need_start = true;
+    }
+
+    pthread_mutex_unlock(&alarm_audio_lock);
+
+    if (need_yield) {
+        printf("[Alarm] 让路 —— 先请 hello_app 交出麦克风（非阻塞）\n");
+        ai_companion_audio_yield(true);      /* 只登记请求，立刻返回 */
+    }
+
+    if (!need_start) {
+        return;
+    }
+
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&attr, ALARM_WORKER_STACK_SIZE);
+
+    if (pthread_create(&tid, &attr, alarm_sound_worker, NULL) != 0) {
+        pthread_attr_destroy(&attr);
+
+        /* 线程起不来：报警**绝不能因此变成一声不响** —— 就地出声 + 上报
+         * （等于退回"没有让路"的老行为，这一声可能不响，但页面、上报都在）。
+         * 让路请求**留着不收回**：下一拍 hello_app 真的交出来了，报警后面几轮
+         * open 就能响；收回统一留给 close_alarm（配对纪律不破，见下）。 */
+        printf("[Alarm] 出声线程起不来（栈/资源不足），就地出声："
+               "这一声可能不响，且没有人续租让路\n");
+
+        pthread_mutex_lock(&alarm_audio_lock);
+        alarm_worker_up     = false;
+        alarm_sound_pending = false;
+        pthread_mutex_unlock(&alarm_audio_lock);
+
+        alarm_sound_do();
+        return;
+    }
+
+    pthread_attr_destroy(&attr);
+}
+
+/**
+ * @brief  LVGL 线程侧：报警结束，把麦克风还给 hello_app（幂等，只还一次）
+ *
+ * reclaim 是非阻塞的（只登记方向，重开常开麦由 hello_app 自己的线程做），
+ * 所以放在 close_alarm 里无条件调：还出去的一定会还回来。
+ * 出声线程看到 alarm_yield_held 变假就自己收摊（最多晚 1 秒那一拍）。
+ */
+static void alarm_yield_end(void)
+{
+    bool need_reclaim;
+
+    pthread_mutex_lock(&alarm_audio_lock);
+    need_reclaim = alarm_yield_held;
+    alarm_yield_held    = false;      /* 出声线程据此收摊 */
+    alarm_sound_pending = false;
+    pthread_mutex_unlock(&alarm_audio_lock);
+
+    if (need_reclaim) {
+        printf("[Alarm] 报警结束：把麦克风还给 hello_app\n");
+        ai_companion_mic_reclaim();   /* 非阻塞、无条件可调 */
+    }
+}
+
+/* ==================== 显示报警 ==================== */
+void robot_ui_show_alarm(const char *content)
+{
     /* ① 先把红色报警页面切出来（**必须第一步**）。
      *
      * 这一步原来排在报警声和上报后面，实测踩了坑：上报走网络（MQTT + TLS 推送），
@@ -712,10 +1043,17 @@ void robot_ui_show_alarm(const char *content)
     robot_ui_set_face(ROBOT_FACE_ALARM);
     robot_ui_set_status(ROBOT_STATUS_ALARM);
 
-    /* 启动报警闪烁动画 */
-    lv_anim_start(&anim_blink);
+    /* 启动报警闪烁：先复位成满不透明，再让 2Hz 定时器跑起来 */
+    if (lbl_alarm_icon != NULL)
+    {
+        lv_obj_set_style_opa(lbl_alarm_icon, LV_OPA_COVER, 0);
+    }
+    if (alarm_blink_timer != NULL)
+    {
+        lv_timer_resume(alarm_blink_timer);
+    }
 
-    /* ② 设备级动作：让喇叭真的响起来（板级报警模块，非阻塞返回）。
+    /* ② 设备级动作：**先请 hello_app 让路**，再让喇叭真的响起来（板级报警模块）。
      *
      * 放在这个函数里、而不是各个调用点，是因为界面上的"报警"按钮走的是
      *   btn_event_handler() -> robot_ui_show_alarm()
@@ -723,37 +1061,23 @@ void robot_ui_show_alarm(const char *content)
      * 声音检测回调）唯一的汇合点，改一处就全接上了。也不会重复触发：
      * alarm_trigger() 对同级或更低的重复触发只更新 reason/text，不重来。
      *
+     * ★ 让路（2026-09-15 补）：出声之前必须先请 hello_app 交出麦克风 —— 常开麦
+     *   占着设备时，报警的 CONFIGURE/START 会被音频上层**静默跳过**，结果是
+     *   全程无声（根因链和现场实证见上面那一节的说明）。
+     *   这里只做两件**非阻塞**的事：登记让路请求（只登记一次）+ 起一条出声工作
+     *   线程（在那条线程里：有界等让路 -> alarm_trigger + 上报 -> 报警期间续租）。
+     *   出声 + 上报（原来的 ②③）因此比原来晚"让路那一下"（通常 100~400ms，
+     *   最坏 3.3 秒），参数和顺序一个字都没改，见 alarm_sound_do()。
+     *
+     *   "等让路"**绝不能**就地做在这个函数里：它跑在 **LVGL 线程**，而轮询最长
+     *   3.3 秒 —— 等在 LVGL 线程里就是把界面冻住（见上面那一节）。所以一切跟
+     *   等/出声有关的事都在工作线程里做。
+     *   重复调用（现场日志里每几秒一次）不会叠出多次让路、也不会起第二条线程。
+     *
      * 这里**不受 main.c 里 g_ai_initialized / #if 0 的影响**：robot_ui.c
      * 完全不引用那个标志，所以 AI 初始化整块停用也照样出声。
      */
-    ret = alarm_trigger(ALARM_LEVEL_EMERGENCY, "ui",
-                        "报警已触发，请尽快确认");
-    if (ret != OK) {
-        printf("robot_ui: alarm_trigger failed: %d\n", ret);
-    }
-
-    /* ③ 上报：MQTT 发到 zhi_ai/<client_id>/alarm（+ 手机推送）。
-     * 以前这里没接，所以按了报警按钮只响、不上报；补上这一句
-     * 才算"响 + 屏幕 + 上报 + 推送"四个动作齐全。
-     *
-     * ⚠️ 必须用 **report_alarm_queued()**，不能用 report_alarm()：
-     * 这里跑在 **LVGL 线程**（报警按钮的回调），而 MQTT socket 的 fd 属于
-     * robot_ui 的 network_task —— 跨 task group 直接 send() 那个 fd 号必然失败
-     * （真机日志：`[ALARM] report_alarm type=ui … ret=-1` 后面紧跟着
-     * `MQTT publish failed: -1`，而同一时刻 net_task 的心跳是成功的）。
-     * 排队版本只把消息拷进队列、由 network_task 去发，可从任意线程调。
-     * 详情见 network_comm.h 里 mqtt_publish_queued() 的说明。 */
-    {
-        int rret = report_alarm_queued("ui", "用户按下报警按钮");
-        if (rret < 0) {
-            /* 排队口的负值只表示**这条没进队列**：-EINVAL topic 空、
-             * -ENOSPC 队列满、-EMSGSIZE 载荷超长（语义见
-             * mqtt_publish_queued()）。跟 MQTT 连没连上无关 —— 连接由
-             * network_task 自己维持，连不上是它那边重连的事。 */
-            printf("robot_ui: report_alarm_queued 没入队: %d"
-                   "（队列满或载荷超长，这条不会发出去）\n", rret);
-        }
-    }
+    alarm_yield_begin();
 }
 
 /* ==================== 关闭报警 ==================== */
@@ -767,10 +1091,22 @@ void robot_ui_close_alarm(void)
         printf("robot_ui: alarm_clear failed: %d\n", ret);
     }
 
-    /* 停止闪烁动画 */
-    /* v9 语义: lv_anim_delete(var, exec_cb) 第一个参数是动画绑定的对象
-     * (anim_blink.var == scr_alarm), 不是 lv_anim_t 结构体地址 */
-    lv_anim_delete(anim_blink.var, anim_blink_update);
+    /* 报警结束：把麦克风还给 hello_app（非阻塞、**只还一次**）。
+     * 让路是 show_alarm 那次借的，配对纪律要求"借了就得还" —— 漏一次 reclaim
+     * hello_app 就一直聋着（它的让路看门狗 10 秒后会强制收回兜底，但正常路径
+     * 不该走到那里）。放在 alarm_clear() 之后：先把对方的出声请求停掉，再把
+     * 设备还回去。理由和 reclaim 为什么非阻塞见本节前面那一节。 */
+    alarm_yield_end();
+
+    /* 停止报警闪烁（并复位成满不透明，免得下次进报警页时停在半透明的状态） */
+    if (alarm_blink_timer != NULL)
+    {
+        lv_timer_pause(alarm_blink_timer);
+    }
+    if (lbl_alarm_icon != NULL)
+    {
+        lv_obj_set_style_opa(lbl_alarm_icon, LV_OPA_COVER, 0);
+    }
 
     /* 返回主界面 */
     lv_scr_load(scr_main);
