@@ -181,6 +181,77 @@
  * 没动**，所以"开会话才武装、关会话才拆掉 + 软复位"的边界语义不变。 */
 #define SF32LB52_AUDIO_ARM_ONCE   1
 
+/* M4 可回退开关：read()/write() 的"等待到点了"改由**本驱动自己的看门狗**产生，
+ * 不再用内核的定时信号量等待（nxsem_tickwait_uninterruptible）。
+ *
+ *   1 = 本次改动之后的行为（默认）：read 的分片节拍仍是 100ms × 50 片 = 5 秒
+ *       预算；write 仍是"一次等满 采样时长+500ms"。两边**返回值的语义与总超时
+ *       预算逐字不变**，只是"到点了"由两记**各自独立**的私有看门狗产生：
+ *       priv->rx_wait_wdog（read 每片一武装）与 priv->wr_wait_wdog（write 一次
+ *       一武装）。**两者绝不能共用一个对象** —— 本板 rtcb->waitdog 与阻塞对象
+ *       都是每线程一份的，两个等待串台正是这类崩溃的来源。
+ *       回调只做两件事：立一个"这次超时了"的旗、有人正在等就 post 对应的信号量。
+ *       它**不读也不写任何 TCB 字段**（不碰 task_state、不碰 waitobj），
+ *       所以内核里那条会断言崩溃的路径（sem_timeout → sem_waitirq 读
+ *       waitobj）在这两条等待上**根本不会被执行**。
+ *   0 = 逐字回到改动之前：两处 read 的等待逐字用回
+ *       nxsem_tickwait_uninterruptible(&priv->rx_sem, MSEC2TICK(100))，
+ *       write 的等待逐字用回
+ *       nxsem_tickwait_uninterruptible(&priv->wr_sem, MSEC2TICK(wait_ms))，
+ *       新代码全部由 #if 编掉（含那四个成员与那四个函数），一字不进镜像。
+ *
+ * 为什么要改（上板硬崩的定案）：现场抓到
+ *     ASSERT sem_waitirq.c:137 task robot_ui
+ *     nxsem_wait_irq ← nxsem_timeout ← wd_timer ← timer_callback ← systick_interrupt
+ *   即"定时看门狗到期 → 那条等待的 waitobj 已经是 NULL → DEBUGASSERT(sem != NULL)"。
+ *   内核的 nxsem_tickwait_slow() 是这么干的（sched/semaphore/sem_tickwait.c）：
+ *       wd_start(&rtcb->waitdog, delay, nxsem_timeout, rtcb);  ← 每片都武装一次
+ *       nxsem_wait_slow(sem);                                  ← 阻塞在 waitobj 上
+ *       wd_cancel(&rtcb->waitdog);                             ← 醒了再取消
+ *   而 ISR 里的 nxsem_post()（sched/semaphore/sem_post.c）走的是
+ *       wd_cancel(&stcb->waitdog) → stcb->waitobj = NULL → 任务转 ready
+ *   两边都声明自己在临界区里，但本板的临界区是 **BASEPRI 型**
+ *   （arch/arm/include/arm_m/irq.h:465 up_irq_save → raisebasepri(
+ *     NVIC_SYSH_DISABLE_PRIORITY)，非 ARMV6M 分支），它只挡住优先级 **不低于**
+ *   阈值的异常；而 AUDPRC 的 DMA 中断优先级恰恰是 0（最高）——
+ *   本驱动的 DMA 句柄是 kmm_zalloc 出来的（`priv->aprc.hdma[RX] = kmm_zalloc`），
+ *   `Init.IrqPrio` 全场没有任何人赋值，而厂商 HAL 在通道分配那一步无条件写
+ *      NVIC_SetPriority(irq_type, hdma->Init.IrqPrio);
+ *   （vendor/sifli/chips/drivers/hal/bf0_hal_dma.c:307）→ 优先级 0，
+ *   **BASEPRI 挡不住它**。于是 ISR 里的 post 可以落在 nxsem_timeout 的
+ *   "查 task_state == TSTATE_WAIT_SEM"与"读 wtcb->waitobj"之间，
+ *   把 waitobj 清成 NULL 而谓词检查已经通过 → 断言。
+ *
+ *   这不是 arm-once 引入的：老路径每片 100ms、每秒 50 片，arm-once 之后每帧
+ *   仍然要武装/取消 50 次，配合 HT+TC 每帧各一次 post，就是每秒上百次"掷骰子"。
+ *   上一版录音几十秒就冻死（冻死后 ISR 不再 post，撞不上），这一版录音一直活着，
+ *   于是这个本就存在的竞态被暴露出来。
+ *
+ *   为什么是"换形态"而不是"把片数减到 5 片 × 1000ms"：上层的 audio_record_stop
+ *   是"先停设备再 join"，join 在 LVGL 线程里、超时 300ms。100ms 分片是
+ *   "stop 那一次 post 万一生效不了"时的兜底时延；拉长到 1 秒会让这条兜底
+ *   从 100ms 退到 1000ms（join 必然超时、界面卡死），所以节拍必须保持 100ms。
+ *   真正要拿掉的不是"分片"，而是"用内核那条会读 waitobj 的超时路径分片"。
+ *
+ *   代价：多两记属于本驱动的看门狗（read 每片一次 wd_start/wd_cancel，write
+ *   每次一次），它们的回调在 systick 中断里只置旗 + post，工作量与 DMA 中断里
+ *   那次 post 同级；它们和任何 TCB 都无关联，所以"取消失败/与 ISR post 并发"
+ *   不会有断言，最坏只是多一次 post（read/write 开头那句 nxsem_reset 会把多余的
+ *   计数清掉）。
+ *
+ *   write() 是形状完全相同的第二处：等待侧在 sf32lb52_audio_write 里那句
+ *   一次等满 wait_ms 的 nxsem_tickwait_uninterruptible，post 侧是 ISR
+ *   HAL_AUDPRC_TxCpltCallback / HAL_AUDCODEC_TxCpltCallback 里
+ *   `if (priv->wr_busy) nxsem_post(&priv->wr_sem)` —— 同样是"ISR 的 post
+ *   可能在 nxsem_timeout 读完 task_state、还没读 waitobj 之间插进来"。
+ *   处理方式与 read 逐字同构，**不新开开关**。 */
+#define SF32LB52_AUDIO_CALM_WAIT   1
+
+/* read() 每片的超时长度（毫秒）。语义与内核 tickwait 的那一片完全一致：
+ * 只决定"没人 post 时多久回来看一眼 running/stop/会话代号"，不决定总预算
+ * （总预算 = 这个值 × 50 片，仍然是 5 秒）。 */
+#define SF32LB52_AUDIO_WAIT_SLICE_MS   100
+
 /* 常驻接收环能承载的单帧上限（字节）。超过它的 read 不走常驻环，逐字落回
  * 每帧 arm 的老路径 —— 例如 hw_test 那种"一次读 1 秒 = 32000 字节"的整块
  * 录音，本来就是"一次一停"的整块语义，老路径正是它的原生形态。
@@ -268,6 +339,27 @@ struct sf32lb52_audio_s
   sem_t                   rx_sem;       /* read() 同步信号量 */
   bool                    rx_busy;      /* read() DMA 进行中 */
   bool                    rx_aborted;   /* stop() 打断了正在等待的 read() */
+
+#if SF32LB52_AUDIO_CALM_WAIT
+  /* read() 每一片 100ms、write() 那一次等满 wait_ms 的"到点了"由这两记
+   * **本驱动私有**的看门狗产生（见 SF32LB52_AUDIO_CALM_WAIT 的说明）。
+   * 它们与任何 TCB 都没有关联，回调里只置旗 + post 对应的信号量，所以不存在
+   * "看门狗到期时 waitobj 已被 ISR 的 post 清成 NULL"这条崩溃路径。
+   *
+   * rx_wait_to / wr_wait_to：这一次等待是被上面那记心跳唤醒的（而不是真有人
+   * post 到了东西）。read 的循环出口用的是 ret == OK，必须能把"数据来了"和
+   * "到点了"分开，否则一次心跳会被当成一帧数据返回（交上去一块没被写过的
+   * 缓冲）；write 靠它把"心跳到点"翻译成 -ETIMEDOUT（本块丢弃），与原来那句
+   * tickwait 的出口逐字一致。
+   *
+   * 两个方向**各一记，绝不共用**：本板 rtcb->waitdog 与它阻塞的对象是每线程
+   * 一份的，两个等待串台正是这类崩溃的来源。 */
+
+  struct wdog_s           rx_wait_wdog; /* read() 每片心跳（wdt 回调见下） */
+  bool                    rx_wait_to;   /* 这一片是心跳到点唤醒的 */
+  struct wdog_s           wr_wait_wdog; /* write() 那一次的等满心跳 */
+  bool                    wr_wait_to;   /* 这次等待是心跳到点唤醒的 */
+#endif
 
   /* DMA 传输错误（TE）打断了正在等待的 read()。
    *
@@ -495,6 +587,13 @@ static bool sf32lb52_audio_rx_once_prepare(FAR struct sf32lb52_audio_s *priv,
 static ssize_t sf32lb52_audio_read_once(FAR struct sf32lb52_audio_s *priv,
                                         FAR char *buffer, size_t buflen);
 static void sf32lb52_audio_rx_once_reset(FAR struct sf32lb52_audio_s *priv);
+#endif
+
+#if SF32LB52_AUDIO_CALM_WAIT
+/* write() 在这个定义之前，先声明一笔（与上面 ARM_ONCE 那组同一个道理）。 */
+
+static int  sf32lb52_audio_tx_wait_slice(FAR struct sf32lb52_audio_s *priv,
+                                         uint32_t wait_ms);
 #endif
 
 /****************************************************************************
@@ -2514,6 +2613,22 @@ static ssize_t sf32lb52_audio_write(FAR struct audio_lowerhalf_s *dev,
 
   priv->user_tid = nxsched_gettid();
 
+#if SF32LB52_AUDIO_CALM_WAIT
+  /* 与 read() 开头那两句对称：
+   *
+   *   nxsem_reset：上一次 write 完成时 ISR 的 post 万一来晚了一步（落在"本次
+   *     等待已经返回、wr_busy 已经清零"之后），会留下一个没人要的计数，让本次
+   *     写一进等待就立刻返回、把没播完的块当播完了交上去。这里清掉。
+   *     （清在 wr_busy = true 之前：post 只可能发生在 wr_busy 为真时，所以这一
+   *     行之后不会有任何在途的 post 被误伤。）
+   *   wd_cancel：上一次 write 万一没走到取消（线程被删、被强杀）就留下了一记
+   *     待触发的私有心跳，它的回调**只看 wr_busy**，所以在下面 wr_busy 置真
+   *     之后随时可能补一记 post —— 必须在置真之前把它取消掉。 */
+
+  nxsem_reset(&priv->wr_sem, 0);
+  (void)wd_cancel(&priv->wr_wait_wdog);
+#endif
+
   priv->wr_busy = true;
 
   /* 数据体检：样本是否为空/异常（全 0 会让 DAC 只输出直流，只有开关爆音） */
@@ -2604,11 +2719,22 @@ static ssize_t sf32lb52_audio_write(FAR struct audio_lowerhalf_s *dev,
     }
 
   {
-    /* 按实际采样率算等待上限（ms），再加 500ms 余量 */
+    /* 按实际采样率算等待上限（ms），再加 500ms 余量。
+     *
+     * M4：这一次等满的 wait_ms 预算与返回语义**一个字都没变**，只是"到点了"
+     * 由本驱动自己的心跳（wr_wait_wdog）产生，不再由内核的 rtcb->waitdog +
+     * nxsem_timeout 产生 —— 后者会和下面两个 TxCplt ISR 里的 nxsem_post 抢同一
+     * 个 waitobj（`if (priv->wr_busy) nxsem_post(&priv->wr_sem)`），正是上板
+     * 硬崩的那条断言。write() 没有分片，所以心跳只武装/取消一次。 */
+
     uint32_t wait_ms = (uint32_t)(((uint32_t)(buflen / 2) * 1000U) /
                        (uint32_t)(priv->samplerate ? priv->samplerate : 16000)) + 500U;
 
+#if SF32LB52_AUDIO_CALM_WAIT
+    ret = sf32lb52_audio_tx_wait_slice(priv, wait_ms);
+#else
     ret = nxsem_tickwait_uninterruptible(&priv->wr_sem, MSEC2TICK(wait_ms));
+#endif
   }
 
   priv->wr_busy = false;
@@ -2639,6 +2765,145 @@ static ssize_t sf32lb52_audio_write(FAR struct audio_lowerhalf_s *dev,
 
   return buflen;
 }
+
+#if SF32LB52_AUDIO_CALM_WAIT
+/****************************************************************************
+ * Name: sf32lb52_audio_rx_wait_timeout
+ *
+ * Description:
+ *   read() 一片（SF32LB52_AUDIO_WAIT_SLICE_MS）的心跳到点了。
+ *
+ *   这个回调跑在 systick 中断里，只做两件**与 TCB 无关**的事：
+ *     1) 立 rx_wait_to 旗：告诉 read() 的循环"这片是超时醒的，不是数据来了"；
+ *     2) 有人正在等（rx_busy）就 post 一次 rx_sem，把他叫醒。
+ *   没人等时不 post：那一次计数没人消费，会在下一次 read 开头的 nxsem_reset
+ *   里被清掉，但"多一次没人要的 post"本身就是给下一次 read 埋一个假唤醒，
+ *   所以这里按 rx_busy 挡住（和 DMA 那两条中断回调同一套判据、同一个理由）。
+ *
+ *   **不打日志**：中断上下文里碰串口会抢控制台锁把整机挂住（本文件在播放完成
+ *   回调里就为此删过一次 printf）。
+ *
+ *   与内核那条 nxsem_timeout 的根本区别：这里从不读 task_state，也从不读/写
+ *   waitobj —— 它只投递一个信号量计数。不存在"看门狗到期时那个线程的 waitobj
+ *   已经被别人的 post 清成 NULL"的窗口，也就没有那条断言的立足之地。
+ ****************************************************************************/
+
+static void sf32lb52_audio_rx_wait_timeout(wdparm_t arg)
+{
+  FAR struct sf32lb52_audio_s *priv = (FAR struct sf32lb52_audio_s *)arg;
+
+  priv->rx_wait_to = true;
+
+  if (priv->rx_busy)
+    {
+      nxsem_post(&priv->rx_sem);
+    }
+}
+
+/****************************************************************************
+ * Name: sf32lb52_audio_rx_wait_slice
+ *
+ * Description:
+ *   read() 等一片的完整动作：武装私有心跳 → 阻塞等 rx_sem → 取消心跳。
+ *
+ *   返回值语义**与它替换掉的那句 nxsem_tickwait_uninterruptible 完全一致**：
+ *     OK         = 这一片里有人 post 到了东西（真数据 / stop / 新会话 / TE）；
+ *     -ETIMEDOUT = 这一片谁也没 post，是本驱动自己的心跳叫醒的。
+ *   所以两处 read 的循环出口判据（老路径看 ret == OK，arm-once 看计数器）
+ *   一个字都不用改，五秒预算、返回 0 / -ETIMEDOUT / buflen 三种出口也不变。
+ *
+ *   为什么用 nxsem_wait_uninterruptible 而不是 nxsem_wait：
+ *   它内部对 -EINTR 自旋重试（include/nuttx/semaphore.h），语义与原来那句
+ *   tickwait 的 "uninterruptible" 一样 —— 信号打断这次等待时不会提前返回，
+ *   这一片仍然由我们的心跳收口（心跳没被取消，仍然会在 100ms 到点）。
+ ****************************************************************************/
+
+static int sf32lb52_audio_rx_wait_slice(FAR struct sf32lb52_audio_s *priv)
+{
+  int ret;
+
+  priv->rx_wait_to = false;
+
+  (void)wd_start(&priv->rx_wait_wdog, MSEC2TICK(SF32LB52_AUDIO_WAIT_SLICE_MS),
+                 sf32lb52_audio_rx_wait_timeout, (wdparm_t)priv);
+
+  ret = nxsem_wait_uninterruptible(&priv->rx_sem);
+
+  /* 数据先到（或者心跳刚好在取消前一刻到点）都无妨：wd_cancel 对已经到点的
+   * 看门狗只是返回 -EINVAL，什么也不做；多出来的那一次 post 会被下一片
+   * （或下一次 read 开头）自然吃掉，不会串到别的等待上。 */
+
+  (void)wd_cancel(&priv->rx_wait_wdog);
+
+  return (ret == OK && priv->rx_wait_to) ? -ETIMEDOUT : ret;
+}
+
+/****************************************************************************
+ * Name: sf32lb52_audio_tx_wait_timeout
+ *
+ * Description:
+ *   write() 那一次等待（采样时长 + 500ms）的心跳到点了。
+ *
+ *   与 rx 那记逐字同构，也是跑在 systick 中断里，只做两件**与 TCB 无关**的
+ *   事：立 wr_wait_to 旗（告诉 write()"这次是到点了，不是播放完成"），
+ *   以及 wr_busy 为真时 post 一次 wr_sem 把人叫醒。没人等时不 post —— 理由与
+ *   rx 那边相同：空投一次计数就是给下一次 write 埋一个假唤醒。
+ *   **不打日志**（中断里碰串口会抢控制台锁把整机挂住）。
+ *
+ *   与内核那条 nxsem_timeout 的根本区别同样是：从不读 task_state，也从不读/
+ *   写 waitobj，只投递一个信号量计数。
+ ****************************************************************************/
+
+static void sf32lb52_audio_tx_wait_timeout(wdparm_t arg)
+{
+  FAR struct sf32lb52_audio_s *priv = (FAR struct sf32lb52_audio_s *)arg;
+
+  priv->wr_wait_to = true;
+
+  if (priv->wr_busy)
+    {
+      nxsem_post(&priv->wr_sem);
+    }
+}
+
+/****************************************************************************
+ * Name: sf32lb52_audio_tx_wait_slice
+ *
+ * Description:
+ *   write() 等完这一次播放的完整动作：武装私有心跳 → 阻塞等 wr_sem → 取消心跳。
+ *   （write 不分片，所以只武装一次，wait_ms 就是原来那一次 tickwait 的预算。）
+ *
+ *   返回值语义**与它替换掉的那句 nxsem_tickwait_uninterruptible 完全一致**：
+ *     OK         = 这一次里有人 post 到了东西（播放完成中断 / 其它唤醒）；
+ *     -ETIMEDOUT = 谁也没 post，是本驱动自己的心跳叫醒的。
+ *   所以 write() 后面的出口（ret < 0 → 打日志 + 本块丢弃返回 0；OK → 返回
+ *   buflen）一个字都不用改。
+ *
+ *   用 nxsem_wait_uninterruptible 而不是 nxsem_wait：理由与 rx 那边相同 ——
+ *   与原来那句 tickwait 的 "uninterruptible" 语义一样，信号打断时不会提前
+ *   返回，这一次等待仍由我们的心跳收口。
+ ****************************************************************************/
+
+static int sf32lb52_audio_tx_wait_slice(FAR struct sf32lb52_audio_s *priv,
+                                        uint32_t wait_ms)
+{
+  int ret;
+
+  priv->wr_wait_to = false;
+
+  (void)wd_start(&priv->wr_wait_wdog, MSEC2TICK(wait_ms),
+                 sf32lb52_audio_tx_wait_timeout, (wdparm_t)priv);
+
+  ret = nxsem_wait_uninterruptible(&priv->wr_sem);
+
+  /* 与 rx 那边同一条：wd_cancel 对已经到点的看门狗只是返回 -EINVAL；多出来的
+   * 那一次 post 由 write() 开头那句 nxsem_reset 收掉，不会串到下一次写上。 */
+
+  (void)wd_cancel(&priv->wr_wait_wdog);
+
+  return (ret == OK && priv->wr_wait_to) ? -ETIMEDOUT : ret;
+}
+#endif /* SF32LB52_AUDIO_CALM_WAIT */
 
 #if SF32LB52_AUDIO_ARM_ONCE
 /****************************************************************************
@@ -2841,6 +3106,14 @@ static ssize_t sf32lb52_audio_read_once(FAR struct sf32lb52_audio_s *priv,
 
   nxsem_reset(&priv->rx_sem, 0);
 
+#if SF32LB52_AUDIO_CALM_WAIT
+  /* 上一次 read 万一没走到取消（线程被删、被强杀）就留下了一记待触发的私有
+   * 心跳，这里补一次取消：它只会多投一个没人要的计数，但"本次 read 绝不可能
+   * 被上一次的残留心跳叫醒"这件事必须由本函数自己保证，而不是靠上游收尾干净。 */
+
+  (void)wd_cancel(&priv->rx_wait_wdog);
+#endif
+
   priv->rx_busy    = true;
   priv->rx_aborted = false;
   priv->rx_dma_err = false;
@@ -2857,6 +3130,11 @@ static ssize_t sf32lb52_audio_read_once(FAR struct sf32lb52_audio_s *priv,
    * 信号量本身。唤醒只是"早点醒"的辅助手段，丢了也不影响 —— 下一片醒来自己
    * 会看到计数变了。整条 arm-once 路径因此不依赖任何一次 post 的成败。
    *
+   * M4：这一片的 100ms 由本驱动自己的心跳产生（sf32lb52_audio_rx_wait_slice），
+   * 不再由内核的 rtcb->waitdog + nxsem_timeout 产生 —— 后者会和 ISR 里的
+   * nxsem_post 抢同一个 waitobj，正是上板硬崩的那条断言。本循环不在意 ret，
+   * 只在意计数器，所以换成哪条超时路径都不影响这里的判据与时序。
+   *
    * 五个判据与老路径一一对应：拿到帧 / rx_aborted / 设备停了 / 会话换代 / TE。 */
 
   for (slice = 0; slice < 50; slice++)
@@ -2869,7 +3147,11 @@ static ssize_t sf32lb52_audio_read_once(FAR struct sf32lb52_audio_s *priv,
           break;
         }
 
+#if SF32LB52_AUDIO_CALM_WAIT
+      (void)sf32lb52_audio_rx_wait_slice(priv);
+#else
       (void)nxsem_tickwait_uninterruptible(&priv->rx_sem, MSEC2TICK(100));
+#endif
     }
 
   /* 刚完成的那半块在环里的字偏移：**在这里读一次就定下来**，别等到 memcpy
@@ -3235,6 +3517,12 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
 
   nxsem_reset(&priv->rx_sem, 0);
 
+#if SF32LB52_AUDIO_CALM_WAIT
+  /* 同 arm-once 那条路：把上一次 read 万一留下的心跳取消掉（见那边的说明）。 */
+
+  (void)wd_cancel(&priv->rx_wait_wdog);
+#endif
+
   priv->rx_busy    = true;
   priv->rx_aborted = false;
 
@@ -3435,14 +3723,23 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
    * 第五个判据 rx_dma_err 是本次新增的：DMA 传输错误(TE)时错误回调会 post
    * 一次信号量把这一片立刻叫醒（不等这 100ms），这里再判一次旗子是给
    * "post 那一下又被别的 post 混掉"兜底 —— 两个机制合起来，TE 之后本次 read
-   * 最坏 100ms 就收尾，而不是空转满 5 秒。 */
+   * 最坏 100ms 就收尾，而不是空转满 5 秒。
+   *
+   * M4：这一片的 100ms 改由本驱动自己的心跳产生（sf32lb52_audio_rx_wait_slice），
+   * 不再用内核的定时信号量等待。两边的返回值语义被刻意做成完全一样（OK =
+   * 这一片有人 post 到东西；-ETIMEDOUT = 本片只有心跳），所以下面这个循环的
+   * 判据、片数、5 秒预算、以及后面 ret<0 → -ETIMEDOUT 的出口一个字都没动。 */
 
   {
     int slice;
 
     for (slice = 0; slice < 50; slice++)
       {
+#if SF32LB52_AUDIO_CALM_WAIT
+        ret = sf32lb52_audio_rx_wait_slice(priv);
+#else
         ret = nxsem_tickwait_uninterruptible(&priv->rx_sem, MSEC2TICK(100));
+#endif
 
         if (ret == OK || priv->rx_aborted || !priv->running ||
             gen != priv->session_gen || priv->rx_dma_err)
@@ -3865,6 +4162,23 @@ int sf32lb52_audio_initialize(void)
 
   nxsem_init(&priv->wr_sem, 0, 0);
   nxsem_init(&priv->rx_sem, 0, 0);
+
+#if SF32LB52_AUDIO_CALM_WAIT
+  /* read() 每片 / write() 每次等待的心跳（M4）。kmm_zalloc 出来的 func 已经是
+   * NULL（= 不活跃），这里补两次 wd_init 只是把"这两记看门狗各自属于本驱动"
+   * 这件事写在明面上 —— 两个方向各一记，不共用。 */
+
+  wd_init(&priv->rx_wait_wdog);
+  wd_init(&priv->wr_wait_wdog);
+
+  /* 开机打一行"这台固件用的是哪条超时路径"：上板判读就靠它区分
+   * "M4 生效"和"烧的其实是旧镜像/开关被改回 0"（旧镜像这里一行都没有）。 */
+
+  syslog(LOG_INFO,
+         "AUDIO: read/write 的等待超时来自本驱动心跳（M4 CALM_WAIT=1，"
+         "read %dms/片、write 一次等满），内核定时等待不参与\n",
+         SF32LB52_AUDIO_WAIT_SLICE_MS);
+#endif
 
   /* 持有者身份显式给 -1：kmm_zalloc 出来是全 0，而 pid 0 是 idle 任务 ——
    * "没记过"和"真的记了一个 pid"必须分得开（见 struct 里那段说明）。 */
