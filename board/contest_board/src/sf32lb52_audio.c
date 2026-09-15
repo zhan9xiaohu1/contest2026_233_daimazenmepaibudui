@@ -558,16 +558,31 @@ struct sf32lb52_audio_s
    *                     arm-once 等价形态（老路径数是"连续多少次 arm 一个字节
    *                     都没搬到"，两者是同一条时间轴上的同一个量）；
    *   rx_once_cndtr_prev 上一次超时现场的 CNDTR：两次一模一样 = 这 5 秒里 DMA
-   *                     一个字节都没动（请求线死了的硬证据）。 */
+   *                     一个字节都没动（请求线死了的硬证据）。
+   *   rx_restart_pending / rx_restart_evt / rx_restart_irq
+   *                     第 1 级（原地重挂）的**待判账**：这一级不再自称"自愈成功"
+   *                     —— 它写完寄存器回读到的就是自己刚写进去的值，恒等，证明
+   *                     不了硬件在拉数据（见 rx_dma_restart 里那段）。所以重挂只
+   *                     记"做过"和那一刻的两个进度计数，判据留给下一次 read：
+   *                     隔一整个窗口计数一模一样 = 这一级被否证。 */
 
   bool                    rx_once_armed;
   uint32_t                rx_once_granule;
-  uint32_t                rx_once_evt;
-  uint32_t                rx_once_off;
+
+  /* 这两个是 ISR 与 read 任务之间传递"哪一帧到了"的唯一通道，所以是 volatile：
+   * ISR 先写 off 再自增 evt，read 靠"回读 evt 有没有变"认出"两次 load 之间落进了
+   * 一次中断"（见 rx_once_take）。不加 volatile 的话编译器会把两次 evt load 合并成
+   * 一次，那次回读等于没写、判据也就没了。 */
+
+  volatile uint32_t       rx_once_evt;
+  volatile uint32_t       rx_once_off;
   uint32_t                rx_once_pending_len;
   uint32_t                rx_once_lost;
   uint32_t                rx_once_stall_periods;
   uint32_t                rx_once_cndtr_prev;
+  bool                    rx_restart_pending;
+  uint32_t                rx_restart_evt;
+  uint32_t                rx_restart_irq;
 #endif
 };
 
@@ -1377,7 +1392,9 @@ static FAR const char *sf32lb52_audio_recover_level_name(int level)
     {
       return "一级（首选）：只重设 CNDTR + 重新使能 TC/HT/TE + 把句柄置回 BUSY"
              "（厂商 bf0_audprc_dma_restart 的做法；不动通道、不关 ADCPATH、"
-             "不复位模块）";
+             "不复位模块）—— **这一级只表示「已原地重挂」，不代表已恢复**："
+             "它写回的 CNDTR/CCR 就是自己刚写进去的值，证明不了硬件在拉数据；"
+             "真判据是下一帧，见 rx_restart_pending";
     }
 
   if (level == 2)
@@ -1486,12 +1503,24 @@ static void sf32lb52_audio_recover_log(FAR struct sf32lb52_audio_s *priv,
  *   出现"软件把 State 置成了 BUSY、硬件还停在旧计数/通道没开"的假象，下一次
  *   read 就会拿着这样一个通道空等 5 秒。所以本级的顺序是：
  *
- *     关通道 → 清该通道全部标志 → 打开 IT → 写 CNDTR → 开通道 → **回读校验**
+ *     关通道 → 清该通道全部标志 → 打开 IT → 写 CNDTR → 开通道
  *
- *   回读校验（CNDTR 是否等于满值、CCR.EN 是否真的置起）通过之后，才允许写
- *   hdma->State = BUSY 与 aprc.State[RX] = BUSY_RX —— 那两份 State 是**软件账**，
- *   只有硬件先真的挂上，它们才有资格变成"忙"。校验没过就把通道放回关着的状态、
- *   返回失败，让二级去重挂（那种情况下通道簿记已经不可信了，硬来不如重来）。
+ *   **回读是自证，所以本驱动不再拿它当"恢复成功"**（风险 B）：
+ *   CNDTR 回读到的就是上面刚写进去的 counts、CCR.EN 也是我们自己刚置的 —— 两次
+ *   load 读的是同一份"软件刚写下去的值"，恒等。外设不再拉请求线时，CNDTR 正好
+ *   停在满值（DMA 只在被拉请求时才递减），于是这条校验必然通过：明明硬件一寸
+ *   没动，也会记一次"第 1 级自愈成功"，然后白等 5 秒、靠下一次 read 失败才升到
+ *   第 2 级。能证明"硬件真的在搬数据"的只有一样东西 —— DMA 自己的完成中断
+ *   （HT/TC 计数，只有硬件拉请求才会涨）。所以本级在这里只判一件事："写入有没有
+ *   被硬件收下"（写丢了才回 -EIO，让二级去重挂），同时记下待判账
+ *   rx_restart_pending + 那一刻的 rx_once_evt / rx_irq_count —— 宣判交给**下一次
+ *   read 的结果**：隔一整个窗口这两个计数一模一样，就是"这一级没把数据拉回来"，
+ *   判它否证、下一次直接上第 2 级。判据落在 read 里（任务上下文，5 秒窗口本来
+ *   就有），本级一行等待都不加，read 的 5 秒预算也不会被拉长。
+ *
+ *   hdma->State = BUSY 与 aprc.State[RX] = BUSY_RX 这两份**软件账**照写：写入真被
+ *   收下了，簿记就该是"忙"（否则下一次 read 会以为通道是闲的、再武装一遍）。它们
+ *   只是簿记，谁都不拿它们当"恢复了"的证据。
  ****************************************************************************/
 
 static int sf32lb52_audio_rx_dma_restart(FAR struct sf32lb52_audio_s *priv)
@@ -1513,6 +1542,9 @@ static int sf32lb52_audio_rx_dma_restart(FAR struct sf32lb52_audio_s *priv)
   __HAL_DMA_SET_COUNTER(hdma, counts);
   __HAL_DMA_ENABLE(hdma);
 
+  /* 只判"写入被硬件收下没有"。这条过了**不等于**恢复成功（上面那段就是理由）：
+   * 它读的是我们自己刚写的值。写丢了才回 -EIO —— 那是真凭据，二级立刻接手。 */
+
   if (hdma->Instance->CNDTR != counts ||
       (hdma->Instance->CCR & DMAC_CCR1_EN) == 0)
     {
@@ -1523,6 +1555,14 @@ static int sf32lb52_audio_rx_dma_restart(FAR struct sf32lb52_audio_s *priv)
   hdma->State = HAL_DMA_STATE_BUSY;
   priv->aprc.State[SF32LB52_AUDIO_PRC_RX_CH] = HAL_AUDPRC_STATE_BUSY_RX;
   priv->rx_restart_count++;
+
+  /* 待判账：本级做完了，但"有没有用"在这里判不了（判了就是自证）。留两个进度
+   * 计数的当前值，交给下一次 read —— 它要么成功交帧（就地清掉 pending），要么
+   * 在失败出口看到这两个数一个都没涨，据此判第 1 级否证。 */
+
+  priv->rx_restart_evt     = priv->rx_once_evt;
+  priv->rx_restart_irq     = priv->rx_irq_count;
+  priv->rx_restart_pending = true;
   return OK;
 }
 
@@ -1679,6 +1719,14 @@ static int sf32lb52_audio_rx_hard_reset(FAR struct sf32lb52_audio_s *priv)
  *   第 1 级**（rx_recov_step 在 read 成功交帧处清零）。于是"偶发一次"永远只走
  *   最轻的那一级；只有反复治不好才逐级加重、最后才动软复位。某一级当场就报错
  *   （硬件没收下这次重挂）时立刻升到下一级，不用再等一次 5 秒。
+ *
+ *   第 1 级的真判据（风险 B）：它唯一"当场可判"的是写入有没有被收下，那不是恢复
+ *   成功（读的是自己刚写的值，自证，见 rx_dma_restart）。所以本级的规矩是——
+ *   **它不参与"治住了没有"的判定，只用下一次读的结果判**：上一帧用的是第 N 级、
+ *   这一帧又失败 → 直接上第 N+1 级。落到第 1 级就是"重挂过但还没被验证"这件事
+ *   挡不住升级：下一次 read 的失败出口会拿 rx_restart_evt / rx_restart_irq 去结账
+ *   （涨没涨都记一笔），然后走到的这里 ++ 一定让它变成第 2 级，绝不会再把第 1 级
+ *   试第二遍。
  *
  *   开关 = 0 时（老路径）这一函数逐字退回改动前的行为：只有第 3 级。
  ****************************************************************************/
@@ -3258,6 +3306,13 @@ static void sf32lb52_audio_rx_once_reset(FAR struct sf32lb52_audio_s *priv)
   priv->rx_once_lost        = 0;
   priv->rx_once_stall_periods = 0;
   priv->rx_once_cndtr_prev  = 0;
+
+  /* 第 1 级那份待判账也作废：环都清了，上一代那次重挂的判据没有任何意义，
+   * 留着只会让下一代第一次超时被误判成"第 1 级被否证"。 */
+
+  priv->rx_restart_pending  = false;
+  priv->rx_restart_evt      = 0;
+  priv->rx_restart_irq      = 0;
 }
 
 /****************************************************************************
@@ -3402,13 +3457,29 @@ static void sf32lb52_audio_rx_once_take(FAR struct sf32lb52_audio_s *priv,
                                         size_t buflen, FAR uint32_t *evt_seen)
 {
   uint32_t granule_bytes = priv->rx_once_granule << 2;
-  uint32_t off = priv->rx_once_off;
-  uint32_t evt_now = priv->rx_once_evt;
+  uint32_t off;
+  uint32_t evt_now;
   size_t   n = buflen - *done;
 
-  /* 先读偏移、后读序号：万一这中间 ISR 又交了一帧，宁可少交一帧（漏掉的那帧
-   * 记进 rx_once_lost），也不要同一个半块交两次 —— 宁缺勿重，因为上层拿到重复
-   * 的声音比缺一小段更糟（VAD/KWS 会把同一段当两次）。 */
+  /* 取一支**自洽的**"偏移 + 序号"。ISR 的顺序是"先写偏移、再自增序号"，所以
+   * 本函数按"序号 → 偏移 → 两个都回读一遍"来读，回读到的和第一次一样才认：
+   *   - 原来"先读偏移、后读序号"有个窄窗口：两次 load 之间落进一次 HT/TC，拿到的
+   *     是"新序号 + 旧偏移"，而旧偏移对应的那个半块过了一整个乒乓周期之后**正好
+   *     是 DMA 此刻正在写的那一半** → 交出去的是正在被覆盖的数据（撕裂）；
+   *   - 只把两条语句换个位置还不够：那样读到的一定是刚完成的半块（不撕裂了），但
+   *     记账的序号比实际旧一号，调用方那圈 while 会再取一次同一个半块 —— 等于把
+   *     "撕裂"换成了"同一帧交两次"，而重复比缺帧更糟（见上面调用约定的说明）；
+   *   - 回读一次（两个数都要看：只要一个变了就说明中断插进来了）就把两头都堵上：
+   *     配对自洽 → 读到的一定是已完成、且此刻没被 DMA 写的那一半，序号也不会少算。
+   * 两个字段是 volatile，回读不会被编译器合并掉（合并掉就退化成第二种，判据白写）。
+   * 单核、ISR 不会中途阻塞，所以这个循环最多多转一圈。 */
+
+  do
+    {
+      evt_now = priv->rx_once_evt;
+      off     = priv->rx_once_off;
+    }
+  while (evt_now != priv->rx_once_evt || off != priv->rx_once_off);
 
   if (evt_now - *evt_seen > 1u)
     {
@@ -3597,17 +3668,39 @@ static ssize_t sf32lb52_audio_read_once(FAR struct sf32lb52_audio_s *priv,
 #endif
     }
 
-  priv->rx_busy = false;
+  /* 这两笔账只在"我还是当前这一代"时才动（风险 A）。
+   *
+   * rx_busy 是 ISR 判"要不要 post 一下正在等的 read"的依据：一个上一代的残影在这
+   * 里把它清成 false，会让**新会话**那条 read 从此收不到完成通知、只能靠每 100ms
+   * 的心跳醒来 —— 而每次醒来只取环里最新的那一帧、中间几帧记成 lost，整条录音就
+   * 慢成几分之一速。会话代号变了就一律不碰（新会话那条 read 自己的出口会把这份账
+   * 收干净）。这不是新增的门：它挡不住任何恢复，只是不许动不属于自己这一代的状态。 */
+
+  if (gen == priv->session_gen)
+    {
+      priv->rx_busy = false;
+    }
 
   /* 会话结束（被 stop / close / 换代）：按 EOF 返回 0，返回语义与老路径一致。
-   * 常驻环这套账一并作废，但**不在这里 abort** —— 会话边界那条收尾已经把
-   * 通道拆干净了（hw_stop/hw_shutdown 里"先看句柄状态"的 DMAStop 就在 post
-   * 之前），对着可能已被别人重新分配走的物理通道再 abort 一次是有害的。 */
+   * 常驻环这套账只在**自己这一代真的结束了**的时候才作废，而且**不在这里 abort**
+   * —— 会话边界那条收尾已经把通道拆干净了（hw_stop/hw_shutdown 里"先看句柄状态"
+   * 的 DMAStop 就在 post 之前），对着可能已被别人重新分配走的物理通道再 abort 一次
+   * 是有害的。
+   *
+   * gen != priv->session_gen 那一路（本次 read 是上一代的残影，reaper 放弃 join 之
+   * 后新会话已经起来、可能已经武装了它自己的常驻环）**绝对不许清账**（风险 A）：
+   * 清掉的是新会话的 armed/granule/evt/pending —— 新会话下一次 read 会静默重新武装
+   * （abort 掉正在跑的通道），或者拿到 granule_bytes == 0 白等 5 秒再丢一段音频。
+   * 残影只需要安静地退出去：它的会话代号对不上，新会话的数据一个字节也交不出去。 */
 
   if (priv->rx_aborted || !priv->running || gen != priv->session_gen)
     {
-      priv->rx_aborted = false;
-      sf32lb52_audio_rx_once_reset(priv);
+      if (gen == priv->session_gen)
+        {
+          priv->rx_aborted = false;
+          sf32lb52_audio_rx_once_reset(priv);
+        }
+
       return 0;
     }
 
@@ -3632,12 +3725,14 @@ static ssize_t sf32lb52_audio_read_once(FAR struct sf32lb52_audio_s *priv,
       priv->rx_ok_playstart = priv->playstart_count;
 
       /* 数据又通了：恢复级数回到最轻的第 1 级（下一次真出问题从"原地重挂"试起），
-       * "数据停了"那套账也一起清零。 */
+       * "数据停了"那套账也一起清零。第 1 级那份待判账同时结清 —— 真交满了一帧，
+       * 说明它（如果上一帧用过它）确实把数据拉回来了，没有"被否证"这回事。 */
 
       priv->rx_stall_seen         = 0;
       priv->rx_stall_logged       = false;
       priv->rx_once_stall_periods = 0;
       priv->rx_recov_step         = 0;
+      priv->rx_restart_pending    = false;
 
       return buflen;
     }
@@ -3780,6 +3875,25 @@ static ssize_t sf32lb52_audio_read_once(FAR struct sf32lb52_audio_s *priv,
         }
     }
 
+  /* ---- 跨代守卫（风险 A，与上面那条 EOF 出口同一个道理）----
+   *
+   * 上面那次判据过后本函数认定自己还是"当前这一代"，但从那里到这里中间隔着一次
+   * syslog（几千个 tick）：别的线程完全可能在这段里把会话换代（stop / open）。
+   * 所以凡是"改会话账 / 动硬件"的动作（下面那套停滞计数、CNDTR 参照值、第 1 级
+   * 判定、以及三级恢复本身）之前，都重新比一次代号。这不是新加的门：代号变了就
+   * 说明这条会话已经结束，恢复它没有任何意义（新会话起来时 hw_start 会把这套账
+   * 整个重置、下一次 read 重新武装），它挡住的只是"上一代把新一代的账改掉"。
+   * 只读的部分（上面那条超时日志、现场快照）照打不误，判读用的证据一个都不少。
+   *
+   * 返回 0（EOF）而不是 ret：会话换代在上面的 EOF 出口本来就是 0，后面还留着一批
+   * 属于死会话的字节也没意义；更重要的是残影必须**停下来** —— 它若接着读，下一次
+   * 进来就会把新会话的代号当成自己的，转头去清新会话的 rx_aborted / rx_dma_err。 */
+
+  if (gen != priv->session_gen)
+    {
+      return 0;
+    }
+
   /* 自愈判据的 arm-once 等价形态（老路径那句"连续多少次 arm 一个字节都没搬"
    * 在这里的同一条时间轴上的写法）：
    *
@@ -3876,6 +3990,52 @@ static ssize_t sf32lb52_audio_read_once(FAR struct sf32lb52_audio_s *priv,
   if (rx_err ||
       (irq_delta == 0 && dma_state_now == HAL_DMA_STATE_BUSY))
     {
+      /* ---- 第 1 级（原地重挂）的判据落在**这里**（风险 B）----
+       *
+       * 第 1 级判不了自己：它写完回读的是刚写进去的值，恒等（见 rx_dma_restart
+       * 那段），所以在恢复路径里宣称"自愈成功"是自证。它的"有没有用"只由这一次
+       * read 的结果宣判 —— 上一帧那次恢复用的是第 1 级时，它在 rx_restart_evt /
+       * rx_restart_irq 里留下了"重挂那一刻的进度"；现在整整一个窗口（本次 read 的
+       * 5 秒）过去了，这两个计数涨没涨就是唯一真凭据（只有硬件拉请求线才会让它们
+       * 涨）：
+       *   一个都没涨 → 硬件一寸没动，第 1 级被否证：把 rx_recov_step 钉在 1，紧接着
+       *                recover_rx 的 ++ 直接把它推到第 2 级，本回合不会再试第 1 级；
+       *   涨过、或这次是 TE → 不否证，照原样 ++ 升一级（第 1 级不再自称成功，但也
+       *                不被冤枉 —— 它只是没拿到"没治住"的证据）。
+       * 放在这道自愈门**里面**：本回合真要动手恢复时才结这笔账，否则 pending 留着
+       * 继续攒证据（判据本来就是"从重挂那一刻起一个字节都没动"）。无论哪种，结账
+       * 只发生一次，绝不拿它反复下结论。这块不改返回值、不加任何等待：read 的
+       * 5 秒预算与出口口径一个字没动。 */
+
+      if (priv->rx_restart_pending)
+        {
+          bool dead = (priv->rx_once_evt == priv->rx_restart_evt &&
+                       priv->rx_irq_count == priv->rx_restart_irq);
+
+          priv->rx_restart_pending = false;
+
+          if (dead)
+            {
+              if (priv->rx_recov_step < 1u)
+                {
+                  priv->rx_recov_step = 1u;
+                }
+
+              if (!rx_err)
+                {
+                  syslog(LOG_WARNING,
+                         "AUDIO: RX 第 1 级（原地重挂）被否证：重挂之后至少一个"
+                         "窗口过去，irq=%u half=%u evt=%u 一个都没涨、"
+                         "CNDTR=%u/%u 没动 → 本回合不再用第 1 级，升到第 2 级\n",
+                         (unsigned)priv->rx_irq_count,
+                         (unsigned)priv->rx_half_irq_count,
+                         (unsigned)priv->rx_once_evt,
+                         (unsigned)cndtr_now,
+                         (unsigned)(priv->rx_once_granule * 2u));
+                }
+            }
+        }
+
       priv->rx_recover_count++;
       sf32lb52_audio_recover_rx(priv, rx_err);
     }

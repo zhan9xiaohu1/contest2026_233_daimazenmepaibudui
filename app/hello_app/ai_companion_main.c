@@ -2076,56 +2076,6 @@ static void mic_hold_tick(void)
 
 #define LISTEN_SUPERVISE_FORCE_MS  45000
 
-/* 上面那条"数据流已断"判据（listen_supervise_tick 里那段）专用的阈值：
- * 距最后一滴数据多久才算"数据流真的没了"。**故意不和 LISTEN_SUPERVISE_FORCE_MS
- * 共用一个数** —— 那个 45 秒回答的是"失去麦克风多久"（录音已经不在，计时从 0 起
- * 算），而这里回答的是"麦克风还在手里、却一滴数据都没有多久了"，两者的合法上限
- * 差着一个数量级，共用一个数必然有一边是错的。
- *
- * 180 秒（3 分钟）的来历，两个方向都要交代：
- *   - 必须大于**合法调用链的最长阻塞**：这段空窗是 ASR + 大模型在录音线程的
- *     VAD 回调里同步跑出来的（process_ai_dialogue），其中最长的单次阻塞是本构建
- *     的 TLS socket 读超时 —— AGENT_LLM_SOCKET_TIMEOUT_SEC = 120 秒
- *     （packages/ai_agent/include/agent_config.h；本构建 CONFIG_AI_AGENT_NET_RPMSG
- *     没开，走的就是这条真 socket 的路），再叠加每次请求前的重握手和 ASR 本身，
- *     120 秒不是"最坏"而是"下限"。180 秒 = 120 + 60 秒余量；
- *   - 又不能太长：它直接等于"麦克风真死了之后要多久才有人去救"。这条判据是
- *     **兜底**（另一条 8 秒的"线程正卡在 read 里"更快，正常情况轮不到它），
- *     所以宁可保守。正常对话那几十秒由"对话在跑"那个排除项整段让开
- *     （AUDIO_DIALOGUE_MAX_BLOCK_MS，**和本数是同一个值**，见那个宏），
- *     根本不会靠这个数硬扛。
- *
- * ⚠️ 这个数只能拿来判"线程压根没回到 read"（audio_record_idle_ms 涨）那种形状，
- * 单用它判死会误伤正常对话，理由见 ai_audio.h 的 audio_record_idle_ms。 */
-
-#define AUDIO_RECORD_IDLE_DEAD_MS  180000
-
-/* 「有人正在跑一整段对话」这个排除项的上界（毫秒）：排除只在"距对话开始还不到
- * 这么久"时成立，超了就不再豁免，交给下面那条断流判据（listen_supervise_tick）。
- *
- * **故意写成 AUDIO_RECORD_IDLE_DEAD_MS 的别名，不是第二个数**：两个阈值量的是
- * 同一件事 ——"录音线程里一次合法阻塞最长能有多久"。那边从"距最后一滴数据"这
- * 一侧量（到它就判死），这边从"对话已经跑了多久"那一侧量（到它就不再让开）。
- * 两边只要不等就必然有一个被架空：上界比 idle 阈值小时排除项永远先到期（等于
- * 没排除），比它大时判据永远先命中（排除项白写）。所以只能同值、一起改。
- *
- * ★ 为什么必须带这个上界（2026-09-15 从"布尔量、在跑就排除"改过来）：
- *   那个布尔量由录音线程写、主循环读，它自己也可能**永不回落** ——
- *   process_ai_dialogue() 真卡死（ASR/网络那一路不返回）时它会一直挂着，
- *   排除项于是把断流判据**永久**关掉，录音端又变回"永久聋"；而这正是本判据
- *   要根治的形状。改存"对话开始时刻"这种能自己过期的时间戳，最坏也只是
- *   "上界之内不判"，到点判据一定接管。
- *
- * 180000 的来历和 AUDIO_RECORD_IDLE_DEAD_MS 共用一份（那边写了完整推导），
- * 两个方向都落在这条数上：
- *   - 合法上界：本构建 TLS socket 读超时 120 秒（AGENT_LLM_SOCKET_TIMEOUT_SEC，
- *     packages/ai_agent/include/agent_config.h）+ agent 层约 60 秒看门狗
- *     ⇒ 正常对话占住录音线程不会超过它，超了就不是"正常对话"了；
- *   - 恢复上界：真卡死时"最多多久判据能动手"也是它（见 listen_supervise_tick
- *     里那段注释对"卡死 5 分钟"的取值推算）。 */
-
-#define AUDIO_DIALOGUE_MAX_BLOCK_MS  AUDIO_RECORD_IDLE_DEAD_MS
-
 /* 失败日志节流：前 5 次每次都打（开头几次最需要看见），之后每 10 次一条 */
 
 #define LISTEN_SUPERVISE_LOG_FIRST      5
@@ -2136,48 +2086,8 @@ static uint32_t g_listen_retry_at;         /* 下次重试的时间点 (main_now
 static uint32_t g_listen_fail_count;       /* 连续失败次数（退避 + 日志节流） */
 static uint32_t g_listen_backoff_ms = LISTEN_SUPERVISE_RETRY_MS;
 static uint32_t g_listen_dead_since;       /* 从哪一刻起听不见了，0 = 还没断 */
-static uint32_t g_listen_last_try_ms;      /* 上次重开录音的时间（只在失败退避时有用） */
-
-/* "录音线程此刻正泡在一整段对话里"（ASR + 大模型，跑在录音线程的 VAD 回调里）：
- * 存的是那一整段的**开始时刻**（main_now_ms），0 = 没在跑。进 process_ai_dialogue()
- * 存旧值、出（含所有提前 return）恢复旧值。唯一的读者是下面断流判据的排除项
- * （listen_supervise_tick），判法在 dialogue_exclude_active() 里：在跑、且距开始
- * 还没到 AUDIO_DIALOGUE_MAX_BLOCK_MS。
- *
- * 定义放在这里而不是紧挨着 process_ai_dialogue()：本文件里 static 就写在**第一个
- * 用到它的地方**（判据在下面这个函数里），写成"标志在判据上面、写在对话下面"是
- * 这里唯一能同时满足两边的排法。
- *
- * 它排除的是哪一段合法空窗：那几十秒里录音线程一次 read 都不会发生
- * （audio_record_wait_ms 恒为 -1，但 audio_record_idle_ms 会一路涨）——
- * 正常说完一句话就能让"距上次数据"涨到几十秒，不排除就是每次正常对话都白重开
- * 一次麦。追问相位里 ASR 也跑（process_ai_dialogue 的 ask_mode），所以同一个标志
- * 把追问那条路也盖住了（限时听只有 6 秒，状态机在那之前就切走了，靠状态机挡不住）。
- *
- * 0 当哨兵不会和真实时刻撞车：main_now_ms() 从开机算起，头一毫秒里既不可能有
- * 对话在跑、也还没有录音数据（那一刻 idle_ms 是 -1，判据本来就不成立）。 */
-
-static volatile uint32_t g_dialogue_started_ms;
-
-/**
- * @brief  "对话在跑"这个排除项在这一拍成不成立
- *
- * 在跑、且距开始还没到上界才算数（上界与那两个数字的来历见
- * AUDIO_DIALOGUE_MAX_BLOCK_MS）。写成函数只是为了给 listen_supervise_tick
- * 那一长串条件留一个能把理由写清楚的位置。
- *
- * 时间戳只读一次：录音线程可能在两次读之间把它清零，那不是危险方向（清掉只让
- * 判据更容易命中，而"对话刚结束"本来就不该再豁免）。差值用无符号算，绕一圈
- * （约 49 天）也不会算反。 */
-
-static bool dialogue_exclude_active(void)
-{
-  uint32_t started = g_dialogue_started_ms;
-
-  return started != 0U &&
-         (uint32_t)(main_now_ms() - started) <
-           (uint32_t)AUDIO_DIALOGUE_MAX_BLOCK_MS;
-}
+static uint32_t g_listen_last_try_ms;      /* 上一次真去重开录音的那一拍（失败也算；
+                                            * 它是防抖与防刷屏的锚点，见下面那段） */
 
 /**
  * @brief  监听守护：录音不活跃就按退避把它重新拉起来
@@ -2205,8 +2115,11 @@ static bool dialogue_exclude_active(void)
  *   连"忙"都不认，强行重开。另外还有一条更快的路：录音线程自己报的
  *   ctx->record_died（异常中断）不等任何时间 —— 只要是"下一拍"就能重开
  *   （只留一道"两次重开至少隔 1.8 秒"的防抖，防止设备一起来就死时高频开关设备）。
- *   还有第三条路，专治最隐蔽的那种形状：会话看着还在（四个开关标志全健康）、
- *   数据流却真的断了 —— 判据是 ai_audio 那边两个**数据流**观测，见下面那段。
+ *
+ * 判据只有这两条（活着 / 死了），不做任何"数据流看着像死了"的推断：录音线程
+ * 卡在 read 里、标志却全健康的那种形状，这里是**看不见**的 —— 那正是不该在
+ * 应用层拿一堆时间戳去猜的事（2026-09-15 试过，判据本身会把恢复永久挡死），
+ * 该由"录音不活跃"这条最朴素的路兜，观测手段留在 diag 的 idle/wait 两栏里。
  */
 
 static void listen_supervise_tick(sm_context_t *ctx)
@@ -2238,120 +2151,7 @@ static void listen_supervise_tick(sm_context_t *ctx)
       return;
     }
 
-  /* 会话看着还在（设备 START 着、录音线程也没退出），但**数据流真的断了** ——
-   * 这是第三条自愈路径，专治"永久聋"里最隐蔽的那种形状：
-   *
-   *   录音线程卡在 audio_in_read() 里（设备不再产生 DMA 完成中断）、或者卡在
-   *   数据回调里出不来，四个开关标志（recording / record_thread_valid /
-   *   record_stop / record_exited）**全是健康的** —— 原来这里一句
-   *   audio_record_is_active() 就判"活着、复位、返回"，连一次重试都不排，
-   *   用户那边就是"界面还亮着、喊它没反应，只能重启板子"。
-   *
-   * 判据用 ai_audio 那边两个**数据流**观测（定义与各自的坑见 ai_audio.h 的
-   * audio_record_wait_ms / audio_record_idle_ms），任一成立即命中：
-   *   ① read 已经等了 AUDIO_RECORD_STALL_MS(8 秒)：线程此刻**真的阻塞在 read
-   *      里**（没在等时这个观测是 -1，天然不成立）。下层单次 read 自己 5 秒必回
-   *      （超时返回 -ETIMEDOUT，录音线程跳过那一帧接着读，见 board 的 read 和
-   *      ai_audio.c 的容忍上限），所以 8 秒没回来 = "连那 5 秒超时都没回来"
-   *      那种卡死，这正是 8 秒这个数的来历；
-   *   ② 距最后一滴数据已经 AUDIO_RECORD_IDLE_DEAD_MS(180 秒)：兜住 ① 看不见的
-   *      形状（线程压根没回到 read）。这个数**故意不复用**上面"忙也得有上限"的
-   *      45 秒：那个数计的是"失去麦克风的时长"，而这里计的是"麦还在手里、却一滴
-   *      数据都没有的时长"，两者的合法上限差着一个数量级。180 秒来自本构建 TLS
-   *      读超时 120 秒 + 余量，完整来历见宏定义处。
-   *
-   * 合法的空窗必须排除掉（排不掉就是误判，命中一次要白停白开一次，几十毫秒里
-   * 正在收的音频就没了）：
-   *   - dialogue_exclude_active()（"对话在跑、且距开始还没到上界"）：
-   *     ASR + 大模型是在**录音线程的 VAD 回调里**同步跑的
-   *     （ai_state_machine.c 的 sm_ai_talking_enter → process_ai_dialogue），
-   *     那几十秒一次 read 都不会发生（①不成立，但②会一路涨）—— 正常说完一句话
-   *     就能让"距上次数据"涨到几十秒，不排除就是每次正常对话都白重开一次麦。
-   *     这个时间戳进/出 process_ai_dialogue 存清，正常对话和追问两条路一起盖住。
-   *     ★ 原来是拿状态机"不是 AI_TALKING"来挡这一段的，那是个**有寿命**的判据，
-   *       挡不住：AI_TALKING 自己 30 秒就超时切走（ai_state_machine.c 的 sm_run），
-   *       而这一段最长可以到 TLS 读超时的 120 秒量级；追问那条路更短 ——
-   *       ask_flow_finish() 在限时听 6 秒之后就把状态推成 AI_RESPONSE/LISTENING，
-   *       那次 ASR 还在跑。也就是说旧写法在正常对话里会留下 ≥15 秒（追问 ≥90 秒）
-   *       完全不设防的窗口，而②的阈值正好落在窗口里 —— 真会误杀。
-   *     ★★ 上界（AUDIO_DIALOGUE_MAX_BLOCK_MS，与②同值同来历）是 2026-09-15 补的：
-   *       排除项原先是**无上界**的布尔量，而写它的录音线程自己可能永不回落
-   *       （ASR/网络那一路真卡死）—— 那就会把本判据**永久**关掉，录音端又变回
-   *       "永久聋"，正是本判据要根治的形状。现在到点就不再豁免。
-   *       拿"对话卡死 5 分钟"这一刻把三条判据逐个代入（值是算出来的，不是估的）：
-   *         · 排除项：时间戳有值、差值 300000 ms 不 < 180000 ⇒ **不豁免**；
-   *         · ① wait_ms = -1（线程卡在 VAD 回调里、压根没在 read）⇒ 不成立；
-   *         · ② idle_ms ≥ 300000 ms（线程卡住也照涨）≥ 180000 ⇒ **成立**。
-   *       所以命中时刻**不是 5 分钟，而是对话开始后约 180 秒**（差值扫过 180000
-   *       的那一拍，100ms 一拍；一般还早于此，因为线程真卡在 read 里时①那 8 秒
-   *       会先响）。命中后真停一次设备，再走下面的重开流程。
-   *       ⚠️ 停完的重开仍受"上一代线程收尾了没有"约束（见下面 ★）：卡住的那次
-   *          调用不返回，麦克风就还回不来 —— 本上界保证的是判据这扇门**不会永久
-   *          关着**，以及设备级 AUDIOIOC_STOP 一定会发下去（那正是能把卡在设备里的
-   *          线程捅醒的那一下）。
-   *   - 扬声器在响：TTS 出声期间录音是被特意停掉的（半双工让路），设备怎么收尾
-   *     由播放线程决定（audio_prepare_output / audio_resume_record），这里插一脚
-   *     就是互相打断。
-   *   （让路 / 收尾 / "我要常听"没开着这三种情况在上面那条早退里就返回了，
-   *     不在这里重复写。）
-   * 这两个窗口都由**别人**维护的标志决定，也都可能卡住不回（对话那个已经带上界，
-   * 见上）—— 所以它们只排除本判据；上面那条"录音不活跃够久就强行重开"（stale）
-   * 的兜底照旧管它们。
-   *
-   * 命中后**真停一次**：audio_record_stop() 才会发设备级 AUDIOIOC_STOP、关掉本层
-   * fd、把 ctx 里的锁存清干净（它自己的收尾有上界：轮询线程退出的 300ms，界面优先，
-   * 见 audio_reap_record_thread）。停完**不 return** —— 下面那段"不活跃"的流程会按
-   * 既有退避重开（LISTEN_SUPERVISE_RETRY_MS = 1.8 秒），重开前该清的场
-   * （g_speech_capturing / g_speech_frames / kws_reset）也一并走到。
-   * ★ 但重开那一段会先确认**上一代录音线程真的收尾了**（record_thread_valid &&
-   *   !record_exited 就不重开，见下面那个 if）：线程可能还卡在 ASR 回调里没出来
-   *   （stop 只等 300ms，等不到就放弃 join），此时清场和起新一代都会踩在它头上 ——
-   *   清场那句注释"此刻录音线程已经不在"靠的就是这一条。
-   * 幂等：停完 audio_record_is_active() 就是 false，本判据不会再命中第二次；
-   * 万一重开失败，走的是既有的翻倍退避，不会每一拍来敲一次设备。
-   * 不阻塞主循环：动手之前先按下面真开麦那一段同样的方式 trylock 抢一次
-   * "设备动作权"（抢不到就放弃这一拍），整条路最重的一步就是那次有界的 stop
-   * （≤300ms），和原来"发现不活跃就重开"那条路一样重。 */
-
-  if (audio_record_is_active(&g_audio_ctx) &&
-      !audio_is_playing(&g_audio_ctx) &&
-      g_ask_phase == ASK_PHASE_IDLE &&
-      !dialogue_exclude_active() &&
-      (audio_record_wait_ms(&g_audio_ctx) >= AUDIO_RECORD_STALL_MS ||
-       audio_record_idle_ms(&g_audio_ctx) >= (int)AUDIO_RECORD_IDLE_DEAD_MS))
-    {
-      /* 动设备之前先抢"设备动作权"（和下面真开麦那一段是同一条纪律：让路线程
-       * 也会 stop/start 常开录音，两边同时上手就是同一个录音线程被 join 两次 /
-       * 两条线程抢一个设备）。trylock 失败就放弃这一拍 —— 卡死的会话不会自己好，
-       * 下一拍判据照样成立，让一拍不心疼。 */
-
-      locked = false;
-
-      if (!g_yield_worker_dead)
-        {
-          if (pthread_mutex_trylock(&g_mic_device_lock) != 0)
-            {
-              return;
-            }
-
-          locked = true;
-        }
-
-      printf("[监听守护] 会话看着还在、数据流已断：read 已等 %d ms（阈值 %d）、"
-             "距最后一滴数据 %d ms（阈值 %u）—— 判定数据流断了，"
-             "真停一次再重开\n",
-             audio_record_wait_ms(&g_audio_ctx), AUDIO_RECORD_STALL_MS,
-             audio_record_idle_ms(&g_audio_ctx),
-             (unsigned)AUDIO_RECORD_IDLE_DEAD_MS);
-
-      audio_record_stop(&g_audio_ctx);
-
-      if (locked)
-        {
-          pthread_mutex_unlock(&g_mic_device_lock);
-        }
-    }
-  else if (audio_record_is_active(&g_audio_ctx))
+  if (audio_record_is_active(&g_audio_ctx))
     {
       /* 录音还活着（设备已 START 且线程没退出）：把重试状态复位 */
 
@@ -2441,10 +2241,25 @@ static void listen_supervise_tick(sm_context_t *ctx)
         {
           return;
         }
+
+      /* 到点了：动手之前先把下一拍的排程推后一个退避。不推的话，下面那些
+       * "这一拍先不重开"的 return 会让每一拍都落到这里（排程点已经过、又没被
+       * 消费），串口就被同一条日志以 100ms 的节奏刷屏 —— 现场被刷过 196 秒。
+       * 推后之后，无论这一拍成没成、有没有被守卫挡回来，日志最多每个退避间隔
+       * 一条。 */
+
+      g_listen_retry_at = now + g_listen_backoff_ms;
     }
 
   /* 从这里往下就是真的重开了。日志放在这里而不是判定处：判定是每一拍都跑的，
    * 放前面会刷屏。 */
+
+  /* 时间戳在动设备**之前**落下：它表示"这一拍已经试过了"，下面每一条 return
+   * （抢不到设备锁、守卫说现在不能开麦）都算这一拍试过了。它是本函数唯一的
+   * 防抖 + 防刷屏锚点，任何一条 return 之前它都必须已经写过 —— 漏写一次就是
+   * 那条日志以 100ms 的节奏刷屏。 */
+
+  g_listen_last_try_ms = now;
 
   if (stale)
     {
@@ -2497,23 +2312,10 @@ static void listen_supervise_tick(sm_context_t *ctx)
     }
 
   if (g_mic_hold_active || !g_listen_wanted || g_mic_device_busy ||
-      audio_record_is_active(&g_audio_ctx) ||
-      (g_audio_ctx.record_thread_valid && !g_audio_ctx.record_exited))
+      audio_record_is_active(&g_audio_ctx))
     {
-      /* 最后那一条是"上一代录音线程还没收尾"（2026-09-15 加）：
-       * audio_record_is_active() 只看 recording / record_thread_valid /
-       * record_stop / record_exited 这几个位的组合，而 audio_record_stop() 对
-       * 卡在设备调用（或卡在 ASR 回调）里的线程只等 300ms 就放弃 join ——
-       * 那时它照样把 recording 置成 false，于是"看着不活跃"但其实**线程还在**。
-       * 这一刻去清场（g_speech_capturing / g_speech_frames / kws_reset）和起
-       * 新一代录音线程，就是踩在旧线程头上：旧线程醒来会往同一个 g_speech_buf
-       * 写、把新一代的 record_exited/recording 一起改掉（ai_audio.c 那段
-       * "两条线程抢一个设备、永远好不了"就是这一种）。
-       * record_thread_valid && !record_exited 恰好只描述这一种状态（从未启动过
-       * 录音时 thread_valid 为假，正常收尾后 reap 会把 thread_valid 清掉），
-       * 所以本判据不会挡住开机后第一次开麦，也不会挡住正常重开。
-       * 不满足就**这一拍先不重开**：本函数 100ms 一拍，旧线程收尾（最坏是驱动
-       * 单次 read 那 5 秒）之后下一拍自然就放行了。 */
+      /* 等锁期间状态又变了（真让路 / 又开始收尾 / 设备被别人占了），
+       * 这一拍不动设备 —— 理由和函数开头那条早退一样。 */
 
       if (locked)
         {
@@ -2527,7 +2329,6 @@ static void listen_supervise_tick(sm_context_t *ctx)
    * （1.8s 起翻倍），不会每一拍都来敲一次设备。 */
 
   g_listen_dead_since = 0;
-  g_listen_last_try_ms = now;
 
   /* 重开之前清场：上一段会话可能死在"人正说话"中间，g_speech_capturing
    * 还挂着 true、g_speech_buf 里有半截累积语音，不清掉的话下一次进 ASR 的
@@ -4011,13 +3812,10 @@ static void publish_user_said(const char *text)
 }
 
 /**
- * @brief  处理AI对话的本体（在AI_TALKING状态调用）
- *
- * 不要在别处直接调它：进出门那件事（g_dialogue_started_ms）在同名的包装函数里，
- * 而监听守护的断流判据正是靠那个时间戳让开"ASR / 大模型正在跑"这个合法空窗。
+ * @brief  处理AI对话的本体（在AI_TALKING状态调用，见 sm_ai_talking_enter）
  */
 
-static void process_ai_dialogue_impl(sm_context_t *ctx)
+static void process_ai_dialogue(sm_context_t *ctx)
 {
   char text_buf[512] = {0};
   light_intent_t light_intent;
@@ -4146,44 +3944,6 @@ static void process_ai_dialogue_impl(sm_context_t *ctx)
       printf("[AI] 发送LLM请求失败: %d\n", ret);
       sm_handle_event(ctx, SM_EVENT_AI_ERROR);
     }
-}
-
-/**
- * @brief  处理AI对话（状态机的入口，见 sm_ai_talking_enter）
- *
- * 只做一件事：把"录音线程从这一刻起泡在一整段对话里"这件事**显式**报给监听守护
- * （g_dialogue_started_ms，定义在常听守护那一段，读它的是 listen_supervise_tick
- * 的断流判据，经 dialogue_exclude_active()）。
- *
- * 为什么不用状态机（原来那版判据用 sm_get_state() != AI_TALKING）：
- *   - AI_TALKING 自己有个 30 秒超时（ai_state_machine.c 的 sm_run + 转换表），
- *     超时就把状态推回 IDLE —— 而这一整段（ASR + 大模型）最长可以到 TLS 的
- *     120 秒 socket 超时量级，**中间那段无保护的空窗**比状态还长；
- *   - 追问相位更糟：限时听只有 6 秒（ASK_LISTEN_TIMEOUT_MS），ask_flow_finish()
- *     早早就把状态推成 AI_RESPONSE → LISTENING，而那次 ASR 还在跑。
- * 显式时间戳不会被超时骗掉，进/出这一段就是真值。
- *
- * 为什么是"存旧值再恢复"而不是"进入置值、每个出口清 0"：本函数有 5 个提前
- * return（数据不足 / 识别失败 / 识别为空 / 追问 / 灯控），逐个写迟早漏一个；
- * 而漏一个的后果是排除项永远成立 —— 断流自愈会被自己挡掉（比误杀更糟）。
- * 存旧值同时天然支持嵌套调用（万一将来有）。
- *
- * ★ 在这里记的是**开始时刻**而不是"在跑"这个事实：排除项自己按
- *   AUDIO_DIALOGUE_MAX_BLOCK_MS 作废，所以本函数万一永不返回（ASR/网络那一路
- *   真卡死），判据也只是"晚一点接管"，不会被永久关掉 —— 这正是从布尔量改成
- *   时间戳的理由，详见 g_dialogue_started_ms 与那个宏的注释。
- *
- * 写它的是录音线程（VAD 回调 → sm_handle_event → sm_ai_talking_enter → 这里），
- * 读的是主循环线程：volatile uint32_t（32 位对齐）的读写是原子的，不加锁。
- */
-
-static void process_ai_dialogue(sm_context_t *ctx)
-{
-  uint32_t was_started = g_dialogue_started_ms;
-
-  g_dialogue_started_ms = main_now_ms();
-  process_ai_dialogue_impl(ctx);
-  g_dialogue_started_ms = was_started;
 }
 
 /****************************************************************************

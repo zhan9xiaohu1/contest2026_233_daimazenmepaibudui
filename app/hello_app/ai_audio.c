@@ -87,9 +87,10 @@ int audio_in_abandon(void);
  *     不会把偶发抖动误判成死；真死则最多 25 秒被发现；
  *   - 真机那种超时"粘住"（连着若干次健康读之后卡住、再也不给数据）的可能性很大，
  *     粘住时容忍次数越多聋得越久，所以不往 10 那头靠；
- *   - 守卫那条 8 秒判据（ai_audio.h 的 AUDIO_RECORD_STALL_MS）替这里兜不了底：
- *     它看的是"单次 read 阻塞了多久"，而每次超时都在 5 秒返回、时间戳随之重新
- *     起算，5 秒 < 8 秒，所以它永远不会因为连续超时被触发。上限只能由本宏定。 */
+ *   - 上层不会替这里兜底：上层只看会话标志（录音不活跃就重开），"会话看着还在、
+ *     设备其实已经不给数据"那种形状它看不见（2026-09-15 试过在应用层加"数据流
+ *     像死了"的判据，结果那道判据把重开永久挡死）。所以"连续超时到什么时候算
+ *     会话死了"只能由本宏定，别再指望别人。 */
 
 #define AUDIO_RECORD_TIMEOUT_TOLERANCE  5
 
@@ -599,9 +600,9 @@ static void *audio_record_thread(void *arg)
        * 它阻塞到读满 want 字节：被 AUDIOIOC_STOP 打断返回 0（EOF，会话结束），
        * 下层分片等待超时则返回负值（errno = ETIMEDOUT，只是这一帧没数据）。 */
 
-      /* 记下"这一次 read 是什么时候开始等的"：整个 A2 判据就靠它 ——
-       * "线程在等数据、而且等太久了"是"设备不再给数据"的唯一实证
-       * （见 ai_audio.h 的 audio_record_wait_ms）。
+      /* 记下"这一次 read 是什么时候开始等的"：它答的是"线程此刻在不在等设备、
+       * 等了多久"，只进 diag 快照（见 ai_audio.h 的 audio_record_wait_ms）——
+       * 不做判据，理由写在 ai_audio.h 那边。
        * 0 是"没在等"的哨兵，所以用非零的那个取值。 */
 
       ctx->record_read_start_ms = audio_now_ms_nonzero();
@@ -787,7 +788,7 @@ static void *audio_record_thread(void *arg)
           /* 数据流活跃度：这次是"读了，但一个字节都没拿到"，如实记下来。
            * 连续空读计数只有超时这条路才可能大于 1（另外两条都会立刻跳出循环）。
            * 记下的结果码：超时 -ETIMEDOUT、EOF -ECANCELED、其它负值原样 ——
-           * 守护重开麦那一行会把它打出来，一眼看出"为什么断的"。 */
+           * diag 快照的 lres 一栏会把它打出来，一眼看出"为什么断的"。 */
 
           ctx->record_empty_reads++;
           ctx->record_last_result = timed_out ? -ETIMEDOUT :
@@ -1668,8 +1669,9 @@ bool audio_is_recording(audio_context_t *ctx)
  * （录音异常中断的标记，上层认领后自己清，见 ai_audio.h 那张说明表）。
  *
  * ⚠️ "活着"≠"还听得见"：设备不再给数据（DMA 完成中断不来了）时线程照样
- * 卡在 read 里，这四个字段全是健康的。判"数据流还在不在"要配
- * audio_record_wait_ms()，理由和用法写在 ai_audio.h 的声明处。
+ * 卡在 read 里，这四个字段全是健康的 —— 那种形状只有 diag 快照里的
+ * idle / wait 两栏看得见（audio_record_idle_ms / audio_record_wait_ms），
+ * 本函数管不了、也不该管：上层的恢复路径只看它（不活跃就重开）。
  */
 
 bool audio_record_is_active(const audio_context_t *ctx)
