@@ -684,6 +684,74 @@ void board_early_initialize(void)
  *
  ****************************************************************************/
 
+/****************************************************************************
+ * hello_app 看护线程（2026-09-19 新增）
+ *
+ * 为什么需要：hello_app（入口 ai_companion_main，任务名 "hello_app"）是**开机
+ * 常驻**的语音服务。它一旦退出，**没有任何人负责把它拉起来**。
+ * 真机实测过一次完整链条：主循环 `while (g_running)` 被清成 0 → main() 把
+ * audio / sm / llm 全 deinit → `return 0` → 整个任务组消失（`ps` 里 hello_app
+ * 连同它的 5 条线程一起不见、串口里**一条断言都没有**，因为它其实是优雅退出）。
+ * 界面那边只觉得"没反应" —— app 都不在了，自然没人听麦克风。
+ *
+ * 这里做一层与"它为什么退出"无关的兜底：每 5 秒看一次它的 TCB 还在不在，
+ * 不在就照原样重新 task_create 一个。
+ *
+ * 为什么用 nxsched_get_tcb() 而不是 kill(pid, 0)：NuttX 里线程退出会回收 pid，
+ * 而"查得到 TCB"才是"这个线程真的还在"的直接判据 —— 语义干净，也不发信号。
+ * 取到 TCB 必须配对 nxsched_put_tcb() 释放引用。
+ ****************************************************************************/
+
+#ifdef CONFIG_BOARD_LATE_INITIALIZE
+static pid_t g_hello_app_pid = -1;
+
+static int hello_app_watchdog(int argc, FAR char *argv[])
+{
+  extern int ai_companion_main(int argc, FAR char *argv[]);
+
+  for (;;)
+    {
+      FAR struct tcb_s *tcb;
+
+      sleep(5);
+
+      if (g_hello_app_pid <= 0)
+        {
+          continue;
+        }
+
+      tcb = nxsched_get_tcb(g_hello_app_pid);
+      if (tcb != NULL)
+        {
+          nxsched_put_tcb(tcb);
+          continue;
+        }
+
+      /* 它不在了 —— 这就是"界面没反应"的根因现场。打一行日志再拉起来。 */
+
+      syslog(LOG_ERR, "WARN: hello_app(%d) 已退出，看护线程重新拉起它\n",
+             (int)g_hello_app_pid);
+
+      g_hello_app_pid = task_create("hello_app", 100,
+                                    CONFIG_HELLO_APP_STACKSIZE,
+                                    ai_companion_main, NULL);
+      if (g_hello_app_pid < 0)
+        {
+          syslog(LOG_ERR, "ERROR: 重启 hello_app 失败: %d\n",
+                 (int)g_hello_app_pid);
+          g_hello_app_pid = -1;
+        }
+      else
+        {
+          syslog(LOG_ERR, "WARN: hello_app 已重新拉起，新 pid=%d\n",
+                 (int)g_hello_app_pid);
+        }
+    }
+
+  return OK;
+}
+#endif
+
 #ifdef CONFIG_BOARD_LATE_INITIALIZE
 void board_late_initialize(void)
 {
@@ -830,6 +898,22 @@ void board_late_initialize(void)
     if (ret < 0)
       {
         syslog(LOG_ERR, "ERROR: hello_app autostart failed: %d\n", ret);
+      }
+    else
+      {
+        /* 记下它的 pid，并起一个看护线程：它万一退出（2026-09-19 真机出现过
+         * 一次，整组消失、界面"没反应"），由看护负责把它重新拉起来。
+         * 看护优先级给低一点（110），不跟 app 抢 CPU；栈只要 2KB。 */
+
+        g_hello_app_pid = ret;
+
+        ret = task_create("hello_app_wd", 110, 2048,
+                          hello_app_watchdog, NULL);
+        if (ret < 0)
+          {
+            syslog(LOG_ERR, "ERROR: hello_app 看护线程创建失败: %d\n",
+                   (int)ret);
+          }
       }
   }
 #endif

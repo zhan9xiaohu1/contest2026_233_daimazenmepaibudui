@@ -525,15 +525,10 @@ static void voice_state_tick(sm_context_t *ctx)
     }
 }
 
-/**
- * @brief  信号处理函数
- */
-
-static void signal_handler(int signo)
-{
-  (void)signo;
-  g_running = 0;
-}
+/* 这里原来有一个 signal_handler()，只做一件事：收到 SIGINT/SIGTERM 就
+ * `g_running = 0`。**2026-09-19 已连同 signal() 注册一并删除** ——
+ * 它让这个开机常驻的 app 能被外部信号整台关掉、而且关掉之后没人拉起来。
+ * 完整理由见 ai_companion_main() 里那段"不注册 SIGINT / SIGTERM"的说明。 */
 
 /**
  * @brief  开始累积一句话（VAD 报"人开始说话" 和 唤醒词命中 共用这一段）
@@ -4098,10 +4093,27 @@ int main(int argc, char *argv[])
   printf("╚══════════════════════════════════════════╝\n");
   printf("\n");
 
-  /* 注册信号处理 */
-
-  signal(SIGINT, signal_handler);
-  signal(SIGTERM, signal_handler);
+  /* **不注册 SIGINT / SIGTERM**（2026-09-19 真机定案，用户拍板）。
+   *
+   * 为什么去掉：这个 app 是**开机常驻服务**（由 board_late_initialize() 的
+   * task_create 起，见 board/contest_board/src/sifli_ap.c，任务名 hello_app）。
+   * 而 signal_handler() 里只有一句 `g_running = 0` —— 主循环
+   * `while (g_running)` 一假就 `return NULL`，main() 随即 pthread_join 到它，
+   * 把 audio / sm / llm 全 deinit 掉，最后 `return 0`，
+   * **整个任务组就此消失，而且没有任何人负责把它拉起来**。
+   *
+   * 真机现象（当晚实测）：`ps` 里 hello_app 连同它的 5 条线程一起不见、
+   * 串口里**一条断言都没有**（是优雅退出，不是崩溃）、界面那边只觉得"没反应"
+   * —— app 都不在了，自然没人听麦克风，于是表现为"麦克风又坏了"。
+   *
+   * 全文件只有两处能清 g_running：
+   *   1) 这里注册的 SIGINT / SIGTERM（运行中唯一能关掉它的东西）；
+   *   2) pthread_create(main_loop_task) 失败（那条会打 [错误] 日志，不是本现象）。
+   * 所以从源头断掉第 1 条：常驻服务不该被 Ctrl+C 之类的外部信号整台关掉。
+   *
+   * 现在要主动停它只有一条路：把 g_running 置 0（目前没有任何代码这么做，
+   * 也就是说它设计上就是"一直跑"）。另有一层兜底：sifli_ap.c 里的看护线程
+   * 会在它万一消失后把它重新 task_create 起来。 */
 
   /* 1. 初始化状态机 */
 
