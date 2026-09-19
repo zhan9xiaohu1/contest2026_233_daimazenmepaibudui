@@ -25,9 +25,12 @@
 #include "ai_companion_diag.h"
 
 /* ai_companion_state_snapshot_impl() 交来的那一行状态。
- * 尺寸按"所有键都写全、每个数字都到 int 的位数"留：满打满算不到 300 字节。
+ * 尺寸按"所有键都写全、每个数字都到 int/uint 的位数、状态名取最长的
+ * CARE_REMIND"留：2026-09-16 加上 rxi..rxl 那六个计数器之后是 316 字节
+ * （加之前 226），离 384 还有 60 多字节余量。
  * 以后字段再加，超了也只是尾巴被截断、那几个字段按"取不到"（-1）输出，
- * 不会写出半截 JSON（那一行本身也还是完整的 C 字符串）。 */
+ * 不会写出半截 JSON（那一行本身也还是完整的 C 字符串）—— 所以 impl 那边
+ * 把新字段一律接在最后，被切掉的先是最不关键的那些。 */
 #define DIAG_SNAP_BUF   384
 
 /* 能用的最小缓冲：连 "{}" 加结尾 '\0' 都放不下的，按"取不到"报，别写半个对象。
@@ -218,7 +221,12 @@ static const char *const g_diag_keys[] =
   "idle", "lres", "wait", "empty",
   "hold", "want", "busy", "req", "net", "wd", "wdead", "nrt",
   "sm",                       /* 唯一的字符串字段：状态机名字 */
-  "cap", "sp", "kws", "vad", "asr"
+  "cap", "sp", "kws", "vad", "asr",
+  /* 2026-09-16 加：驱动侧的录音分诊计数（完成 / 半满 / read 进入 / 等待超时 /
+   * TE 错误 / 被 DMA 覆盖的帧数）。名字和顺序跟 ai_companion_diag.h 的字段表、
+   * 以及 ai_companion_main.c 那一行的写法一致；impl 那边取不到（驱动还没起来）
+   * 时不写这几个键，这里就自动输出 -1。 */
+  "rxi", "rxh", "rxr", "rxt", "rxe", "rxl"
 };
 
 int ai_companion_diag_snapshot(char *buf, size_t len)

@@ -46,11 +46,15 @@ static lv_obj_t *scr_main = NULL;      // 主屏幕
 static lv_obj_t *scr_alarm = NULL;     // 报警屏幕
 
 /* 主界面组件 */
-/* lbl_status / lbl_net：**状态栏里已经不再创建这两个标签**（2026-09-14 用户要求
- * 删掉"[在线]"和"NET --"，见 create_status_bar() 的注释）。这里保留声明是因为
- * robot_ui_set_status() / robot_ui_set_net_status() 还在（内部判 NULL 后直接返回），
- * 这样 main.c 里那十几处调用点不用改。它们恒为 NULL，不会有任何显示。 */
-static lv_obj_t *lbl_status = NULL;    // 状态标签（已不再创建）
+/* lbl_status：**不再是状态栏上那个"[在线]"**（状态栏那三样 2026-09-14 已被用户
+ * 要求删掉，见 create_status_bar() 的注释），2026-09-16 挪到主界面「AI 回复区」
+ * 里当"语音状态小字"：用户原话「既然我们做了常态语音，不如在主页那个对话框加上
+ * 状态」。所以它现在**是会显示的**，由 create_ai_reply_area() 建出来、
+ * robot_ui_set_status() 写文字和颜色。
+ *
+ * lbl_net：仍然不在任何地方创建，恒为 NULL（robot_ui_set_net_status() 内部判 NULL
+ * 后直接返回）。保留声明是为了不动 main.c 里那些调用点。 */
+static lv_obj_t *lbl_status = NULL;    // 语音状态小标签（建在 AI 回复区里）
 static lv_obj_t *lbl_time = NULL;      // 时间标签
 static lv_obj_t *lbl_net = NULL;       // 网络状态标签（已不再创建）
 static lv_obj_t *lbl_face = NULL;      // 表情标签
@@ -236,8 +240,11 @@ static void create_status_bar(lv_obj_t *parent)
      *     唯一的保底入口，老人手指粗，越大越好按。
      *
      * 注意：`robot_ui_set_status()` / `robot_ui_set_net_status()` 两个 setter
-     * **保留**了（对应标签不再创建、恒为 NULL，它们内部都有 NULL 检查）——
-     * 这样 main.c 里那十几处调用点一行都不用改，只是不再有任何显示效果。 */
+     * 都**保留**了（内部都有 NULL 检查），main.c 里那十几处调用点一行都不用改：
+     *   - set_net_status()：对应标签仍然不创建，恒为 NULL，没有任何显示效果；
+     *   - set_status()：2026-09-16 起**有显示效果了** —— 它写的不再是状态栏，
+     *     而是主界面「AI 回复区」里那一行语音状态小字（见 create_ai_reply_area()
+     *     和 robot_ui_set_status()）。状态栏这一块仍然只有时钟 + 菜单按钮。 */
     lv_obj_t *bar = lv_obj_create(parent);
     /* 高度 40 → **64**：菜单按钮要做到 52 高才够好点（40 的栏里塞不下），
      * 顺便让整块状态栏不那么挤。 */
@@ -347,11 +354,31 @@ static void create_face_area(lv_obj_t *parent)
 }
 
 /* ==================== 创建 AI 回复区域 ==================== */
+
+/* 语音状态小标签（lbl_status）的四档配色：听=蓝、想=橙、说=绿、空闲=灰。
+ *
+ * 和语音镜像面板（touch_ui.c 的 voice_state_color）**用的是同一套色值** ——
+ * 老人在主界面和面板里看到的"蓝色=在听、橙色=在想、绿色=在说"是同一个意思，
+ * 换个屏幕不用重新学。
+ *
+ * 写成宏是因为它有两处用：下面建标签时的初始颜色，和 robot_ui_set_status()
+ * 里每一档的写入（两处必须一致，散着写迟早会漂）。 */
+#define UI_STATUS_COLOR_IDLE      lv_color_hex(0xBDBDBD)   /* 灰：空闲，不抢眼 */
+#define UI_STATUS_COLOR_LISTENING lv_color_hex(0x42A5F5)   /* 蓝：在听 */
+#define UI_STATUS_COLOR_THINKING  lv_color_hex(0xFFA726)   /* 橙：在想 */
+#define UI_STATUS_COLOR_SPEAKING  lv_color_hex(0x66BB6A)   /* 绿：在说 */
+
 static void create_ai_reply_area(lv_obj_t *parent)
 {
-    /* AI 回复容器 */
+    /* AI 回复容器。
+     *
+     * 高度 120 -> **150**（2026-09-16）：下面那一行语音状态小字（20 号字 21px
+     * + 6px 上边距 ≈ 27px）要有地方放，不然它会反过来把上面两行（[AI] 图标 +
+     * 回复正文）往上挤 —— 要求就是"别挤掉现有内容"。
+     * 容器本身仍然是"居中 + 向下 20"，所以这 30px 是上下各长 15px：
+     * 上沿离表情区还有 40 多像素、下沿离底部按钮栏还有 50 像素，都不碰。 */
     lv_obj_t *container = lv_obj_create(parent);
-    lv_obj_set_size(container, LV_PCT(90), 120);
+    lv_obj_set_size(container, LV_PCT(90), 150);
     lv_obj_align(container, LV_ALIGN_CENTER, 0, 20);
     lv_obj_set_style_bg_color(container, lv_color_hex(0x2D2D44), 0);
     lv_obj_set_style_radius(container, 20, 0);
@@ -376,6 +403,26 @@ static void create_ai_reply_area(lv_obj_t *parent)
     lv_obj_set_width(lbl_ai_reply, LV_PCT(100));
     lv_obj_set_style_text_align(lbl_ai_reply, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_pad_top(lbl_ai_reply, 5, 0);
+
+    /* 语音状态小标签：主界面上「空闲 / 在听… / 在想… / 在说…」那一行。
+     *
+     * 用户原话：「既然我们做了常态语音，不如在主页那个对话框加上状态」——
+     * 不弹开语音面板，扫一眼主界面就知道它现在在干什么。
+     *
+     * 谁写它：只有 robot_ui_set_status()（四档的文字和颜色都在那边）。
+     * 这里只把控件建出来挂到 lbl_status 上，**不另开一条状态来源** ——
+     * 语音状态从 hello_app 的 voice_state_probe() 出来，一路经
+     * robot_ui_bridge_voice_state() / MQTT 的 voice_state 分支 → ui_post()
+     * （内部 lv_async_call）投到 LVGL 线程，最后落到那一个 setter 上。
+     *
+     * 字号取 20（比上面两行的 24 小一档）：它是状态提示，不该跟 AI 的正文抢
+     * 注意力；又没有小到看不清 —— 这一屏是给老人用的，16 那一档本工程只用在
+     * 辅助信息上。颜色由 setter 按状态给，初始是"空闲"的灰。 */
+    lbl_status = lv_label_create(container);
+    lv_label_set_text(lbl_status, "空闲");
+    lv_obj_set_style_text_color(lbl_status, UI_STATUS_COLOR_IDLE, 0);
+    lv_obj_set_style_text_font(lbl_status, &lv_font_ui_20, 0);
+    lv_obj_set_style_pad_top(lbl_status, 6, 0);
 }
 
 /* ==================== 创建底部按钮 ==================== */
@@ -583,6 +630,27 @@ void robot_ui_set_ai_reply(const char *text)
 }
 
 /* ==================== 设置状态 ==================== */
+/* 写的是主界面「AI 回复区」里那一行语音状态小字（create_ai_reply_area() 建的
+ * lbl_status）。**状态栏上没有它** —— 状态栏那三样 2026-09-14 已被用户删掉。
+ *
+ * 四档和语音链路的四档一一对应（hello_app 的 voice_state_probe()）：
+ *   空闲 IDLE       「空闲」  灰   不抢眼，它只是"没事，我在"
+ *   在听 LISTENING  「在听…」 蓝
+ *   在想 THINKING   「在想…」 橙   识别 / 等大模型这一段
+ *   在说 SPEAKING   「在说…」 绿
+ * 文案比语音镜像面板（touch_ui.c 的 voice_state_text：「我在听…」「正在想…」
+ * 「正在说话…」）**更短**：面板里那行是大字、有整行的地方，主界面这一行是夹在
+ * 对话框里的小字，短一点才不会撑宽。颜色两边是同一套（见文件上面那几个
+ * UI_STATUS_COLOR_*），老人换个屏幕不用重新学。
+ *
+ * 提醒中 / 报警两档沿用原来的措辞（它们是别的流程在借这一行，不是语音状态），
+ * 只把原来的方括号去掉 —— 这一行现在是纯文字状态行，不是状态栏那种标签。
+ *
+ * ⚠️ 只能在 LVGL 线程里调（直接碰控件）。非 LVGL 线程一律走 main.c 的 ui_post()
+ *    （内部 lv_async_call），见那里"跨线程改界面"那一段。
+ * ⚠️ `default` 分支一个字都不改是**纪律**：认不出来的档位宁可少刷一次，也不要
+ *    把这一行停在一个错的字上（touch_ui_set_voice_state 和 main.c 的 voice_state
+ *    分支是同一条规矩）。 */
 void robot_ui_set_status(robot_status_t status)
 {
     current_status = status;
@@ -590,23 +658,27 @@ void robot_ui_set_status(robot_status_t status)
     if (lbl_status) {
         switch (status) {
             case ROBOT_STATUS_IDLE:
-                lv_label_set_text(lbl_status, "[在线]");
-                lv_obj_set_style_text_color(lbl_status, lv_color_hex(0x4CAF50), 0);
+                lv_label_set_text(lbl_status, "空闲");
+                lv_obj_set_style_text_color(lbl_status, UI_STATUS_COLOR_IDLE, 0);
                 break;
             case ROBOT_STATUS_LISTENING:
-                lv_label_set_text(lbl_status, "[聆听中]");
-                lv_obj_set_style_text_color(lbl_status, lv_color_hex(0x2196F3), 0);
+                lv_label_set_text(lbl_status, "在听…");
+                lv_obj_set_style_text_color(lbl_status, UI_STATUS_COLOR_LISTENING, 0);
+                break;
+            case ROBOT_STATUS_THINKING:
+                lv_label_set_text(lbl_status, "在想…");
+                lv_obj_set_style_text_color(lbl_status, UI_STATUS_COLOR_THINKING, 0);
                 break;
             case ROBOT_STATUS_SPEAKING:
-                lv_label_set_text(lbl_status, "[回复中]");
-                lv_obj_set_style_text_color(lbl_status, lv_color_hex(0xFF9800), 0);
+                lv_label_set_text(lbl_status, "在说…");
+                lv_obj_set_style_text_color(lbl_status, UI_STATUS_COLOR_SPEAKING, 0);
                 break;
             case ROBOT_STATUS_REMINDING:
-                lv_label_set_text(lbl_status, "[提醒中]");
+                lv_label_set_text(lbl_status, "提醒中");
                 lv_obj_set_style_text_color(lbl_status, lv_color_hex(0x9C27B0), 0);
                 break;
             case ROBOT_STATUS_ALARM:
-                lv_label_set_text(lbl_status, "[报警!]");
+                lv_label_set_text(lbl_status, "报警");
                 lv_obj_set_style_text_color(lbl_status, lv_color_hex(0xF44336), 0);
                 break;
             default:

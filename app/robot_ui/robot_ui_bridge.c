@@ -181,10 +181,14 @@ void robot_ui_bridge_voice_state(int state)
       return;
     }
 
-  /* 映射规则与 robot_ui/main.c 的 MQTT 分支逐字一致：
-   *   listening 状态栏[聆听中] 普通表情 / thinking 状态栏[聆听中] 思考表情
-   *   speaking  状态栏[回复中] 普通表情 / idle     状态栏[在线]   普通表情
-   * （界面没有"思考中"这一档状态栏，thinking 保持[聆听中]，不然会闪回[在线]）
+  /* 映射规则与 robot_ui/main.c 的 MQTT 分支逐字一致。
+   * 这里说的"状态栏"是历史上的叫法：状态栏那三样 2026-09-14 已被用户删掉，
+   * 这些 ROBOT_STATUS_* 现在落到**主界面「AI 回复区」里那一行语音状态小字**上
+   * （robot_ui_set_status，四档：空闲/在听/在想/在说）。
+   *   listening 小字「在听…」蓝 普通表情 / thinking 小字「在想…」橙 思考表情
+   *   speaking  小字「在说…」绿 普通表情 / idle     小字「空闲」灰 普通表情
+   *（2026-09-16 之前 thinking 借的是 LISTENING 那一档，因为那行小字还没显示出来、
+   *  靠表情区分就够了；现在四档各显各的，不再借。）
    *
    * 「在说」要把语音镜像面板弹出来（MQTT 那条路也是这么做的，见
    * on_ai_command_received 的 voice_state 分支）：面板不弹出来，老人根本
@@ -208,7 +212,10 @@ void robot_ui_bridge_voice_state(int state)
         break;
 
       case ROBOT_UI_BRIDGE_VOICE_THINKING:
-        robot_ui_bridge_post_status(ROBOT_STATUS_LISTENING, ROBOT_FACE_THINKING,
+        /* 主界面那行小字走"在想…"这一档（表情仍然是"思考"，和 MQTT 那条路
+         * 逐字一致）。桥接层自己的语义没变：进来的还是 ROBOT_UI_BRIDGE_VOICE_
+         * THINKING 这一档，只是显示目标从 LISTENING 换成了 THINKING。 */
+        robot_ui_bridge_post_status(ROBOT_STATUS_THINKING, ROBOT_FACE_THINKING,
                                     NULL);
         touch_ui_set_voice_state(TOUCH_VOICE_STATE_THINKING);
         break;
@@ -310,4 +317,59 @@ int robot_ui_bridge_panel_reinit(void)
 
   printf("[Bridge] 面板已重初始化，已投一次全屏重绘\n");
   return 0;
+}
+
+/**
+ * @brief  每帧看一眼"面板内容是不是已经对不上了"，是就整屏重绘
+ *
+ * 为什么需要：驱动侧 putrun/putarea 在**面板还没就绪**的时候是**静默丢弃**
+ * （vendor/sifli/boards/sf32lb52/drivers/lcd/sf32lb_lcd.c 里那两个
+ *  `if (s_fb_registering || !s_lcd_hw_ready) return OK;`）。开机时 /dev/fb0
+ * 一注册好界面就起来了，而面板要等那次完整 Init 才置就绪 —— LVGL 的整屏
+ * 首帧正好被丢掉，而它自己以为已经画上去了。之后它只重画脏区，于是屏幕
+ * 一直保持"只有那几个小脏区有内容"：整屏黑、只有状态栏那一小块/刚点开的
+ * 页面有画面（实测现象）。面板被重初始化（SWRESET 清 GRAM）同理。
+ *
+ * 跑在 LVGL 线程里（robot_ui 主循环），所以这里碰控件是安全的。
+ *
+ * Returned Value: 这次有没有投一次整屏重绘（只给日志/调试用）。
+ */
+
+bool robot_ui_bridge_lcd_check(void)
+{
+  static uint32_t last_ms;
+  static uint32_t redraw_cnt;
+  uint32_t now;
+
+  if (!g_ui_ready)
+    {
+      return false;
+    }
+
+  /* 限速：面板还没就绪时，重绘出去的像素同样会被丢 ⇒ 标志马上又会被置上。
+   * 不限速就变成"每几毫秒渲染一整屏"的空转，把 LVGL 线程整个占住。
+   * 250ms 一次：最多白画几帧，面板一就绪下一轮就是完整的一屏。 */
+  now = lv_tick_get();
+  if (last_ms != 0 && (uint32_t)(now - last_ms) < 250)
+    {
+      return false;                 /* 标志留着，下一轮再看 */
+    }
+
+  last_ms = now;
+
+  if (!sf32lb_lcd_take_content_lost())
+    {
+      return false;
+    }
+
+  lv_obj_invalidate(lv_screen_active());
+
+  redraw_cnt++;
+  if (redraw_cnt <= 3)
+    {
+      printf("[Bridge] 面板内容缺失（丢帧或面板复位）⇒ 整屏重绘第 %u 次\n",
+             (unsigned)redraw_cnt);
+    }
+
+  return true;
 }

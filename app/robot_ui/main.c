@@ -30,6 +30,10 @@
 /* 刷屏/渲染耗时仪表（app/robot_ui/ui_perf.c）：只在慢的时候打日志，用来回答
  * "黑屏那一下到底黑在哪一段"。总开关是头文件里的 UI_PERF_LOG，置 0 即完全摘掉。 */
 #include "ui_perf.h"
+/* 屏幕镜像的 LVGL 侧（app/robot_ui/lcd_mirror_glue.c）：把每次 flush 的脏区
+ * 拷进板级影子帧缓冲，由 board/.../lcd_mirror.c 的镜像任务发给 PC。
+ * 详细说明见那两个文件的文件头；nsh 命令是 `hw_test lcdmirror ...`。 */
+#include "lcd_mirror_glue.h"
 #include <netutils/cJSON.h>
 
 /* AI 模块头文件 (成员二) */
@@ -1669,15 +1673,20 @@ static void on_ai_command_received(const char *action, const char *param)
     }
     else if (strcmp(action, "voice_state") == 0) {
         /* 框架侧 ai_companion（常开麦克风跑 VAD -> ASR -> 大模型 -> TTS）
-         * 报来的实时状态：既更新镜像面板的状态行，也顺手把状态栏/表情跟上，
-         * 老人不开面板也能看见"它在听/在想/在说"。
+         * 报来的实时状态：既更新镜像面板的状态行，也顺手把主界面那行语音状态小字
+         * 和表情跟上，老人不开面板也能看见"它在听/在想/在说"。
          *
-         * 四个取值 -> 界面：
-         *   "listening" 听   面板「我在听…」蓝 + 状态栏 [聆听中]（顺手自动弹面板）
-         *   "thinking"  想   面板「正在想…」橙 + 表情思考（状态栏没有"思考中"这一档，
-         *                   保持 [聆听中]，不然会闪回 [在线]）
-         *   "speaking"  说   面板「正在说话…」绿 + 状态栏 [回复中]（顺手自动弹面板）
-         *   "idle"      空闲 面板「直接说话就行，我在听」灰 + 状态栏 [在线]
+         * 四个取值 -> 界面（"状态栏"那一档 2026-09-14 已经删了，现在说的是主界面
+         * 「AI 回复区」里那一行小字，见 robot_ui_set_status）：
+         *   "listening" 听   面板「我在听…」蓝 + 小字「在听…」蓝（顺手自动弹面板）
+         *   "thinking"  想   面板「正在想…」橙 + 小字「在想…」橙 + 表情思考
+         *   "speaking"  说   面板「正在说话…」绿 + 小字「在说…」绿（顺手自动弹面板）
+         *   "idle"      空闲 面板「直接说话就行，我在听」灰 + 小字「空闲」灰
+         *
+         * thinking 原来借的是 ROBOT_STATUS_LISTENING（那时小字还没显示，靠表情区分
+         * 就够）；2026-09-16 加了 ROBOT_STATUS_THINKING 这一档，主界面才能把
+         * "在听"和"在想"分开 —— 这正是用户要的那四档。表情仍然是 THINKING，
+         * 一个字都没变。
          *
          * ⚠️ 本回调跑在 network_task（MQTT 收包）线程里：ui_post() 和
          * touch_ui_set_voice_state() 内部都是 lv_async_call，不能在这里直接碰控件
@@ -1701,7 +1710,9 @@ static void on_ai_command_received(const char *action, const char *param)
             ui_post(ROBOT_STATUS_LISTENING, ROBOT_FACE_HAPPY, NULL);
             touch_ui_set_voice_state(TOUCH_VOICE_STATE_LISTENING);
         } else if (strcmp(param, "thinking") == 0) {
-            ui_post(ROBOT_STATUS_LISTENING, ROBOT_FACE_THINKING, NULL);
+            /* 表情仍然是"思考"，只有主界面那行小字从原来的「在听…」换成「在想…」
+             * （以前借 LISTENING 是因为那行字还没显示出来，借一下就够）。 */
+            ui_post(ROBOT_STATUS_THINKING, ROBOT_FACE_THINKING, NULL);
             touch_ui_set_voice_state(TOUCH_VOICE_STATE_THINKING);
         } else if (strcmp(param, "speaking") == 0) {
             ui_post(ROBOT_STATUS_SPEAKING, ROBOT_FACE_HAPPY, NULL);
@@ -3775,6 +3786,12 @@ int main(int argc, char *argv[])
     ui_perf_attach_display(lv_result.disp);
 #endif
 
+    /* 屏幕镜像（真机屏幕坏了，拿电脑当显示器）：挂 flush 钩子 + 起镜像任务。
+     * 开机自动起，目标默认 192.168.137.1:5600；控制命令 `hw_test lcdmirror ...`。
+     * 必须在 lv_nuttx_init() 成功之后、建界面之前调 —— 影子帧缓冲靠"开机头几秒
+     * 整屏重绘"填满，挂晚了也没事，客户端连上会再整屏重绘一次。 */
+    lcd_mirror_attach_lvgl_display(lv_result.disp);
+
     /* 触摸采样周期:默认跟随 LV_DEF_REFR_PERIOD（33ms ~ 30Hz），手感偏迟钝。
      * 这里只把输入设备读取定时器提到 10ms，屏幕刷新节奏不变。 */
     if (lv_result.indev != NULL)
@@ -3976,6 +3993,10 @@ int main(int argc, char *argv[])
         static bool net_ok   = false;
         static int  time_tick = 0;
         static int  reminder_tick = 0;
+
+        /* 面板内容对不上（开机丢帧 / 面板被复位过）⇒ 把整屏判脏，下面这一帧
+         * 就会重画一整屏。必须在 LVGL 线程里调（本循环就是），函数内部自己限速。 */
+        robot_ui_bridge_lcd_check();
 
         /* 计时仪表：量这一轮 lv_timer_handler 的耗时（一帧的"渲染 + 刷屏"都在里面）。
          * 正常时它什么都不打，只有"慢"才由 ui_perf_frame_end() 打一行。 */

@@ -60,6 +60,11 @@ if(CONFIG_LVX_USE_CONTEST2026_233_ZHI_AI)
          # ui_perf.h 的 UI_PERF_LOG，置 0 时这个文件编译成空翻译单元，main.c 里
          # 那几处调用也被 #if 掉。不想要了就删这一行 + 删两个文件。
          ui_perf.c
+         # 屏幕镜像的 LVGL 侧（真机屏幕坏了，拿电脑当显示器）：
+         # 只挂一个 LV_EVENT_FLUSH_START 把它们交给驱动的那块脏区拷进板级
+         # 影子帧缓冲，socket/协议/任务/nsh 全在 board/.../lcd_mirror.c。
+         # 拿掉这个功能：删这一行 + 删两个文件 + 删 main.c 里那一句调用。
+         lcd_mirror_glue.c
          lv_font_ui_16.c lv_font_ui_20.c lv_font_ui_24.c
     STACKSIZE 32768
     PRIORITY 100

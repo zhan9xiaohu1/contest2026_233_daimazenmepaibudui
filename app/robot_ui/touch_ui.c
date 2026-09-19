@@ -355,21 +355,45 @@ void touch_ui_init(void)
      * 默认会把触摸事件吃掉（不冒泡给父对象），所以手指落在那些区域上时，
      * 屏幕根本收不到 PRESSED/RELEASED —— 现象就是"怎么划都划不出菜单"。
      * indev 的事件只看按下/抬起，与命中的对象无关，因此一定能收到。
-     * 屏幕上的注册保留着（同一次滑动可能两边都来，swipe_handled 去重）。 */
-    lv_indev_t *indev = lv_indev_get_next(NULL);
-    if (indev != NULL)
-      {
-        lv_indev_add_event_cb(indev, screen_gesture_event_handler,
-                              LV_EVENT_PRESSED, NULL);
-        lv_indev_add_event_cb(indev, screen_gesture_event_handler,
-                              LV_EVENT_RELEASED, NULL);
-        lv_indev_add_event_cb(indev, screen_gesture_event_handler,
-                              LV_EVENT_CANCEL, NULL);
-      }
-    else
-      {
-        printf("[Gesture] 没找到输入设备，右滑只在屏幕上生效\n");
-      }
+     * 屏幕上的注册保留着（同一次滑动可能两边都来，swipe_handled 去重）。
+     *
+     * ⚠ 必须挂到**每一个 pointer 设备**上，不能只挂 lv_indev_get_next(NULL)：
+     *   - 本机可能有两只手：真触摸（/dev/input0，现在坏了没有）和镜像的
+     *     鼠标虚拟设备（lcd_mirror_glue.c 建的）。lv_indev_create() 是
+     *     **_lv_ll_ins_head**（插在表头），所以"第一个"到底是哪一只、取决于
+     *     谁先建 —— 只挂一只的话，另一只"点得动按钮、却划不出菜单"，
+     *     现场极难判断（表现成"手势偶尔灵偶尔不灵"）。
+     *   - 遍历全部 pointer 设备就对两只都生效，而且以后加设备也不用再改这里。 */
+    {
+        lv_indev_t *indev;
+        int         attached = 0;
+
+        for (indev = lv_indev_get_next(NULL); indev != NULL;
+             indev = lv_indev_get_next(indev))
+          {
+            if (lv_indev_get_type(indev) != LV_INDEV_TYPE_POINTER)
+              {
+                continue;
+              }
+
+            lv_indev_add_event_cb(indev, screen_gesture_event_handler,
+                                  LV_EVENT_PRESSED, NULL);
+            lv_indev_add_event_cb(indev, screen_gesture_event_handler,
+                                  LV_EVENT_RELEASED, NULL);
+            lv_indev_add_event_cb(indev, screen_gesture_event_handler,
+                                  LV_EVENT_CANCEL, NULL);
+            attached++;
+          }
+
+        if (attached == 0)
+          {
+            printf("[Gesture] 没找到 pointer 输入设备，右滑只在屏幕上生效\n");
+          }
+        else
+          {
+            printf("[Gesture] 右滑已挂到 %d 个输入设备\n", attached);
+          }
+    }
 
     lv_obj_add_event_cb(current_screen, screen_gesture_event_handler,
                         LV_EVENT_PRESSED, NULL);

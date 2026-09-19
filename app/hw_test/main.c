@@ -43,6 +43,26 @@
  *   hw_test lcdreinit        面板重新初始化（黑屏救回）：重发一遍面板初始化
  *                            序列 + 拉一次 RESET 脚，再请界面全屏重绘一次
  *                            —— 单独运行；整屏黑但串口/触摸还活着时敲它
+ *   hw_test lcdmirror [start|stop|status|uart|tcp] [ip|节点] [port]
+ *                            屏幕镜像（板端 -> PC）+ **鼠标当触摸**（反向通道）：
+ *                            把界面像素发到电脑上显示，同时把电脑上的鼠标
+ *                            当成板子的触摸（本机触摸 IC 已经不应答、
+ *                            /dev/input0 都没了，这是唯一能操作界面的路）。
+ *                            协议 v2：20 字节头，载荷可 RLE（见 lcd_mirror.h）。
+ *                            **开机自动起**（传输默认 TCP），目标默认
+ *                            192.168.137.1:5600；不给参数就打印状态。
+ *                            `uart [节点]` 切到控制台串口那条腿（不依赖 USB
+ *                            网络，帧格式一模一样，默认 /dev/console）；
+ *                            `tcp <ip> [port]` 切回来。PC 端跑
+ *                            D:/apply/claw/_flash/lcd_mirror.py
+ *                            —— 单独运行
+ *   hw_test lcdtap <x> <y> <0|1>
+ *                            注入一次触摸（x/y 是面板坐标，越界会钳住；
+ *                            1=按下 0=抬起）。**串口模式下的触摸入口**：
+ *                            PC 往串口里写这一行文本，NSH 执行它 ——
+ *                            反向触摸不走帧的字节流（二进制包会被行输入吃掉）。
+ *                            拖动就是连着发 `lcdtap x y 1`，最后 `lcdtap x y 0`
+ *                            —— 单独运行，且镜像要在跑
  *
  * 设计约定：
  *   - 每一步失败都只打印 FAIL，不中断后面的步骤，也不会卡死
@@ -112,6 +132,7 @@
 #include "sf32lb52_backlight.h"        /* 板级亮度封装 backlight_set/get */
 #include "sf32lb52_boardbtn.h"         /* 板级按键：GPIO 轮询 + 回调（不用 /dev/buttons） */
 #include "sf32lb52_status.h"           /* 板级统一外设状态 board_status_get/dump */
+#include "lcd_mirror.h"                /* 板级屏幕镜像（屏幕坏了拿 PC 当显示器） */
 /* 面板重新初始化（黑屏救回）：实现在 robot_ui 那个 app 的 robot_ui_bridge.c，
  * 它自己再去调 vendor 面板驱动的 sf32lb_lcd_panel_reinit()。
  * 走 robot_ui 这一跳而不是在 hw_test 里直接调驱动，是因为"重初始化之后要重绘"
@@ -451,6 +472,23 @@ static void usage(void)
          "序列 + 拉一次 RESET 脚，\n"
          "                       再请界面全屏重绘一次。整屏黑、"
          "但串口还活着时敲它（单独运行）\n");
+  printf("  hw_test lcdmirror [start|stop|status|uart|tcp] [ip|节点] [port]\n"
+         "                       屏幕镜像（屏幕坏了拿 PC 当显示器）：开机"
+         "**自动起**，传输默认 TCP，目标默认\n"
+         "                       %s:%d；不给参数就打印状态（含当前传输、"
+         "节点名/目标地址、收到多少条触摸）。\n"
+         "                       协议 v2（20 字节头 + RLE 载荷）。`uart [节点]` "
+         "切控制台串口那条腿（默认\n"
+         "                       /dev/console，帧格式一模一样，不依赖 USB 网络；"
+         "每 3 秒发一次整屏关键帧），\n"
+         "                       `tcp <ip> [port]` 切回来。PC 端 "
+         "_flash/lcd_mirror.py 里按住鼠标 = 点屏幕\n",
+         LCD_MIRROR_DEFAULT_IP, LCD_MIRROR_DEFAULT_PORT);
+  printf("  hw_test lcdtap <x> <y> <0|1>   注入一次触摸（面板坐标，1=按下 "
+         "0=抬起）。**串口模式下的触摸入口**：\n"
+         "                       PC 往串口里写这行文本、由 NSH 执行；"
+         "拖动就连续发 `lcdtap x y 1`，\n"
+         "                       最后一条 `lcdtap x y 0` 抬手（镜像要在跑）\n");
   printf("  hw_test button [秒]  等按键按下（板级 GPIO：PA11=KEY / PA34=HOME），"
          "默认 15 秒，超时算 FAIL（单独运行）\n");
   printf("  hw_test status       打印统一外设状态（board_status_get/dump）；"
@@ -3327,6 +3365,88 @@ static bool arg_is_number(FAR const char *s)
 }
 
 /****************************************************************************
+ * Name: arg_tail_ws / arg_is_word / arg_is_number_ws / arg_copy_trimmed
+ *
+ * Description:
+ *   **串口那条路必须容忍尾随空白**，尤其是 '\r'：PC 端写 nsh 命令时习惯发
+ *   "\r\n" 结束一行（板子自己的 _flash/raw_cap.py 也是这么敲回车的），而 NSH
+ *   的 readline 只把 '\n' 当行尾 —— 前面那个 '\r' 会留在行缓冲里、粘在
+ *   **最后一个参数**后面（`hw_test lcdtap 100 200 1\r\n` 的最后一个参数就成了
+ *   "1\r"）。不处理的话，PC 端 --serial 模式下一按鼠标，板子就会回一行
+ *   "用法 hw_test lcdtap ..."，看着像命令名写错了。
+ *
+ *   所以 lcdmirror / lcdtap 这两个子命令的参数判定都走下面这几个（子命令名、
+ *   数字都容忍尾随空白；节点名/IP 先拷进本地缓冲再去掉尾随空白）。
+ *   其它子命令没这问题：它们是人在终端里敲的，不经过 PC 端那个脚本。
+ *
+ ****************************************************************************/
+
+static size_t arg_tail_ws(FAR const char *s)
+{
+  size_t n = strlen(s);
+
+  while (n > 0 &&
+         (s[n - 1] == '\r' || s[n - 1] == '\n' ||
+          s[n - 1] == ' ' || s[n - 1] == '\t'))
+    {
+      n--;
+    }
+
+  return n;
+}
+
+static bool arg_is_word(FAR const char *s, FAR const char *word)
+{
+  size_t n = arg_tail_ws(s);
+
+  return strlen(word) == n && strncmp(s, word, n) == 0;
+}
+
+static bool arg_is_number_ws(FAR const char *s)
+{
+  size_t n = arg_tail_ws(s);
+  size_t i = 0;
+
+  if (n == 0)
+    {
+      return false;
+    }
+
+  if (s[0] == '-' || s[0] == '+')
+    {
+      if (n == 1)
+        {
+          return false;
+        }
+
+      i = 1;
+    }
+
+  for (; i < n; i++)
+    {
+      if (s[i] < '0' || s[i] > '9')
+        {
+          return false;
+        }
+    }
+
+  return true;
+}
+
+static void arg_copy_trimmed(FAR char *dst, size_t cap, FAR const char *src)
+{
+  size_t n = arg_tail_ws(src);
+
+  if (n >= cap)
+    {
+      n = cap - 1;
+    }
+
+  memcpy(dst, src, n);
+  dst[n] = '\0';
+}
+
+/****************************************************************************
  * Name: step_backlight
  *
  * Description:
@@ -3556,6 +3676,223 @@ static int step_status(void)
 }
 
 /****************************************************************************
+ * Name: step_lcdmirror
+ *
+ * Description:
+ *   lcdmirror 子命令：屏幕镜像（板子 -> PC）的开关与状态，
+ *   以及"PC 鼠标当触摸"这条反向通道（都跟着镜像任务走）。
+ *
+ *   `hw_test lcdmirror [start|stop|status|uart|tcp] [ip|节点] [port]`
+ *     - 不给子命令、或给 status：打印状态（只读）；会打印**当前传输**、
+ *       节点名/目标地址、收到多少条触摸消息、最后坐标、当前是按下还是抬起
+ *       —— 现场判断"鼠标到底通没通"看它；
+ *     - uart [dev]：切到**控制台串口**那条腿（默认 /dev/console）。帧格式
+ *       和 TCP 一模一样，所以 PC 端不用改解析器 —— 只是不再依赖 USB 网络。
+ *       **不会自动开**：串口和控制台日志共用一条线，必须手动切；
+ *     - tcp <ip> [port]：切回 TCP（顺带换目标地址）；
+ *     - start [ip] [port]：可选先换目标地址，再起镜像任务；
+ *       **开机本来就是自动起的**，所以正常情况这里只会打印"已经在跑"；
+ *     - stop：停掉镜像任务。**鼠标模拟触摸也一起停**（反向通道在镜像是哪个
+ *       循环里，镜像不在跑就不再注入），刷屏路径同时完全绕开、一行开销都不留。
+ *
+ *   ⚠ 本命令**不烧屏、不碰 LVGL**：镜像任务自己开 socket/串口、自己收自己发。
+ *   像素是 robot_ui 的 flush 钩子喂进来的，所以只有界面在刷的东西才会出现在
+ *   镜像里（比如 `hw_test lcdcolor` 那种直接写 /dev/fb0 的刷色不会进镜像）。
+ *   反过来，鼠标注入是喂给 robot_ui 里那个虚拟输入设备的，也只有界面在跑才
+ *   点得动。
+ *
+ *   协议是 **v2**（见 board/contest_board/src/lcd_mirror.h 的文件头注释）：
+ *   20 字节小端头 + 载荷，flags bit0=1 时载荷是 RLE 压缩流，压不小就退回原样；
+ *   一帧最多 LCD_MIRROR_MAX_ROWS_PER_FRAME 行，更长的脏区拆成多帧。
+ *   status 会把协议版本、RLE/原样帧数、压掉多少字节一起打出来。
+ *   ⚠ PC 端脚本要跟着 v2：老的只认 16 字节头（ver1）的客户端收不下现在的帧。
+ *
+ ****************************************************************************/
+
+static int step_lcdmirror(FAR const char *sub, FAR const char *ip, int port,
+                          FAR const char *dev, int resend_y0, int resend_rows)
+{
+  int ret;
+
+  printf("[LCDMIRROR] 屏幕镜像（板端 -> PC）\n\n");
+
+  /* `resend <y0> <rows>`：把这几行重新标脏、下一轮再发一遍。
+   * PC 侧发现某条带子被日志字节插坏（它已经解出帧头、知道是哪一段）时发它 —— 
+   * 这是"精确自愈"，取代了原来每 3 秒一趟的整屏关键帧（那趟会把 1.4 秒的线时
+   * 全占掉，用户的即时更新只能排队）。 */
+
+  if (sub != NULL && strcmp(sub, "resend") == 0)
+    {
+      lcd_mirror_resend_rows((uint16_t)resend_y0, (uint16_t)resend_rows);
+      printf("      已请求补发 y=%d 起 %d 行\n", resend_y0, resend_rows);
+      return OK;
+    }
+
+  if (sub != NULL && strcmp(sub, "keyframe") == 0)
+    {
+      lcd_mirror_resend_all();
+      printf("      已请求整屏关键帧（全部行重新标脏）\n");
+      return OK;
+    }
+
+  /* 先看子命令是不是换传输：这两条都只是置标志，任务下一轮自己重开。 */
+
+  if (sub != NULL && strcmp(sub, "uart") == 0)
+    {
+      ret = lcd_mirror_use_uart(dev);
+      if (ret < 0)
+        {
+          printf("      串口节点名太长: %d\n", ret);
+          report("切换到串口传输", 0, "lcd_mirror_use_uart 失败");
+          return -1;
+        }
+
+      printf("      传输已切到串口 %s（帧格式和 TCP 完全一样；"
+             "反向触摸改用 `hw_test lcdtap <x> <y> <0|1>`）\n",
+             lcd_mirror_uart_dev());
+      printf("      ⚠ 串口上帧的二进制字节会和控制台日志交错，"
+             "PC 端会丢掉坏帧、靠每 %d 秒一次的整屏关键帧自愈；\n"
+             "        想停就 `hw_test lcdmirror tcp %s %d` 或 "
+             "`hw_test lcdmirror stop`\n",
+             LCD_MIRROR_UART_KEYFRAME_MS / 1000,
+             LCD_MIRROR_DEFAULT_IP, LCD_MIRROR_DEFAULT_PORT);
+
+      /* 没在跑就顺手起一个：切了传输却什么都没发生最容易被当成"没生效"。
+       * （已经在跑的话 start 是幂等的，不重启任务。） */
+      ret = lcd_mirror_start();
+      if (ret < 0)
+        {
+          report("切换到串口传输", 0, "镜像任务起不来");
+          return -1;
+        }
+
+      report("切换到串口传输", 1, lcd_mirror_uart_dev());
+      lcd_mirror_status();
+      return OK;
+    }
+
+  if (sub != NULL && strcmp(sub, "tcp") == 0)
+    {
+      ret = lcd_mirror_use_tcp(ip, (uint16_t)port);
+      if (ret < 0)
+        {
+          printf("      目标地址设置失败: %d\n", ret);
+          report("切换回 TCP 传输", 0, "lcd_mirror_use_tcp 失败");
+          return -1;
+        }
+
+      printf("      传输已切回 TCP，目标 %s:%d\n",
+             lcd_mirror_target_ip(), (int)lcd_mirror_target_port());
+      report("切换回 TCP 传输", 1, NULL);
+      lcd_mirror_status();
+      return OK;
+    }
+
+  if (ip != NULL || port > 0)
+    {
+      ret = lcd_mirror_set_target(ip, (uint16_t)port);
+      if (ret < 0)
+        {
+          printf("      目标地址设置失败: %d\n", ret);
+          report("设置目标地址", 0, "lcd_mirror_set_target 失败");
+          return -1;
+        }
+
+      printf("      目标已设为 %s:%d\n", lcd_mirror_target_ip(),
+             (int)lcd_mirror_target_port());
+    }
+
+  if (sub != NULL && strcmp(sub, "stop") == 0)
+    {
+      ret = lcd_mirror_stop();
+      if (ret < 0)
+        {
+          printf("      停止请求已发但任务还没退完: %d\n", ret);
+          report("屏幕镜像已停止", 0, "任务退出超时（1 秒）");
+          lcd_mirror_status();
+          return -1;
+        }
+
+      report("屏幕镜像已停止", 1, NULL);
+      lcd_mirror_status();
+      return OK;
+    }
+
+  if (sub != NULL && strcmp(sub, "start") == 0)
+    {
+      ret = lcd_mirror_start();
+      if (ret < 0)
+        {
+          printf("      启动失败: %d\n", ret);
+          report("屏幕镜像已启动", 0, "task_create / 影子缓冲分配失败");
+          return -1;
+        }
+
+      report("屏幕镜像已启动", 1, NULL);
+      lcd_mirror_status();
+      return OK;
+    }
+
+  if (sub != NULL && strcmp(sub, "status") != 0)
+    {
+      printf("      lcdmirror: 未知子命令 '%s'"
+             "（start / stop / status / uart [dev] / tcp <ip> [port]）\n", sub);
+      usage();
+      return -1;
+    }
+
+  /* status：只读。镜像没在跑不算 FAIL —— 它就是可以关的。 */
+
+  lcd_mirror_status();
+  printf("      在 PC 上跑：py -3.10 D:/apply/claw/_flash/lcd_mirror.py\n");
+  report("屏幕镜像状态查询", 1, lcd_mirror_is_running() ? "运行中" : "已停止");
+  return OK;
+}
+
+/****************************************************************************
+ * Name: step_lcdtap
+ *
+ * Description:
+ *   `hw_test lcdtap <x> <y> <0|1>`：往镜像的触摸状态里注一次触摸。
+ *
+ *   这是**串口模式下的触摸入口**：串口那条线上，板子的帧是二进制、PC 的命令
+ *   是文本，反向触摸没法像 TCP 那样塞一个 8 字节二进制包进去（会被 NSH 的行
+ *   输入解析吃掉），所以改成 PC 写一行命令、由 NSH 执行。
+ *
+ *   参数必给（缺了直接报错退出，不靠 atoi 的 0 蒙过去）；x/y 是面板坐标，
+ *   负数和越界都会被钳到 0..389 / 0..449（钳位在 lcd_mirror_inject_touch 里）。
+ *   **镜像没在跑时注入是无效的**（界面那边根本不会来取），所以这里提示一句，
+ *   但不算 FAIL —— 这条命令本身是成功的。
+ *
+ ****************************************************************************/
+
+static int step_lcdtap(int x, int y, int down)
+{
+  printf("[LCDTAP] 注入触摸 (%d, %d) %s\n", x, y, down ? "按下" : "抬起");
+
+  if (x < 0)
+    {
+      x = 0;
+    }
+
+  if (y < 0)
+    {
+      y = 0;
+    }
+
+  lcd_mirror_inject_touch((uint16_t)x, (uint16_t)y, down != 0);
+
+  if (!lcd_mirror_is_running())
+    {
+      printf("      注意：镜像没在跑，这条触摸到不了界面"
+             "（先 `hw_test lcdmirror uart` 或 `hw_test lcdmirror start`）\n");
+    }
+
+  report("注入触摸", 1, NULL);
+  return OK;
+}
+
+/****************************************************************************
  * Name: append_arg
  *
  * Description:
@@ -3629,6 +3966,21 @@ int main(int argc, FAR char *argv[])
   int kws_sec       = KWS_ENROLL_DEFAULT_SEC;
   int kws_th        = 0;              /* threshold 子命令要在解析时就给全，
                                        * 0 不是合法阈值，漏掉一眼能看出来 */
+  int do_lcdmirror  = 0;
+  int lcdmirror_resend_y0   = 0;   /* `lcdmirror resend <y0> <rows>` 用 */
+  int lcdmirror_resend_rows = 0;
+  FAR const char *lcdmirror_sub  = NULL;   /* NULL = 只打印状态 */
+  FAR const char *lcdmirror_ip   = NULL;
+  FAR const char *lcdmirror_dev  = NULL;   /* 只给 uart 用：串口节点名 */
+  int lcdmirror_port = 0;                  /* 0 = 不改，用板端默认 */
+  /* IP / 节点名先拷进这两个缓冲再去掉尾随 '\r'（串口上 PC 发来的命令行带
+   * "\r\n"，详细原因见 arg_tail_ws 的注释）。 */
+  char lcdmirror_ip_buf[32];
+  char lcdmirror_dev_buf[LCD_MIRROR_UART_DEV_MAX];
+  int do_lcdtap     = 0;
+  int lcdtap_x      = 0;
+  int lcdtap_y      = 0;
+  int lcdtap_down   = 0;
   int i;
 
   g_pass  = 0;
@@ -3704,6 +4056,128 @@ int main(int argc, FAR char *argv[])
       else if (strcmp(argv[i], "status") == 0)
         {
           do_status = 1;
+        }
+      else if (strcmp(argv[i], "lcdmirror") == 0)
+        {
+          /* `hw_test lcdmirror [start|stop|status|uart|tcp] [ip|节点] [port]`
+           * 位置参数都可省：不给子命令 = 只打印状态；给了 IP 就顺手换目标
+           * （start 会重连到新地址）；`uart [节点]` 切控制台串口那条腿
+           * （不依赖 USB 网络），`tcp <ip> [port]` 切回来。
+           * 参数判定一律走 arg_is_word / arg_is_number_ws：串口那条路上 PC
+           * 发来的命令行末尾带着 '\r'（见那几个函数的注释）。 */
+
+          do_lcdmirror = 1;
+
+          if (i + 1 < argc)
+            {
+              /* 命中就钉一个**字面量**给 step_lcdmirror：argv 里那个可能带着
+               * 尾随 '\r'（"uart\r"），直接往下传的话后面 strcmp 全对不上。 */
+              if (arg_is_word(argv[i + 1], "start"))
+                {
+                  lcdmirror_sub = "start";
+                  i++;
+                }
+              else if (arg_is_word(argv[i + 1], "stop"))
+                {
+                  lcdmirror_sub = "stop";
+                  i++;
+                }
+              else if (arg_is_word(argv[i + 1], "status"))
+                {
+                  lcdmirror_sub = "status";
+                  i++;
+                }
+              else if (arg_is_word(argv[i + 1], "uart"))
+                {
+                  lcdmirror_sub = "uart";
+                  i++;
+                }
+              else if (arg_is_word(argv[i + 1], "tcp"))
+                {
+                  lcdmirror_sub = "tcp";
+                  i++;
+                }
+              else if (arg_is_word(argv[i + 1], "resend"))
+                {
+                  /* `lcdmirror resend <y0> <rows>`：PC 侧报"这条带子坏了"时发它。
+                   * 两个参数都必给、必须是数字（末尾可能粘着 PC 发来的 '\r'）。 */
+
+                  if (i + 3 >= argc || !arg_is_number_ws(argv[i + 2]) ||
+                      !arg_is_number_ws(argv[i + 3]))
+                    {
+                      printf("hw_test lcdmirror resend: 用法 "
+                             "hw_test lcdmirror resend <y0> <rows>\n");
+                      usage();
+                      return EXIT_FAILURE;
+                    }
+
+                  lcdmirror_sub = "resend";
+                  i++;
+                  lcdmirror_resend_y0   = atoi(argv[++i]);
+                  lcdmirror_resend_rows = atoi(argv[++i]);
+                }
+              else if (arg_is_word(argv[i + 1], "keyframe"))
+                {
+                  lcdmirror_sub = "keyframe";
+                  i++;
+                }
+            }
+
+          if (lcdmirror_sub != NULL && strcmp(lcdmirror_sub, "uart") == 0)
+            {
+              /* uart 后面那个位置是**设备节点**，只认以 '/' 开头的 —— 免得
+               * `hw_test lcdmirror uart status` 把 "status" 当成节点名去 open。
+               * 不给就用板端默认（/dev/console）。 */
+              if (i + 1 < argc && argv[i + 1][0] == '/')
+                {
+                  arg_copy_trimmed(lcdmirror_dev_buf, sizeof(lcdmirror_dev_buf),
+                                   argv[++i]);
+                  lcdmirror_dev = lcdmirror_dev_buf;
+                }
+            }
+          else if (i + 1 < argc && !arg_is_number_ws(argv[i + 1]))
+            {
+              arg_copy_trimmed(lcdmirror_ip_buf, sizeof(lcdmirror_ip_buf),
+                               argv[++i]);
+              lcdmirror_ip = lcdmirror_ip_buf;
+            }
+
+          if (i + 1 < argc && arg_is_number_ws(argv[i + 1]))
+            {
+              lcdmirror_port = atoi(argv[++i]);
+            }
+
+          if (i + 1 < argc)
+            {
+              printf("hw_test lcdmirror: 多余的参数 '%s'"
+                     "（用法 start|stop|status|uart [dev]|tcp <ip> [port]）\n",
+                     argv[i + 1]);
+              usage();
+              return EXIT_FAILURE;
+            }
+        }
+      else if (strcmp(argv[i], "lcdtap") == 0)
+        {
+          /* `hw_test lcdtap <x> <y> <0|1>`：注入一次触摸。
+           * **串口模式下的触摸入口** —— PC 往串口里写这一行文本（_flash/
+           * lcd_mirror.py 的 touch_cmd()，结尾是 "\r\n"），NSH 执行它
+           * （反向触摸不走帧的字节流，二进制包会被行输入解析吃掉）。
+           * 三个参数都必给：缺了/不是数字直接报错退出，不能拿 atoi 的 0
+           * 蒙过去（照 asr 缺文件路径那套写法）；数字判定用 arg_is_number_ws,
+           * 因为最后一个参数后面粘着 PC 发来的那个 '\r'。 */
+
+          if (i + 3 >= argc || !arg_is_number_ws(argv[i + 1]) ||
+              !arg_is_number_ws(argv[i + 2]) || !arg_is_number_ws(argv[i + 3]))
+            {
+              printf("hw_test lcdtap: 用法 hw_test lcdtap <x> <y> <0|1>\n");
+              usage();
+              return EXIT_FAILURE;
+            }
+
+          do_lcdtap   = 1;
+          lcdtap_x    = atoi(argv[++i]);
+          lcdtap_y    = atoi(argv[++i]);
+          lcdtap_down = atoi(argv[++i]);
         }
       else if (strcmp(argv[i], "tts") == 0)
         {
@@ -3831,12 +4305,13 @@ int main(int argc, FAR char *argv[])
     }
 
   /* imu / rtc / rtcday / audio / alarm / lcd / lcdreinit / button / status /
-   * tts / asr / kws 是各自独立的子命令：只跑自己，不跑那套 5 步自检
-   * （tts / asr 要联网，是全自检里唯一会等网络的，所以也放单独模式）。 */
+   * tts / asr / kws / lcdmirror / lcdtap 是各自独立的子命令：只跑自己，
+   * 不跑那套 5 步自检（tts / asr 要联网，是全自检里唯一会等网络的，
+   * 所以也放单独模式）。 */
 
   standalone = do_imu || do_rtc || do_rtcday || do_audio || do_alarm ||
                do_backlight || do_lcdreinit || do_button || do_status ||
-               do_tts || do_asr || do_kws;
+               do_tts || do_asr || do_kws || do_lcdmirror || do_lcdtap;
 
   /* lcdcolor 只是刷个屏，别让它再干等 10 秒触摸 */
 
@@ -3851,7 +4326,7 @@ int main(int argc, FAR char *argv[])
   if (standalone)
     {
       printf("   子命令模式：只跑 imu/rtc/rtcday/audio/alarm/lcd/lcdreinit/"
-             "button/status/tts/asr/kws，不做 5 步自检\n");
+             "button/status/tts/asr/kws/lcdmirror/lcdtap，不做 5 步自检\n");
     }
   else
     {
@@ -3931,6 +4406,20 @@ int main(int argc, FAR char *argv[])
       if (do_kws != KWS_CMD_NONE)
         {
           step_kws(do_kws, kws_slot, kws_sec, kws_th);
+          printf("\n");
+        }
+
+      if (do_lcdmirror)
+        {
+          step_lcdmirror(lcdmirror_sub, lcdmirror_ip, lcdmirror_port,
+                         lcdmirror_dev, lcdmirror_resend_y0,
+                         lcdmirror_resend_rows);
+          printf("\n");
+        }
+
+      if (do_lcdtap)
+        {
+          step_lcdtap(lcdtap_x, lcdtap_y, lcdtap_down);
           printf("\n");
         }
     }

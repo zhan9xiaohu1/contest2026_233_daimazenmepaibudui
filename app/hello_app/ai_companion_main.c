@@ -52,6 +52,13 @@
  * 那个头文件同样是自给自足的 —— robot_ui 也要 include 它。 */
 #include "ai_companion_diag.h"
 
+/* 板级录音封装（ai_audio.c 已经在用同一个头）。这里只用它的**只读**观测入口
+ * sf32lb52_audio_rx_stats()：断流时"卡在无界等待"和"DMA 交帧那一半丢了"
+ * 这两种可能，上层看得见的 idle/wait 分不出来，得靠驱动里那几个计数器
+ * （见下面 ai_companion_state_snapshot_impl 末尾和 rxstuck_watch_tick）。
+ * 那个头是自给自足的（只引 nuttx 的 config/compiler + stdint），不引 LVGL。 */
+#include "sf32lb52_audio_in.h"
+
 #include "voice/voice_asr.h"
 #include "voice/voice_tts.h"
 #include "volc_asr.h"
@@ -1138,7 +1145,8 @@ int ai_companion_mic_released(void)
 
 void ai_companion_state_snapshot_impl(char *buf, size_t len)
 {
-  int n;
+  struct sf32lb52_audio_rx_stats_s rxst;
+  int    n;
 
   if (buf == NULL || len == 0)
     {
@@ -1165,7 +1173,14 @@ void ai_companion_state_snapshot_impl(char *buf, size_t len)
    *     nrt = 网络回传通道补连尝试过多少次（0 = 开机就连上了，没有自愈动作；
    *          配合 net 一起看：net=0 而 nrt 在涨 = 一直在补但从没连上）；
    *   cap / sp —— 语音段累积（"到底有没有听到人说话"的直接证据）；
-   *   kws —— 唤醒词模板条数（0 = 没装模板，唤醒词功能等于没开）。 */
+   *   kws —— 唤醒词模板条数（0 = 没装模板，唤醒词功能等于没开）；
+   *   rxi / rxh / rxr / rxt / rxe / rxl —— 2026-09-16 加的驱动侧录音分诊计数
+   *     （sf32lb52_audio_rx_stats()，口径见 sf32lb52_audio_in.h 那个结构体）：
+   *     完成中断 / 半满中断 / read 进入次数 / 等待超时次数 / DMA 传输错误(TE)
+   *     次数 / 被 DMA 覆盖掉的帧数。加它们的原因就是上面 idle/wait 那一句的
+   *     反面：录音线程"卡在 read 里、录音标志却全健康"时，上层看得见的
+   *     idle/wait 分不出是"卡在无界等待"还是"DMA 交帧那一半丢了"，这六个数
+   *     才是那条分界线。它们**只报数、不触发任何恢复动作**。 */
 
   n = snprintf(buf, len,
                "run=%d audio=%d start=%d rec=%d ract=%d died=%d exit=%d "
@@ -1194,6 +1209,37 @@ void ai_companion_state_snapshot_impl(char *buf, size_t len)
                (unsigned)g_speech_frames,
                g_kws_ready,
                sm_get_state_name(sm_get_state(&g_sm_ctx)));
+
+  /* 驱动侧那六个分诊计数接在最后（见上面字段表里 rxi..rxl 那一条）。
+   *
+   * ★ 为什么是"接在后面"而不是插在中间：diag.c 交上来的缓冲是 384 字节的
+   *   DIAG_SNAP_BUF，最坏情况（每个数字都到 int/uint 的上限、状态名取最长的
+   *   CARE_REMIND）这一行大概 320 字节，装得下；但**万一**将来字段再多到装
+   *   不下，被切掉的必须是这几个锦上添花的诊断计数，前面那些回答"它在不在、
+   *   在不在听"的字段（run/audio/ract/idle/wait…）一个都不能少。
+   *
+   * ★ 为什么取不到时**一个键都不写**：驱动还没初始化时 rx_stats 返回 -ENODEV。
+   *   这里不写，diag.c 就按它那条"没写进来的键 = 取不到"的规矩输出 -1 ——
+   *   这比给 %u 编一个哨兵值强得多（-1 在 %u 下是 4294967295，看报表的人只会
+   *   当成真计数）。
+   *
+   * ★ 这一条也是本函数唯一一处**直接问驱动**的读数。它是只读的（驱动那边
+   *   不加锁、不碰设备、不 post 信号量），所以前面那段"任何线程可调、不阻塞"
+   *   的纪律仍然成立。 */
+
+  if (n > 0 && (size_t)n < len && sf32lb52_audio_rx_stats(&rxst) == OK)
+    {
+      (void)snprintf(buf + n, len - (size_t)n,
+                     " rxi=%u rxh=%u rxr=%u rxt=%u rxe=%u rxl=%u",
+                     (unsigned)rxst.irq, (unsigned)rxst.half,
+                     (unsigned)rxst.read, (unsigned)rxst.timeout,
+                     (unsigned)rxst.dma_err, (unsigned)rxst.lost);
+
+      /* snprintf 一定收尾，所以到这里 buf 仍是一行完整的 C 字符串；
+       * 长度重新量一次就够（真装不下时它自己停在 len-1 那一格）。 */
+
+      n = (int)strlen(buf);
+    }
 
   if (n < 0 || (size_t)n >= len)
     {
@@ -2386,6 +2432,106 @@ static void listen_supervise_tick(sm_context_t *ctx)
       printf("[监听守护] 重启语音监听失败 %u 次 (ret=%d)，%u ms 后再试\n",
              (unsigned)g_listen_fail_count, ret,
              (unsigned)g_listen_backoff_ms);
+    }
+}
+
+/* ---- 串口侧的"录音卡死"观测（2026-09-16） ----
+ *
+ * 背景：录音线程会**永久**卡在 read() 里 —— 板内快照上 ract=1 / died=0 /
+ * hold=0 / want=1 全是健康的，只有 idle / wait 一路涨到几十万毫秒。那种形状
+ * listen_supervise_tick 是**看不见**的（录音"活着"，守护只看"活不活"），
+ * 而 MQTT 那条 diag 通道要有人去问才有回执、串口线又经常不在手上。
+ * 所以这里补一条**纯观测**的串口输出：不用去问谁，卡住的时候自己往外说。
+ *
+ * 判据（两条同时成立才打）：录音标志说"在录"（audio_record_is_active，
+ * 也就是 ract=1 那一套），而 audio_record_idle_ms() 已经超过 10 秒 ——
+ * 10 秒是正常情况的 500 倍（20ms 一帧），照理说不可能，
+ * 所以"超了"本身就是异常，不需要再猜。
+ *
+ * 打什么：idle/wait 这两个上层量 + 驱动那六个分诊计数 + armed/busy。
+ * 这一组正是分诊要的全部：
+ *   read/timeout 在涨而 irq/half 不涨 → 请求线或 ADC 侧死了（DMA 起了没数据）；
+ *   irq/half 还在涨                   → 数据在流，是等待/唤醒那一侧的问题；
+ *   dma_err 在涨                      → TE，那一类 HAL 自己拆通道、不会自愈；
+ *   lost 在涨                         → 上层自己来不及取；
+ *   armed=1 且 busy=1 配上 irq/half 冻结 → "通路武装得好好的、就是不来数据"。
+ *
+ * ★ 本函数**只打印**：不唤醒、不停设备、不重开录音、不改任何标志。
+ *   恢复动作是录音链路自己的事（见 listen_supervise_tick 那段"判据只有活着/
+ *   死了"的说明：在应用层拿一堆计数去猜着恢复，2026-09-15 试过，判据本身会把
+ *   恢复永久挡死）。这一步只负责让下次断流时串口上有一锤定音的证据。
+ *
+ * ★ 限频是硬要求：主循环 100ms 一拍，不限频就是每秒 10 行把串口刷满、
+ *   把别的线索冲掉（本文件在别处已经为刷屏吃过亏）。所以**每 10 秒最多一行**，
+ *   用下面那个"下次允许打的时间点"挡；条件不再成立时把它清 0，下次真卡住
+ *   立刻就能看到第一行。 */
+
+#define RXSTUCK_IDLE_MS        10000   /* idle 超过它就算卡住（正常 20ms 一帧） */
+#define RXSTUCK_LOG_PERIOD_MS  10000   /* 卡住期间：每 10 秒最多一行 */
+
+static uint32_t g_rxstuck_log_at;      /* 下一次允许打日志的时间点 (main_now_ms) */
+
+/**
+ * @brief  录音卡死的串口观测（纯打印，主循环每 100ms 调一次）
+ */
+
+static void rxstuck_watch_tick(void)
+{
+  struct sf32lb52_audio_rx_stats_s rxst;
+  uint32_t now;
+  int      idle;
+  int      wait;
+  int      ret;
+
+  if (!g_running || !audio_record_is_active(&g_audio_ctx))
+    {
+      /* 没在录音（或正在收尾）：不是这条观测管的形状，把限频锚点清掉，
+       * 下次真卡住时第一行能立刻出来。 */
+
+      g_rxstuck_log_at = 0;
+      return;
+    }
+
+  idle = audio_record_idle_ms(&g_audio_ctx);
+  if (idle < RXSTUCK_IDLE_MS)
+    {
+      g_rxstuck_log_at = 0;
+      return;
+    }
+
+  now = main_now_ms();
+  if (g_rxstuck_log_at != 0 && (int32_t)(now - g_rxstuck_log_at) < 0)
+    {
+      return;
+    }
+
+  g_rxstuck_log_at = now + RXSTUCK_LOG_PERIOD_MS;
+
+  wait = audio_record_wait_ms(&g_audio_ctx);
+
+  /* 驱动没起来（-ENODEV）时那六个数是真的取不到：如实把这行收成"取不到"，
+   * 绝不打一串 0 冒充满快照 —— 看日志的人会把 0 当成"计数就是 0"，
+   * 那是另一个结论（而且是最容易把人带偏的那个）。 */
+
+  ret = sf32lb52_audio_rx_stats(&rxst);
+
+  if (ret == OK)
+    {
+      printf("[rxstuck] 录音标志说在录、但已 %d ms 没读到数据"
+             "（wait=%d）："
+             "irq=%u half=%u read=%u timeout=%u dma_err=%u lost=%u "
+             "armed=%d busy=%d\n",
+             idle, wait,
+             (unsigned)rxst.irq, (unsigned)rxst.half,
+             (unsigned)rxst.read, (unsigned)rxst.timeout,
+             (unsigned)rxst.dma_err, (unsigned)rxst.lost,
+             rxst.armed, rxst.busy);
+    }
+  else
+    {
+      printf("[rxstuck] 录音标志说在录、但已 %d ms 没读到数据"
+             "（wait=%d）：驱动计数取不到 (ret=%d)\n",
+             idle, wait, ret);
     }
 }
 
@@ -4082,6 +4228,14 @@ static void *main_loop_task(void *arg)
        *    否则应用会一直跑着但永久听不到声音 */
 
       listen_supervise_tick(ctx);
+
+      /* 6.2 录音卡死的串口观测（**只打印**，不做任何恢复动作）：
+       *     上面那条守护看不见"录音线程卡在 read 里、标志却全健康"的形状
+       *     （那种情况录音"活着"），所以另开一条纯观测的路，卡住时每 10 秒
+       *     往串口吐一行 idle/wait + 驱动那六个计数（见 rxstuck_watch_tick）。
+       *     放在守护之后：守护这一拍要不要动设备与它无关，它一个字节都不改。 */
+
+      rxstuck_watch_tick();
 
       /* 6.5 网络回传通道自愈：开机没连上（RNDIS/DNS 还没就绪）就每 10 秒补一次，
        *     连上了主动补推一次当前状态 —— 否则整场 MQTT 上报一条都发不出去，
