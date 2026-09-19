@@ -67,6 +67,31 @@
  * 这种情况，多余的一律按不合法处理。 */
 #define AI_TOOLS_COMMAND_MAX    16
 
+/* report_emergency 的参数上限（字节，含结尾 '\0'）。
+ * reason 会显示在询问框上、也会进日志（"老人呼救""疑似跌倒"），detail 是模型
+ * 补的描述。两个都超长**截断**而不是打回 —— 走到这里说明模型已经认定这是紧急
+ * 情况，不能因为一句话太长把这条链堵住（见 ai_tools_copy_text()）。 */
+#define AI_TOOLS_REASON_MAX     96
+#define AI_TOOLS_DETAIL_MAX     128
+
+/* level 只认这两个值。拷贝走严格版（纯 ASCII 记号），认不出来的一律按 normal
+ * 处理并在回给模型的文本里说一声 —— 同样是不为了装饰性字段把链路打回。 */
+#define AI_TOOLS_LEVEL_MAX      16
+#define AI_TOOLS_LEVEL_HIGH     "high"
+#define AI_TOOLS_LEVEL_NORMAL   "normal"
+
+/* 事件上报用的 sound_type。走 /sound_alarm 这条通道（不上报 /alarm、不推手机），
+ * 命名沿用 ai_companion_main.c 里"未确认"那套 unconfirmed_<type>：一眼能看出
+ * 这条**不是**正式报警。level=high 单独一个名字，家人那边不看 confidence 也能
+ * 分出紧急程度。
+ *
+ * 为什么不上报 /alarm：那条路会推手机推送 + 弹报警页（ai_network_send_alarm()
+ * 内部是 report_alarm() -> push_send_alarm()），用户还没确认就推过去，二次确认
+ * 就白做了。"未确认"走 /sound_alarm 是 ai_companion_main.c 里已经定下来的规矩
+ * （ask_flow_unclear() 那段有原话）。 */
+#define AI_TOOLS_EVENT_SOS       "unconfirmed_llm_sos"
+#define AI_TOOLS_EVENT_SOS_HIGH  "unconfirmed_llm_sos_high"
+
 /* 工具清单的 JSON。description 是写给模型看的，里面一律用中文标点 —— 这是
  * 手写的 JSON 字面量，一个 ASCII 引号或反斜杠就能把它拼坏。
  *
@@ -86,7 +111,50 @@
   "\"enum\":[\"on\",\"off\"]}},"                                        \
   "\"required\":[\"command\"]}}"
 
-#define AI_TOOLS_JSON_ARRAY  "[" AI_TOOLS_SET_LIGHT_JSON "]"
+/* 紧急报告工具。description 必须写清两件事：什么时候该调（老人求救这类），
+ * 以及"调它只是请用户确认、不是已经报了警" —— 少了后半句，模型很容易在老人
+ * 喊救命时反复调用它，或者回一句"已经帮您报警了"（用户实际还没点确认）。 */
+#define AI_TOOLS_REPORT_EMERGENCY_JSON                                   \
+  "{\"name\":\"" AI_TOOL_REPORT_EMERGENCY "\","                          \
+  "\"description\":\"报告一次紧急情况，让板子马上去问用户「是否要报警？」、"          \
+  "并在用户确认之后真正报警。老人喊救命、呼救、说胸口疼、说摔倒了、"                     \
+  "或者你判断用户正处于危险之中（疑似跌倒、受伤、出血）时调用。"                        \
+  "注意：调用本工具只是**请用户确认**，报警要等用户点头，所以不要反复调用，"              \
+  "也不要说已经报过警了。\","                                             \
+  "\"input_schema\":{\"type\":\"object\",\"properties\":{"               \
+  "\"reason\":{\"type\":\"string\",\"description\":\"这次紧急情况是什么，" \
+  "一句简短中文，例如「老人呼救」「疑似跌倒」。\"},"                            \
+  "\"level\":{\"type\":\"string\",\"description\":\"紧急程度："          \
+  "high 表示非常紧急（正在呼救、可能已经受伤），normal 表示需要再确认；"          \
+  "不确定就不传。\","                                                    \
+  "\"enum\":[\"" AI_TOOLS_LEVEL_HIGH "\",\"" AI_TOOLS_LEVEL_NORMAL "\"]}," \
+  "\"detail\":{\"type\":\"string\",\"description\":\"补充描述，"         \
+  "例如老人原话、你的判断依据。可选。\"}},"                                 \
+  "\"required\":[\"reason\"]}}"
+
+#define AI_TOOLS_JSON_ARRAY                                              \
+  "[" AI_TOOLS_SET_LIGHT_JSON "," AI_TOOLS_REPORT_EMERGENCY_JSON "]"
+
+/****************************************************************************
+ * External Symbols
+ ****************************************************************************/
+
+/* 板端二次确认入口（实现在 app/robot_ui/main.c，原型声明在那边的 robot_ui.h）。
+ *
+ * 这里**不 include robot_ui.h**：那个头文件要 <lvgl.h>，而 hello_app 的编译
+ * 命令里没有 LVGL 的头文件路径（理由见 robot_ui_bridge.h / fall_alarm.h 的
+ * 文件头），只能自己声明一份，签名必须和对面一模一样。
+ *
+ * weak 的理由：这个符号长在另一个模块里，谁先合进来不该决定整机镜像能不能
+ * 链起来。加 weak 之后，对面没落地时函数地址是 NULL（下面判空后如实告诉模型
+ * "询问框没弹出来"，而不是假装弹过），落地后自动绑到对面那个强符号上 ——
+ * 对面现在已经落地（main.c 的 ui_post_ask_alarm()），host 测试里验过这条绑定。
+ *
+ * 线程约定（对面给的）：任何任务线程可调，内部只投递不碰 LVGL；不许在中断/
+ * 音频回调里调。execute 回调跑在 ai_agent 的 agent_loop 任务里，符合。 */
+
+__attribute__((weak))
+void ui_post_ask_alarm(const char *reason);
 
 /****************************************************************************
  * Private Data
@@ -245,6 +313,100 @@ static bool ai_tools_copy_token(const char *src, size_t len, char *dst,
 }
 
 /**
+ * @brief  把一个**人话**字段（reason / detail）拷进定长缓冲
+ *
+ * 和 ai_tools_copy_token() 的区别：那个是给 on / off / 设备标识这种纯 ASCII
+ * 记号用的，超长和反斜杠一律判不合法；这里收的是中文描述，规则反过来：
+ *
+ *   - 0x80 以上的字节（UTF-8 中文）原样收；ASCII 控制字符（含 \n \t）丢掉；
+ *   - 空白只去首尾（模型有时会带空格），中间的原样保留；
+ *   - 超长**截断**而不是打回：能走到这里说明模型已经认定这是紧急情况，不能
+ *     因为一句话太长就把这条链堵住（何况 detail 只是个补充）；
+ *   - 截断一定落在字符边界上：装不下时把正在写的那个多字节字符整个回退。
+ *     留半个 UTF-8 字符比少半句话更坏 —— 它会一路进到 cJSON 拼的 MQTT 报文
+ *     和界面的显示缓冲里，那边都不做校验；
+ *   - 反斜杠原样保留（不做转义处理，也不否定它）：下游的 cJSON 会正确转义。
+ *
+ * @param  src      ai_tools_json_find_string() 给的原始字节（可以是 NULL）
+ * @param  len      字节数
+ * @param  dst      输出缓冲（一定以 '\0' 结尾）
+ * @param  dst_cap  输出缓冲大小（至少留一格给 '\0'）
+ * @return 真正拷进 dst 的字节数；0 表示没有可用内容
+ */
+
+static size_t ai_tools_copy_text(const char *src, size_t len, char *dst,
+                                 size_t dst_cap)
+{
+  size_t used = 0;
+  size_t i;
+  size_t seq_start = 0;
+  size_t seq_need = 0;
+
+  if (dst == NULL || dst_cap == 0)
+    {
+      return 0;
+    }
+
+  dst[0] = '\0';
+
+  if (src == NULL)
+    {
+      return 0;
+    }
+
+  for (i = 0; i < len; i++)
+    {
+      unsigned char c = (unsigned char)src[i];
+
+      if (c < 0x20)
+        {
+          continue;
+        }
+
+      if (used + 2 > dst_cap)
+        {
+          /* 装不下（还要留一格给结尾的 '\0'）：正在写的多字节字符整个回退 */
+
+          if (seq_need > 0)
+            {
+              used = seq_start;
+            }
+
+          break;
+        }
+
+      dst[used++] = (char)c;
+
+      if (c >= 0xc2 && c <= 0xf4)
+        {
+          /* 一个多字节序列的引导字节，记住它从哪开始、还要几个续字节 */
+
+          seq_start = used - 1;
+          seq_need  = (c < 0xe0) ? 1 : ((c < 0xf0) ? 2 : 3);
+        }
+      else if (c >= 0x80 && c <= 0xbf)
+        {
+          if (seq_need > 0)
+            {
+              seq_need--;
+            }
+        }
+      else
+        {
+          seq_need = 0;      /* ASCII：不可能还在半个序列里 */
+        }
+    }
+
+  while (used > 0 && (dst[used - 1] == ' ' || dst[used - 1] == '\t'))
+    {
+      used--;
+    }
+
+  dst[used] = '\0';
+  return used;
+}
+
+/**
  * @brief  框架的 get_tools 回调：交回我们的工具清单
  *
  * 每次重建清单都会调一次，所以这里每次都返回一份新的堆内存（框架负责 free）。
@@ -265,6 +427,157 @@ static char *ai_tools_provider_get_tools(void)
 
   memcpy(out, AI_TOOLS_JSON_ARRAY, len);
   return out;
+}
+
+/**
+ * @brief  report_emergency 的执行体：请用户确认 + 上报一条「未确认」事件
+ *
+ * 这一层只做两件事，**真正报警不在这里**：
+ *   1. ui_post_ask_alarm(reason) —— 让界面弹「是否报警？」询问框（对面实现的
+ *      入口，任何任务线程可调）；用户点了确认，才由界面那一侧正式报警；
+ *   2. ai_network_report_sound_alarm() —— 往 /sound_alarm 上报一条**不推手机**
+ *      的事件，让家人/云端知道"模型报了紧急情况、正在等用户确认"。
+ *
+ * 两步都失败也要各自如实说清：模型会照着我们的文本跟老人说话，这里含糊一句，
+ * 老人那边就会听到"已经帮您报警了"。
+ *
+ * @param  input_json   模型给的参数（JSON 对象串；可能为 NULL）
+ * @param  output       工具结果（回给模型看的文本）
+ * @param  output_size  output 的大小
+ * @return 恒为 OK（工具名在 execute 里已经认过；失败原因全部写进 output）
+ */
+
+static int ai_tools_report_emergency(const char *input_json, char *output,
+                                     size_t output_size)
+{
+  char reason[AI_TOOLS_REASON_MAX];
+  char detail[AI_TOOLS_DETAIL_MAX];
+  char level[AI_TOOLS_LEVEL_MAX];
+  char net_state[96];
+  const char *p;
+  const char *ask_state;
+  size_t len = 0;
+  bool high = false;
+  bool level_unknown = false;
+  int ret;
+
+  output[0] = '\0';
+
+  /* reason 必填：它是询问框上那句话，也是给界面的唯一线索。缺了就把原因写成
+   * 一句人话回给模型，让它重说一遍（返回 ERROR 会走成"未知工具"，模型只会
+   * 看到一句英文报错，老人那边什么都等不到）。 */
+
+  p = ai_tools_json_find_string(input_json, "reason", &len);
+
+  if (ai_tools_copy_text(p, len, reason, sizeof(reason)) == 0)
+    {
+      snprintf(output, output_size,
+               "没执行：reason 参数缺失或者是空的。请用一句简短中文说清这次"
+               "紧急情况（例如「老人呼救」「疑似跌倒」）之后重新调用一次。");
+      ai_tools_info("report_emergency: reason 缺失，打回");
+      return OK;
+    }
+
+  /* level 可选：只认 high / normal。认不出来（没给、给了别的词、给了非字符串）
+   * 一律按 normal 走，并在回给模型的文本里说一声 —— 这是紧急链路，不为了一个
+   * 装饰性字段把上报打回。 */
+
+  p = ai_tools_json_find_string(input_json, "level", &len);
+
+  if (p != NULL)
+    {
+      if (ai_tools_copy_token(p, len, level, sizeof(level)))
+        {
+          if (strcmp(level, AI_TOOLS_LEVEL_HIGH) == 0)
+            {
+              high = true;
+            }
+          else if (strcmp(level, AI_TOOLS_LEVEL_NORMAL) != 0)
+            {
+              level_unknown = true;
+            }
+        }
+      else
+        {
+          level_unknown = true;
+        }
+    }
+
+  /* detail 可选：模型的补充描述。只进日志和回给模型的文本，不进上报报文
+   * （现成的上报入口只收 sound_type + confidence 两个参数，见下）。 */
+
+  p = ai_tools_json_find_string(input_json, "detail", &len);
+  ai_tools_copy_text(p, len, detail, sizeof(detail));
+
+  /* 1. 请用户确认。weak 符号为空时（对面还没落地、或者将来被摘掉）**不许**
+   * 假装弹过框：这句话会经模型进到老人耳朵里（"您按下确认就行"），而屏幕上
+   * 什么都没有。 */
+
+  if (ui_post_ask_alarm != NULL)
+    {
+      ui_post_ask_alarm(reason);
+      ask_state = "已经请用户确认（询问框已经弹出来）";
+      ai_tools_info("report_emergency: 已请用户确认「%s」", reason);
+    }
+  else
+    {
+      ask_state = "没能请用户确认（询问框这一侧还没接上，屏幕上什么都没有）";
+      ai_tools_info("report_emergency: ui_post_ask_alarm 没接上，询问框没弹");
+    }
+
+  /* 2. 上报一条「未确认」事件。conf 用 100 / 60 只是给家人那边分紧急程度，
+   * 不是声学置信度。 */
+
+  if (g_net_ctx == NULL)
+    {
+      snprintf(net_state, sizeof(net_state),
+               "事件没有上报（网络上下文还没注册）");
+      ai_tools_info("report_emergency: 网络上下文为空，事件没上报");
+    }
+  else
+    {
+      const char *event = high ? AI_TOOLS_EVENT_SOS_HIGH : AI_TOOLS_EVENT_SOS;
+      int conf = high ? 100 : 60;
+
+      ret = ai_network_report_sound_alarm(g_net_ctx, event, conf);
+
+      if (ret < 0)
+        {
+          snprintf(net_state, sizeof(net_state),
+                   "事件没能交给网络层（返回 %d），这条事件没发出去", ret);
+          ai_tools_info("report_emergency: 事件 %s 上报失败(%d)", event, ret);
+        }
+      else
+        {
+          /* 进了发送队列不等于发出去了（真正 publish 是 network_task 那条
+           * socket 干的），所以只说"交给网络层"。 */
+
+          snprintf(net_state, sizeof(net_state),
+                   "事件已经交给网络层上报（%s）", event);
+          ai_tools_info("report_emergency: 事件 %s conf=%d 已交给网络层",
+                        event, conf);
+        }
+    }
+
+  /* 回给模型的文本。最后那几句是这一整个工具的**主要产物**：模型会照着自己
+   * 看到的东西跟老人说话，所以必须写清"还没报警、要等确认"，并且明确禁止
+   * 重复调用和编造成功 —— 不然老人听到的就是"已经帮您报警了"。 */
+
+  snprintf(output, output_size,
+           "已受理这次紧急报告：%s%s%s（紧急程度 %s）。%s。%s。"
+           "现在**还没有真正报警**：要等用户在询问框里确认之后板子才会报警。"
+           "请把这句话告诉用户并等他确认，不要再调用本工具，"
+           "也不要说已经报警成功。",
+           reason,
+           (detail[0] != '\0') ? "；补充：" : "",
+           detail,
+           high ? AI_TOOLS_LEVEL_HIGH
+                : (level_unknown ? AI_TOOLS_LEVEL_NORMAL
+                                   "（模型给的 level 不认识，已按 normal 处理）"
+                                 : AI_TOOLS_LEVEL_NORMAL),
+           ask_state, net_state);
+
+  return OK;
 }
 
 /**
@@ -290,6 +603,14 @@ static int ai_tools_provider_execute(const char *name, const char *input_json,
   if (name == NULL || output == NULL || output_size == 0)
     {
       return ERROR;
+    }
+
+  /* 紧急报告有自己的入口（参数多一个 level/detail，且要动界面），先分出去，
+   * 下面那段灯控的取值逻辑一行都不用改。 */
+
+  if (strcmp(name, AI_TOOL_REPORT_EMERGENCY) == 0)
+    {
+      return ai_tools_report_emergency(input_json, output, output_size);
     }
 
   if (strcmp(name, AI_TOOL_SET_LIGHT) != 0)
@@ -413,8 +734,8 @@ int ai_tools_provider_init(void)
 
   tool_registry_invalidate();
 
-  ai_tools_info("已注册 provider「%s」，工具 %s", AI_TOOLS_PROVIDER_NAME,
-                AI_TOOL_SET_LIGHT);
+  ai_tools_info("已注册 provider「%s」，工具 %s / %s", AI_TOOLS_PROVIDER_NAME,
+                AI_TOOL_SET_LIGHT, AI_TOOL_REPORT_EMERGENCY);
   return OK;
 
 #else

@@ -47,6 +47,7 @@
 /* #include "ai_checkin.h" */
 #include <string.h>
 #include <errno.h>      /* reminder_play_reason() 要按错误码说人话（-EBUSY / -EIO …） */
+#include <stdint.h>     /* uintptr_t：询问页那条超时看门狗线程要把 gen 当参数传 */
 #include <pthread.h>
 
 /* 语音后端（小米 MiMo，实现在 app/hello_app/mimo_voice.c）。
@@ -596,12 +597,12 @@ static void ui_post(int status, int face, const char *reply)
     }
 }
 
-/* 提醒弹窗 / 报警页 / 关报警 / 报错页：都是"建对象"，同样只能在 LVGL 线程做 */
+/* 提醒弹窗 / 报警页 / 关报警 / 报错页 / 询问页：都是"建对象"，同样只能在 LVGL 线程做 */
 
 typedef struct {
     char *a;        /* 标题 / 正文 */
     char *b;        /* 正文（提醒/报错才有第二个参数） */
-    int   kind;     /* 0=提醒 1=报警 2=关报警 3=报错 */
+    int   kind;     /* 0=提醒 1=报警 2=关报警 3=报错 4=弹询问页 5=撤询问页 */
 } ui_panel_msg_t;
 
 static void ui_apply_panel(void *arg)
@@ -612,6 +613,9 @@ static void ui_apply_panel(void *arg)
         case 0:  robot_ui_show_reminder(m->a, m->b); break;
         case 1:  robot_ui_show_alarm(m->a);          break;
         case 2:  robot_ui_close_alarm();             break;
+        /* 4/5：「检测到异常 → 先问一句」那一页（异常声响二次确认） */
+        case 4:  robot_ui_show_ask_alarm(m->a);      break;
+        case 5:  robot_ui_close_ask_alarm();         break;
         default: robot_ui_show_error(m->a, m->b);    break;
     }
 
@@ -660,6 +664,528 @@ static void ui_post_close_alarm(void)
 static void ui_post_error(const char *title, const char *content)
 {
     ui_post_panel(3, title, content);
+}
+
+/* 询问页（异常声响二次确认）：弹 / 撤，都只是"建控件"，同样投到 LVGL 线程 */
+static void ui_post_ask_show(const char *reason)
+{
+    ui_post_panel(4, reason, NULL);
+}
+
+static void ui_post_ask_close(void)
+{
+    ui_post_panel(5, NULL, NULL);
+}
+
+/* ==================== 「检测到异常 → 先问一句，确认了才报警」 ==================== */
+/*
+ * 用户拍板：异常声音**不直接报警** —— 先弹一页问一句，用户二次确认了才报警。
+ * 因为板子的屏幕现在可能是坏的/被拆下来的，"有人点屏幕"绝不能是报警的前提，
+ * 所以确认有三条路，谁先给出回答都算数：
+ *   ① 屏幕：询问页的两个按钮（robot_ui.c 建页面，回答回到 ask_btn_result_cb）
+ *   ② 网络：MQTT 下行 {"action":"confirm_alarm","confirm":true|false}
+ *          -> on_ai_command_received() 的分支 -> ui_post_ask_answer()
+ *   ③ 兜底：20 秒无人应答自动按「不用了」处理（ask_timeout_thread）
+ * 三条最后都收口到 ask_finish()：一处记账、一处决定报不报警，不会各走各的。
+ *
+ * 线程纪律：本节的入口可能在任意线程（声音检测线程 / network_task / hello_app），
+ * 所以只做"记账 + 投递"；界面动作一律 ui_post_*，真正的动作只在 LVGL 线程里的
+ * ask_finish() 里发生（三条入口都先投到 LVGL 线程）。
+ *
+ * 去重：同一时间只允许一条 pending 询问（新的来就丢弃并打日志，**不覆盖**）；
+ * 用户否认后同一原因在 ROBOT_ASK_ALARM_DENY_HOLD_MS（60 秒）内不再询问 ——
+ * "同一原因"按 ask_reason_key() 归一化后的**类别**算（置信度数字不参与比较，
+ * 否则同一个类每回都像新原因，静默期等于没有）。
+ *
+ * 报警去重：两条确认入口（屏幕/MQTT 与语音追问）都可能对同一次异常给出"确认"。
+ * 一次异常事件只允许报警一次，闸门是 robot_ui_alarm_claim()（见下面）。
+ */
+
+#define ASK_ALARM_POLL_MS   100     /* 超时看门狗线程的轮询粒度 */
+#define ASK_ALARM_REASON_MAX 96     /* 和 robot_ui.c 那边留的缓冲同量级就够 */
+#define ASK_ALARM_SRC_MAX    24
+
+/* 单调毫秒时钟。和摔倒链的 fall_now_ms() 同一个算法、同一个理由：不用
+ * lv_tick_get()，因为这里计时的是工作线程，不该受界面刷新节奏影响。 */
+static uint32_t ask_now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)((uint32_t)ts.tv_sec * 1000u + (uint32_t)(ts.tv_nsec / 1000000));
+}
+
+/* 把 reason 归一化成"比较用的类别键"：把尾部的置信度数字摘掉。
+ *
+ * 为什么必须归一化、而不能直接拿整条 reason 当 key（这就是那个"静默期永远失效"
+ * 的 bug 的根因）：屏幕上要显示置信度（"疑似跌倒撞击 87%"，演示时有用），可
+ * 置信度每次都不一样 —— 拿整条 reason 比，同一个类永远比不上，60 秒静默期就
+ * 形同虚设（用户点了"不用了"，同类异常照样反复弹框）。
+ * 所以：**显示照旧带数字，比较只看类别**。
+ *
+ * 认两种上游写法，都是 ai_companion_main.c 里原样传给 ui_post_ask_alarm() 的：
+ *   "疑似跌倒撞击 87%"          <- sound_event_cb（本地小模型，尾部 " NN%"）
+ *   "异常声音: 摔倒了 (0.87)"   <- sound_detect_callback（老检测器，尾部 " (0.NN)"）
+ * 两种都把尾部数字摘掉；别的形式（例如 MQTT 自测传进来的"玻璃碎声"）原样保留。 */
+static void ask_reason_key(const char *reason, char *out, size_t out_size)
+{
+    size_t n;
+    size_t end;
+    size_t i;
+
+    if (out == NULL || out_size == 0) {
+        return;
+    }
+    if (reason == NULL) {
+        out[0] = '\0';
+        return;
+    }
+
+    n = strlen(reason);
+    end = n;
+
+    if (n >= 3 && reason[n - 1] == ')') {
+        /* "…(0.87)"：从右往左走，括号里只允许数字和小数点 */
+        i = n - 1;
+        while (i > 0 && reason[i - 1] != '(') {
+            i--;
+            if (reason[i] != '.' && (reason[i] < '0' || reason[i] > '9')) {
+                break;
+            }
+        }
+        if (i > 0 && reason[i - 1] == '(' && i < n - 1) {
+            end = i - 1;
+        }
+    } else if (n >= 3 && reason[n - 1] == '%') {
+        /* "… 87%"：'%' 前面得是数字 */
+        i = n - 1;
+        while (i > 0 && reason[i - 1] >= '0' && reason[i - 1] <= '9') {
+            i--;
+        }
+        if (i < n - 1) {
+            end = i;
+        }
+    }
+
+    /* 数字前面那个空格也不算类别的一部分 */
+    while (end > 0 && reason[end - 1] == ' ') {
+        end--;
+    }
+
+    /* 整条都是数字（理论上不会有这种 reason）：那就别摘了，原样当 key 更安全 */
+    if (end == 0) {
+        end = n;
+    }
+
+    if (end > out_size - 1) {
+        end = out_size - 1;
+    }
+
+    memcpy(out, reason, end);
+    out[end] = '\0';
+}
+
+static pthread_mutex_t g_ask_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool            g_ask_pending = false;   /* 有一条询问在等回答（同一时间只允许一条）*/
+static char            g_ask_reason[ASK_ALARM_REASON_MAX];  /* 待回答那条问的是什么 */
+static unsigned        g_ask_gen = 0;           /* 每开始/结束一条 +1（超时线程据此作废）*/
+
+/* 用户否认的记忆：一条就够。两分钟内出现两种不同 reason 的异常声音极少见，
+ * 记多条要多一套淘汰逻辑，对一天工期的比赛没意义。
+ * 存的是 ask_reason_key() 归一化之后的**类别键**（没有置信度数字），
+ * 否则同一个类的置信度每次都不一样、这条静默期永远比不上。 */
+static char            g_ask_deny_reason[ASK_ALARM_REASON_MAX];
+static uint32_t        g_ask_deny_ms = 0;       /* 0 = 还没记过 */
+
+/* 回答的名字（日志里要能看出"确认 / 否认 / 作废"是三种不同的东西） */
+static const char *ask_answer_name(int confirmed)
+{
+    if (confirmed == 1) {
+        return "是的，报警";
+    }
+    if (confirmed == 0) {
+        return "不用了";
+    }
+    return "作废（页面让位）";
+}
+
+/* ==================== 报警去重闸：一次异常只报一次警 ==================== */
+/*
+ * 同一次异常现在有两条确认入口，用户拍板**两条都保留**：
+ *   ① 屏幕按钮 / MQTT confirm_alarm -> 本文件 ask_finish()（报 sound_abnormal）
+ *   ② 语音追问（hello_app 的 ask_flow_escalate：回答里出现"救命/疼"这类词）
+ *      -> 报 sound_emergency
+ * 两条都能确认，也都会各自报警：用户先在屏幕上点了「是的，报警」，再喊一句
+ * "救命"，同一次异常就被上报两遍（家人的手机上就是两条报警）。
+ *
+ * 做法（谁先执行谁置位，另一方放弃并打日志）：
+ *   - g_alarm_seq：事件序号，+1 就是"一次新事件的起点"。两处 +1：
+ *     ui_post_ask_alarm()（"有新异常要问一句"）和 alarm_claim(new_event=true)
+ *     （主菜单「紧急联系家人」—— 按下按钮本身就是一次新事件）。
+ *     三条确认路都在各自的序号之内。
+ *   - g_alarm_claimed_seq：这个序号已经被哪一路领走报警了。
+ *   领得到就执行，领不到就整块放弃（页面/铃声/上报都不做：赢家那一路已经全做过）。
+ * 序号一变闸门自动重开，所以这**不会**变成"一辈子只报一次警"。
+ *
+ * 线程纪律：几条路在不同线程（LVGL 线程 / hello_app 的 main_loop 任务），
+ * 判-记必须在同一把锁里做完，所以复用 g_ask_lock。
+ */
+
+static unsigned g_alarm_seq = 0;            /* 事件序号：每"一次新事件" +1 */
+static unsigned g_alarm_claimed_seq = 0;    /* 已被领走报警的序号（0 = 还没有）*/
+
+/* 领票（闸门的唯一实现）。new_event = true 表示"这是一次全新事件"：领票前先
+ * 把事件序号 +1 —— 序号一变，闸门自动重开（见上面那句"不会变成一辈子只报一次警"）。
+ *
+ * 为什么紧急呼叫必须走 new_event：g_alarm_claimed_seq 记的是**上一个**序号已经
+ * 报过警了；序号不换的话，几分钟前那次异常声响的记号会把老人刚按下的紧急呼叫
+ * 判成"已经报过了"而挡掉 —— 漏报比重复上报严重得多。这和 ui_post_ask_alarm()
+ * 里"新异常就是新事件"是同一条规矩。
+ * 反过来的情形也是对的：按下紧急呼叫时如果正挂着一条询问，序号一换，那条询问
+ * 随后的"确认"就领不到票了 —— 屏幕上报警页已经弹起来，同一次呼叫不该报两遍。 */
+static bool alarm_claim(const char *src, bool new_event)
+{
+    bool mine;
+
+    pthread_mutex_lock(&g_ask_lock);
+
+    if (new_event) {
+        g_alarm_seq++;
+    }
+
+    /* "还没有过任何事件"（g_alarm_seq == 0）时不设闸：没有事件序号就没法判断
+     * 谁和谁同一次，宁可多报一次也不能漏报（漏报是安全功能的失败）。 */
+    if (g_alarm_seq != 0 && g_alarm_claimed_seq == g_alarm_seq) {
+        mine = false;
+    } else {
+        g_alarm_claimed_seq = g_alarm_seq;
+        mine = true;
+    }
+
+    pthread_mutex_unlock(&g_ask_lock);
+
+    printf("[Alarm] 报警去重闸：%s（来源=%s，事件序号=%u）\n",
+           mine ? "本路执行报警" : "这次异常已经报过警了，本路放弃",
+           (src != NULL) ? src : "-", g_alarm_seq);
+
+    return mine;
+}
+
+/* ★ 跨模块入口（声明在 robot_ui.h，hello_app 那边弱声明）：
+ * 返回 true = 这次报警由本路执行；false = 另一条确认入口已经报过了，本路放弃。 */
+bool robot_ui_alarm_claim(const char *src)
+{
+    return alarm_claim(src, false);
+}
+
+/* ★ 报警动作的**唯一收口**：屏幕/MQTT 确认（ask_finish）、语音追问带来的确认、
+ *   主菜单「紧急联系家人」（emergency_call_handler）三条路都到这里 —— "报警页 +
+ *   警音 + MQTT + 手机推送"永远只有这一份实现，谁也不另写一条。
+ *
+ * 线程纪律：只在 **LVGL 线程**里跑（三个调用方都在这一条线程上）。里面没有任何
+ * 阻塞动作：ui_post_alarm 只是投递到下一拍、sm_handle_event 是纯内存、
+ * report_alarm_queued 只把消息拷进队列；真正出声、发 MQTT 都在各自的工作线程里
+ * （见 robot_ui.c 的 alarm_sound_worker）。
+ *
+ * 返回 true = 这次报警由本路执行；false = 别路已经报过了，本路只记日志。 */
+static bool alarm_escalate(const char *src, bool new_event,
+                           const char *alarm_type, const char *text)
+{
+    /* ① 去重闸：一次异常只报一次警。没领到票就整块放弃 —— 报警页、铃声、上报
+     *    三件事都不做，因为赢家那一路已经全做过了（要么是本函数下面那三步，
+     *    要么是 MQTT 的 start_alarm 那条路），再来一遍就是家人手机上两条报警。 */
+    if (!alarm_claim(src, new_event)) {
+        printf("[Alarm] %s：这次已经报过警了，本路不重复报警（只记这一行）\n", src);
+        return false;
+    }
+
+    /* ② 报警页 + 响铃 + MQTT(ui)：复用现成入口（robot_ui_show_alarm 内部就是
+     *    "先切页面 -> 请 hello_app 让路 -> alarm_trigger 出声 + 上报"）。 */
+    ui_post_alarm(text);
+
+    /* ③ 状态机：和"声音检测到异常"、"机主摔倒"同一条事件（不为此新增状态） */
+    if (g_ai_initialized) {
+        sm_handle_event(&g_sm_ctx, SM_EVENT_ALARM_DETECTED);
+    }
+
+    /* ④ MQTT + 手机 Bark：走既有通道（report_alarm_queued 内部已经带了一次
+     *    push_send_alarm，所以这里**不再**单独推一条）。上面 ② 那条上报的
+     *    type 是写死的 "ui"，这条才带真实原因。 */
+    if (report_alarm_queued(alarm_type, text) < 0) {
+        printf("[Alarm] MQTT 报警没入队（报警页和铃声不受影响）\n");
+    }
+
+    return true;
+}
+
+/* 结束一条询问：**唯一收口**，三条确认路最后都到这里。
+ * 只在 LVGL 线程里跑（入口都先投递），所以里面可以直接投界面动作。 */
+static void ask_finish(int confirmed, const char *src)
+{
+    char reason[ASK_ALARM_REASON_MAX];
+    char text[160];
+
+    pthread_mutex_lock(&g_ask_lock);
+
+    if (!g_ask_pending) {
+        pthread_mutex_unlock(&g_ask_lock);
+        printf("[Ask] 没有待回答的询问（来源=%s，回答=%s），忽略\n",
+               src, ask_answer_name(confirmed));
+        return;
+    }
+
+    snprintf(reason, sizeof(reason), "%s", g_ask_reason);
+    g_ask_pending = false;
+    g_ask_gen++;
+
+    /* 只有"用户明确否认/超时"才记静默期：-1（作废，页面被报警页顶掉）不记 ——
+     * 那不是用户的回答，记下去会让同一原因 60 秒内问不出来。
+     * 这里存的是**归一化之后的类别键**（置信度数字不进去），比较时同样归一化，
+     * 否则同一个类的置信度每次都不一样、这条静默期永远比不上（原 bug）。 */
+    if (confirmed == 0) {
+        ask_reason_key(reason, g_ask_deny_reason, sizeof(g_ask_deny_reason));
+        g_ask_deny_ms = ask_now_ms();
+    }
+
+    pthread_mutex_unlock(&g_ask_lock);
+
+    /* 不管哪种回答，询问页都不该再留在屏幕上 */
+    ui_post_ask_close();
+
+    if (confirmed == 1) {
+        printf("[Ask] ★ 用户确认报警（原因=%s，来源=%s）→ 走既有报警入口\n",
+               reason, src);
+
+        snprintf(text, sizeof(text), "检测到异常声响：%s", reason);
+
+        /* 去重闸 + 报警页 + 状态机 + 上报，四件事全在收口 alarm_escalate 里
+         * （和紧急呼叫走的是同一份实现，这里一个字都没有重写）。
+         * new_event = false：事件序号是 ui_post_ask_alarm() 那一步 +1 的，
+         * 本函数只是这一次事件里的一条确认路，不是新事件。
+         *
+         * 没领到票（语音追问那条路已经报过警了）就在收口里记一行日志收工 ——
+         * 报警页、铃声、上报三件事都不做，赢家那一路已经全做过了。 */
+        alarm_escalate(src, false, "sound_abnormal", text);
+    } else if (confirmed == 0) {
+        printf("[Ask] 确认未通过（原因=%s，来源=%s）：不报警；"
+               "同一原因 %u 秒内不再询问\n",
+               reason, src,
+               (unsigned)(ROBOT_ASK_ALARM_DENY_HOLD_MS / 1000));
+    } else {
+        /* -1：这一页被作废了（报警页要盖上来，询问页让位）——
+         * 既不算确认也不记静默期，只把待答状态清掉、页面撤下。 */
+        printf("[Ask] 询问作废（原因=%s，来源=%s）：页面让位，不记"
+               "「用户否认」\n", reason, src);
+    }
+}
+
+/* 询问页按钮的回答（robot_ui.c 在 **LVGL 线程**里回调过来）。
+ * 和 MQTT / 超时那两条路走同一个收口 ask_finish()，所以"点按钮"和"手机上确认"
+ * 的行为逐字一致。reason 参数不用：main.c 自己那份 g_ask_reason 才是权威
+ * （页面上的字符串是清洗过的显示副本）。 */
+static void ask_btn_result_cb(int confirmed, const char *reason, void *arg)
+{
+    (void)reason;
+    (void)arg;
+
+    if (confirmed == 1 || confirmed == 0) {
+        ask_finish(confirmed, "屏幕按钮");
+    } else {
+        /* -1：报警页上来时 robot_ui.c 让位（用户没点过任何按钮） */
+        ask_finish(-1, "报警页让位");
+    }
+}
+
+/* 待回答的回答消息（投递用）：回答 + 是谁给的（日志里要能看出哪条路生效了） */
+typedef struct {
+    int  confirmed;
+    char src[ASK_ALARM_SRC_MAX];
+} ui_ask_answer_msg_t;
+
+static void ui_apply_ask_answer(void *arg)
+{
+    ui_ask_answer_msg_t *m = (ui_ask_answer_msg_t *)arg;
+
+    ask_finish(m->confirmed, m->src);
+    free(m);
+}
+
+/* 非 LVGL 线程用：投一次"回答"（MQTT 下行 / 超时看门狗走这里）。
+ * 投到 LVGL 线程再处理的原因：ask_finish() 要撤页面（robot_ui_close_ask_alarm()
+ * 是建/删控件），跨线程碰 LVGL 会踩 rendering_in_progress 断言把 app 打死。 */
+static void ui_post_ask_answer(int confirmed, const char *src)
+{
+    ui_ask_answer_msg_t *m = malloc(sizeof(ui_ask_answer_msg_t));
+
+    if (m == NULL) {
+        printf("[Ask] 内存不够，这次的回答（%s，来源=%s）投不出去\n",
+               confirmed ? "是的，报警" : "不用了", src);
+        return;
+    }
+
+    m->confirmed = confirmed;
+    snprintf(m->src, sizeof(m->src), "%s", (src != NULL) ? src : "-");
+
+    if (ui_async_call(ui_apply_ask_answer, m) != LV_RESULT_OK) {
+        printf("[Ask] 回答投递失败（内存紧），丢弃一次\n");
+        free(m);
+    }
+}
+
+/**
+ * @brief  跨模块入口（声明在 hello_app 的 ai_sound_detect.h）：另一条确认路
+ *         （hello_app 的语音追问）对这次异常已经有结论了，询问页让位。
+ *
+ * 走的语义是「作废」（ask_finish(-1)，和「报警页要盖上来」同一条路）：撤页面，
+ * **既不报警、也不记「用户否认」的 60 秒静默期** —— 它不代表用户回答过任何东西。
+ * 所以这一路无论怎么调都变不成一次报警，也不会把同一原因的询问堵死。
+ *
+ * 与另一端（robot_ui_show_alarm() 登记 ai_companion_ask_abort()）合起来，就是
+ * 「先询问、二次确认后才报警」那两条入口的互斥：先有结论的那一路收尾时，
+ * 把另一路也撤掉，屏幕上永远只有一套在问、也只报一次警。
+ *
+ * 没有 pending 询问时是**空操作**（连日志都不打）：语音追问每一轮收尾都会调它。
+ * 任何线程可调（内部照旧投到 LVGL 线程）。
+ */
+void ui_post_ask_standdown(const char *src)
+{
+    bool pending;
+    const char *who = (src != NULL) ? src : "另一条确认路";
+
+    pthread_mutex_lock(&g_ask_lock);
+    pending = g_ask_pending;
+    pthread_mutex_unlock(&g_ask_lock);
+
+    if (!pending) {
+        return;
+    }
+
+    printf("[Ask] %s 已经有结论，询问页让位（不报警、不记否认）\n", who);
+
+    /* -1 就是「作废」：投到 LVGL 线程之后走 ask_finish(-1) 那一条路 */
+    ui_post_ask_answer(-1, who);
+}
+
+/* 超时看门狗：等到自己那条询问超时就按「不用了」处理。
+ * 为什么不用 lv_timer：那样计时精度取决于界面刷新节奏，而且**界面卡住时连
+ * "自动放弃"也一起卡住** —— 那正是要避免的"卡在询问页把演示拖死"。
+ * 本线程每 100ms 醒一次、只看两个变量；gen 变了（已有人回答 / 又开了新一条）
+ * 就自己收摊，不占用资源。 */
+static void *ask_timeout_thread(void *arg)
+{
+    unsigned gen = (unsigned)(uintptr_t)arg;
+    long waited = 0;
+
+    while (waited < (long)ROBOT_ASK_ALARM_TIMEOUT_MS) {
+        bool still;
+
+        usleep(ASK_ALARM_POLL_MS * 1000);
+        waited += ASK_ALARM_POLL_MS;
+
+        pthread_mutex_lock(&g_ask_lock);
+        still = g_ask_pending && (g_ask_gen == gen);
+        pthread_mutex_unlock(&g_ask_lock);
+
+        if (!still) {
+            return NULL;    /* 已经有人回答了（屏幕 / MQTT），本线程没用了 */
+        }
+    }
+
+    printf("[Ask] 询问超时（%u 秒无人应答），自动按「不用了」处理\n",
+           (unsigned)(ROBOT_ASK_ALARM_TIMEOUT_MS / 1000));
+
+    ui_post_ask_answer(0, "超时");
+    return NULL;
+}
+
+/* ★ 公开入口（声明在 robot_ui.h）：任何线程都能调 —— "检测到异常，先问用户一句"。
+ * 检测线程（app/hello_app 那边的声音事件识别）和云端工具都调它，
+ * 不需要关心界面到底弹没弹出来：屏幕坏了的时候本来就不该关心，
+ * MQTT 确认和 20 秒超时那两条路照样有效。 */
+void ui_post_ask_alarm(const char *reason)
+{
+    char reason_copy[ASK_ALARM_REASON_MAX];
+    char key[ASK_ALARM_REASON_MAX];
+    pthread_attr_t attr;
+    pthread_t tid;
+    unsigned gen;
+    uint32_t now;
+
+    if (reason == NULL || reason[0] == '\0') {
+        reason = "异常声响";
+    }
+
+    /* 中断上下文里不能做（要起线程、要取锁）—— 和 fall_alarm_trigger
+     * 那道 up_interrupt_context() 检查同一类原因 */
+    if (up_interrupt_context()) {
+        printf("[Ask] 在中断上下文里，不发起询问（要起线程）\n");
+        return;
+    }
+
+    /* 归一化成"类别键"：静默期比的是类别，不是带置信度的整条 reason */
+    ask_reason_key(reason, key, sizeof(key));
+
+    pthread_mutex_lock(&g_ask_lock);
+
+    /* ⓪ 事件序号 +1：**每一次"有新异常、要问一句"都是一次新事件**，包括这一次
+     *    因为"已经在问"或"刚被否认过"而丢掉的那种 —— 新异常就是新事件。
+     *    报警去重闸（robot_ui_alarm_claim）按这个序号开合：漏掉这一步，上一次
+     *    事件的"已报警"记号会把这一次真正的新异常一起挡住，报警就永远出不去了
+     *    （漏报比重复上报严重得多）。 */
+    g_alarm_seq++;
+
+    /* ① 已经在问一条了：**丢掉新的，不覆盖旧的**。覆盖会让"屏幕上问的问题"
+     *    和"被回答的那条"对不上：用户点的明明是 A，报出去的却是 B。 */
+    if (g_ask_pending) {
+        pthread_mutex_unlock(&g_ask_lock);
+        printf("[Ask] 已有一条询问在等回答（原因=%s），本次丢弃（原因=%s）\n",
+               g_ask_reason, reason);
+        return;
+    }
+
+    /* ② 同一原因刚被否认过：60 秒静默期里不再问第二遍。
+     *    比的是归一化之后的类别键（key）、不是带置信度的整条 reason ——
+     *    理由见 ask_reason_key() 上面那一段。 */
+    now = ask_now_ms();
+    if (g_ask_deny_ms != 0 &&
+        (uint32_t)(now - g_ask_deny_ms) < (uint32_t)ROBOT_ASK_ALARM_DENY_HOLD_MS &&
+        strcmp(g_ask_deny_reason, key) == 0) {
+        unsigned left = (unsigned)((ROBOT_ASK_ALARM_DENY_HOLD_MS -
+                                    (uint32_t)(now - g_ask_deny_ms)) / 1000);
+        pthread_mutex_unlock(&g_ask_lock);
+        printf("[Ask] 原因 %s 刚被用户否认过（类别键=%s），%u 秒内不再询问"
+               "（本次丢弃）\n", reason, key, left);
+        return;
+    }
+
+    snprintf(g_ask_reason, sizeof(g_ask_reason), "%s", reason);
+    g_ask_pending = true;
+    gen = ++g_ask_gen;
+    snprintf(reason_copy, sizeof(reason_copy), "%s", g_ask_reason);
+
+    pthread_mutex_unlock(&g_ask_lock);
+
+    printf("[Ask] 检测到异常，先问一句再决定报警：原因=%s"
+           "（%u 秒无人应答按「不用了」处理；MQTT confirm_alarm 也能回答）\n",
+           reason_copy, (unsigned)(ROBOT_ASK_ALARM_TIMEOUT_MS / 1000));
+
+    /* 弹页面 + 起超时看门狗。
+     *
+     * 注意这里**不看** robot_ui_bridge_is_ready() 那道闸门：屏幕这条路可能本来
+     * 就不通（屏坏了/被拆了），把 MQTT 和超时两条确认路一起掐掉才是错的。
+     * 界面还没起来时投进去只是排在队列里，等等级起来再画；真没界面，20 秒后
+     * 这条询问会按「不用了」自己收尾，不会永远挂着不让人再问。 */
+    ui_post_ask_show(reason_copy);
+
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&attr, 4096);
+
+    if (pthread_create(&tid, &attr, ask_timeout_thread, (void *)(uintptr_t)gen) != 0) {
+        printf("[Ask] 超时看门狗起不来：这条询问只能靠屏幕按钮 / MQTT 回答\n");
+    }
+
+    pthread_attr_destroy(&attr);
 }
 
 /* 一次语音请求失败 → 给老人看的一页。
@@ -1678,10 +2204,10 @@ static void on_ai_command_received(const char *action, const char *param)
          *
          * 四个取值 -> 界面（"状态栏"那一档 2026-09-14 已经删了，现在说的是主界面
          * 「AI 回复区」里那一行小字，见 robot_ui_set_status）：
-         *   "listening" 听   面板「我在听…」蓝 + 小字「在听…」蓝（顺手自动弹面板）
+         *   "listening" 听   面板「检测到声音」蓝 + 小字「在听…」蓝（顺手自动弹面板）
          *   "thinking"  想   面板「正在想…」橙 + 小字「在想…」橙 + 表情思考
          *   "speaking"  说   面板「正在说话…」绿 + 小字「在说…」绿（顺手自动弹面板）
-         *   "idle"      空闲 面板「直接说话就行，我在听」灰 + 小字「空闲」灰
+         *   "idle"      空闲 面板「录制中」灰 + 小字「空闲」灰
          *
          * thinking 原来借的是 ROBOT_STATUS_LISTENING（那时小字还没显示，靠表情区分
          * 就够）；2026-09-16 加了 ROBOT_STATUS_THINKING 这一档，主界面才能把
@@ -1694,7 +2220,7 @@ static void on_ai_command_received(const char *action, const char *param)
          * 面板没开着时 touch_ui_set_voice_state() 自己是空操作，不用先判断。 */
         if (strcmp(param, "speaking") == 0) {
             /* ⚠️ **不要**把 "listening" 放进来：hello_app 是开机自启的，它一启动就
-             * 进入"我在听"状态并推一条 listening —— 那样开机第一眼看到的就是语音
+             * 进入 listening 状态并推一条 listening —— 那样开机第一眼看到的就是语音
              * 面板，而不是主菜单（用户实测反馈："为什么一开机就是语音聊天页面？
              * 我希望看到主菜单"）。
              *
@@ -1811,6 +2337,46 @@ static void on_ai_command_received(const char *action, const char *param)
                    param, no ? "没有" : "有");
             fall_set_answer(no ? 0 : 1, "MQTT 自测");
         }
+    }
+    else if (strcmp(action, "confirm_alarm") == 0) {
+        /* ★ 询问页的**第二条确认路**（屏幕可能坏了/被拆下来，所以不能只靠屏幕）：
+         * 从 PC/手机往 zhi_ai/<client_id>/command 发
+         *   {"action":"confirm_alarm","confirm":true}   等价于点「是的，报警」
+         *   {"action":"confirm_alarm","confirm":false}  等价于点「不用了」
+         * 两种写法的归一（布尔 / 数字 / 字符串）在 on_mqtt_message_received() 里做，
+         * 到这里 param 通常是 "yes" / "no" / ""（没给 confirm 字段）。下面这一组
+         * 白名单是给"别的调用点直接调本函数"留的余地（同一条 chain 里也判一次），
+         * **不是**"非 no 即 yes"：认不出来的参数一律忽略并打日志，一条写错参数的
+         * 测试命令不该变成一次正式报警（和上面 fall_answer 同一条纪律）。
+         *
+         * 本回调跑在 network_task（MQTT 收包）线程里，所以回答也要投递到 LVGL 线程，
+         * 和屏幕上那两个按钮走同一个收口（ask_finish）——"点按钮"和"手机确认"
+         * 的结果逐字一致。 */
+        if (strcmp(param, "yes") == 0 || strcmp(param, "true") == 0 ||
+            strcmp(param, "1") == 0) {
+            printf("[Ask] MQTT 下行确认：是的，报警\n");
+            ui_post_ask_answer(1, "MQTT 下行");
+        } else if (strcmp(param, "no") == 0 || strcmp(param, "false") == 0 ||
+                   strcmp(param, "0") == 0) {
+            printf("[Ask] MQTT 下行否认：不用了\n");
+            ui_post_ask_answer(0, "MQTT 下行");
+        } else {
+            printf("[Ask] confirm_alarm 的 confirm 取值不认识（param=%s），忽略"
+                   "（只认 true/false、1/0、\"yes\"/\"no\"）\n",
+                   (param != NULL && param[0] != '\0') ? param : "-");
+        }
+    }
+    else if (strcmp(action, "ask_test") == 0) {
+        /* ★ 询问链的**上板自测入口**（和 fall_test 一个路子）：
+         *   {"action":"ask_test"}                    -> 用默认原因弹询问页
+         *   {"action":"ask_test","param":"玻璃碎声"}  -> 用 param 当原因
+         * 走的就是检测器将来调的那**同一个** ui_post_ask_alarm()，链路一模一样。
+         * 本回调在 network_task 线程里，而 ui_post_ask_alarm() 只记账 + 投递 + 起
+         * 一条 4KB 栈的看门狗线程，立刻返回，不会把 MQTT 那条线程拖住。 */
+        const char *why = (param != NULL && param[0] != '\0') ? param : "异常声响";
+
+        printf("[Ask] 自测触发（action=ask_test，原因=%s）\n", why);
+        ui_post_ask_alarm(why);
     }
     else if (strcmp(action, "light_on") == 0 || strcmp(action, "light_off") == 0) {
         /* 手动自检入口：不开语音、不接大模型也能把"说话 -> 发指令 -> 灯回执 ->
@@ -2069,19 +2635,36 @@ static void voice_chat_handler(void *user_data)
 }
 
 /**
- * 紧急呼叫回调 - 由触摸菜单 "紧急呼叫" 确认后触发
- * 发送 MQTT 报警 + 手机推送通知
+ * 紧急呼叫回调 - 由触摸菜单「紧急联系家人」确认后触发（touch_ui.c 的按钮回调，
+ * 所以本函数跑在 **LVGL 线程**：可以直接碰界面，但一个阻塞动作都不能做 ——
+ * 不收尾录音、不做阻塞式 HTTPS）。
+ *
+ * 走的是"检测到异常声响 → 用户确认报警"那**同一条**收口 alarm_escalate()：
+ * 报警页 + 警音 + 状态机 + MQTT + 手机 Bark 全在里面，本函数不另写报警动作。
+ * 出门之前只是把菜单那条死路（原来只发一次 MQTT + 一次推送，报警页和警音都不响）
+ * 接上这条真报警链路。
+ *
+ * new_event = true：老人按下这个按钮本身就是**一次全新事件**（和"检测到一声异常
+ * 声响"同级），所以事件序号要 +1 —— 否则上一次异常留下的"已报警"记号会把这次
+ * 呼叫判成"已经报过了"而挡掉。去重闸仍然生效：语音追问那条路如果已经报过警，
+ * 这里就只记一行日志（报警页/铃声/上报都不重复做）。
  */
 static void emergency_call_handler(void *user_data)
 {
-    printf("[Emergency] Sending emergency alarm\n");
+    (void)user_data;
 
-    /* MQTT 上报 */
-    report_alarm_queued("emergency", "老人按下紧急呼叫按钮");
+    printf("[Emergency] 紧急呼叫已确认 → 走既有报警入口（报警页 + 响铃 + 上报）\n");
 
-    /* 手机推送 */
-    push_send_alarm("emergency", "老人按下紧急呼叫按钮，请立即查看！");
+    if (!alarm_escalate("紧急呼叫", true, "emergency",
+                        "紧急呼叫：正在联系家人")) {
+        /* 没领到票：别路已经把这一次报过了，本路不再报第二遍（只记日志，见收口）。
+         * 主界面的表情/文案也不改：报警页马上就要上来，改了也看不见。 */
+        return;
+    }
 
+    /* 主界面的表情和回复区文案（报警页撤下之后老人还能看见这一句）。
+     * 手机推送已经在收口里的 report_alarm_queued() 里发过了（一次就够），
+     * 这里**不再**单独 push_send_alarm —— 那样家人的手机会收到两条一样的报警。 */
     robot_ui_set_face(ROBOT_FACE_WORRIED);
     robot_ui_set_ai_reply("已通知家人\n请保持镇静");
 }
@@ -2219,6 +2802,48 @@ static void on_device_state_received(const char *payload)
 
 /* ==================== MQTT 消息回调处理 ==================== */
 
+/* 从入站 JSON 里取 "confirm" 并归一成 "yes" / "no"（取不到或认不出来返回 NULL）。
+ *
+ * 为什么要这一步：询问页的确认用的是**布尔字段**
+ *   {"action":"confirm_alarm","confirm":true}
+ * 而 cJSON 里布尔项的 valuestring 是 NULL —— 下面按 "param" 取字符串的老写法
+ * 永远只能拿到空串，这条确认路就是死的。归一成 "yes"/"no" 之后，分发函数
+ * （on_ai_command_received）仍然只认 (action, param) 两个字符串，一行都不用改。
+ *
+ * 三种写法都认，手工用 mosquitto_pub 测试时方便：
+ *   true/false（JSON 布尔）、1/0（数字）、"yes"/"no"/"true"/"false"（字符串）。
+ * 认不出来 -> NULL，调用方按"参数不认识"忽略并打日志：一条写错参数的测试命令
+ * 不该变成一次正式报警（和 fall_answer 那条纪律一样）。 */
+static const char *confirm_field_to_yesno(const cJSON *root)
+{
+    const cJSON *c = cJSON_GetObjectItem(root, "confirm");
+
+    if (c == NULL) {
+        return NULL;
+    }
+
+    if (cJSON_IsBool(c)) {
+        return cJSON_IsTrue(c) ? "yes" : "no";
+    }
+
+    if (cJSON_IsNumber(c)) {
+        return (c->valuedouble != 0) ? "yes" : "no";
+    }
+
+    if (cJSON_IsString(c) && c->valuestring != NULL) {
+        if (strcmp(c->valuestring, "yes") == 0 || strcmp(c->valuestring, "true") == 0 ||
+            strcmp(c->valuestring, "1") == 0) {
+            return "yes";
+        }
+        if (strcmp(c->valuestring, "no") == 0 || strcmp(c->valuestring, "false") == 0 ||
+            strcmp(c->valuestring, "0") == 0) {
+            return "no";
+        }
+    }
+
+    return NULL;
+}
+
 /**
  * 处理来自 MQTT 的消息
  * 解析命令并转发给 AI 命令处理函数
@@ -2247,6 +2872,19 @@ static void on_mqtt_message_received(const char *topic, const char *payload)
 
     if (action && action->valuestring) {
         const char *param_str = (param && param->valuestring) ? param->valuestring : "";
+        char confirm_buf[8] = "";
+
+        /* confirm_alarm 的答案在 "confirm" 字段上（不是 param）：先归一成
+         * "yes"/"no" 再往下走，分发函数那边一行都不用改。 */
+        if (strcmp(action->valuestring, "confirm_alarm") == 0) {
+            const char *yesno = confirm_field_to_yesno(root);
+
+            if (yesno != NULL) {
+                snprintf(confirm_buf, sizeof(confirm_buf), "%s", yesno);
+                param_str = confirm_buf;
+            }
+        }
+
         on_ai_command_received(action->valuestring, param_str);
     }
 
@@ -3950,6 +4588,12 @@ int main(int argc, char *argv[])
      * "回答是哪个"过来；真正的动作在摔倒链的工作线程里做（本回调跑在 LVGL
      * 线程里，里面只置标志，见 fall_answer_btn_cb）。 */
     touch_ui_set_fall_answer_cb(fall_answer_btn_cb, NULL);
+
+    /* ===== 异常声响「询问是否报警」页的回答（是的，报警 / 不用了）=====
+     * 面板本身是 robot_ui 的（robot_ui_show_ask_alarm），点下去只回调"回答是哪个"
+     * 过来；报不报警、以及"同一原因 60 秒内不再问"的记账都在 ask_finish() 里。
+     * 回调跑在 LVGL 线程里，里面不做耗时的事（只投递），见 ask_btn_result_cb。 */
+    robot_ui_set_ask_result_cb(ask_btn_result_cb, NULL);
 
     /* ===== 注册提醒的到点回调 ===== */
     /* 必须在添加提醒之前注册：注册完下面 touch_ui_add_reminder() 会立刻

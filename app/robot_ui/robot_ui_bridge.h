@@ -57,7 +57,7 @@
  * 取值顺序和 touch_voice_state_t 一一对应，实现里只做一次映射。 */
 typedef enum
 {
-  ROBOT_UI_BRIDGE_VOICE_IDLE = 0,   /* 空闲：直接说话就行 */
+  ROBOT_UI_BRIDGE_VOICE_IDLE = 0,   /* 空闲（面板那行显示「录制中」） */
   ROBOT_UI_BRIDGE_VOICE_LISTENING,  /* 正在听用户说话 */
   ROBOT_UI_BRIDGE_VOICE_THINKING,   /* 送 ASR / 等大模型 */
   ROBOT_UI_BRIDGE_VOICE_SPEAKING    /* TTS 正在出声 */

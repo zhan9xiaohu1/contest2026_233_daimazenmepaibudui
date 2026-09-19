@@ -9,6 +9,8 @@
  ****************************************************************************/
 
 #include <nuttx/config.h>
+#include <nuttx/semaphore.h>   /* nxsem_reset：收掉私有心跳多出来的那次 post */
+#include <nuttx/wdog.h>        /* 私有心跳：让路线程的等待，见 yield_worker_wait */
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -23,6 +25,7 @@
 #include "ai_audio.h"
 #include "ai_llm.h"
 #include "ai_sound_detect.h"
+#include "sound_event.h"
 #include "ai_care.h"
 #include "ai_network.h"
 #include "ai_network_config.h"
@@ -192,6 +195,27 @@ static bool g_net_started;
 
 static volatile bool g_listen_wanted;
 
+/* 「本 app 已经在跑」标记。**file-static，单一大镜像（CONFIG_BUILD_FLAT）里
+ * 只有一份**，所以开机自启那次置上之后，再从 NSH 敲一次 ai_companion 也看得见。
+ *
+ * 为什么必须有它：本 app 同时是 NSH 命令，而 main() 一进来就会把**整条**初始化
+ * 链路再走一遍（sm_init / audio_init / kws_init / 声音检测 / 关怀 / 网络 /
+ * 工具注册 / 开麦）。这些"初始化"写的都是共享 static（g_sm_ctx / g_audio_ctx /
+ * g_sound_ctx ...），第二个实例头一步就把正在跑的那个实例的上下文 memset 掉；
+ * 那个实例的录音线程随即判定自己"已被新一代接管"，走 ai_audio.c 的 stale 收尾
+ * ——只退出，**不 stop 也不 close**；板级那份全局录音会话于是成了"持有线程已消失"
+ * 的形态，第二个实例的 audio_in_start() 正好照"残留自愈"把它抢了过去。
+ * 结果是同一个半双工设备上出现**两个 read 客户端**。驱动那边 priv 是单实例，
+ * rx_sem / rx_busy / RX 的 DMA 武装都只有一份，而 DMA 只可能指向"最后一次 read
+ * 交进来的那个 buffer" —— "一次 read 一次武装一次 post" 的配对就此散掉，另一条
+ * read 只能靠它自己那 5 秒超时收场。真机就在这条路上崩了，断言是
+ * sem_waitirq.c:137；驱动自己早就把这条断言记成这套等待方式的已知风险
+ * （sf32lb52_audio.c:3471 "若将来还见到 sem_waitirq 那条断言…"）。
+ *
+ * 所以第二次启动一律不初始化，只把参数交给调试入口（--sounddetect）。 */
+
+static volatile bool g_app_inited;
+
 /****************************************************************************
  * Private Data
  ****************************************************************************/
@@ -319,6 +343,9 @@ static void print_usage(const char *program)
   printf("  --ask-self-test       注入一条假的异常声，跑一遍追问流程\n");
   printf("  --client-id <ID>      MQTT 客户端 ID（默认 %s）\n",
          AI_DEFAULT_MQTT_CLIENT_ID);
+  printf("  --sounddetect <子命令> [n]\n"
+         "                        任务四门控调试：status（打印统计）/\n"
+         "                        on / off / sensitivity <n>（默认 1.0，越大越敏感）\n");
   printf("  --help                显示帮助\n");
 }
 
@@ -364,7 +391,7 @@ static const char *voice_state_probe(sm_context_t *ctx)
       return VOICE_STATE_SPEAKING;
     }
 
-  /* 正听到人说话，或追问流程在限时等回答 = 我在听。
+  /* 正听到人说话，或追问流程在限时等回答 = 界面上的「检测到声音」那一档。
    * 追问那条链路在等回答期间状态机可能还停在上一轮的 AI_TALKING
    * （要等 ask_flow_finish() 才补 AI_RESPONSE），所以这里要排在状态机前面。 */
 
@@ -751,6 +778,95 @@ static void kws_wake_tick(sm_context_t *ctx)
   speech_capture_begin(ctx);
 }
 
+/****************************************************************************
+ * 任务四：麦克风 PCM 旁路 → 人声/非人声门控（接线）
+ *
+ * 门控线程（ai_sound_detect.c 里，独立低优先级）每 200ms 判一个 0.64s 窗：
+ *   人声 → 这里只置一个标志，主循环 100ms 心跳收走，复用**现有**的云端
+ *          语音入口（speech_capture_begin：VAD/唤醒词那条路，后面就是
+ *          ASR → mimo_chat 云端大模型），不另造一条；
+ *   非人声异常 → 门控线程直接喂 sound_event_feed()（本地小模型，任务三）；
+ *   播放中 → 门控自己整窗跳过（判据是本文件给的 gate_busy_pred）。
+ *
+ * ★ 为什么"人声"这一步要绕一圈标志，而不是在门控线程里直接
+ *   speech_capture_begin()：那个函数会写 g_speech_capturing / 推状态机，
+ *   而它们的主人是录音线程和主循环（见 vad_callback 那一节的并发说明）。
+ *   从第三条线程伸手进去改，等于把"谁在收尾/谁在清零"那套时序打散 ——
+ *   本文件已经为这个坑付过代价（追问流程和唤醒词都只在主循环里推）。
+ ****************************************************************************/
+
+static volatile bool  g_gate_voice_hint;
+static volatile float g_gate_voice_ac;
+static volatile float g_gate_voice_zcr;
+
+/**
+ * @brief  门控线程里的人声回调（**跑在门控线程，只许置标志**）
+ */
+
+static void gate_voice_cb(const sound_gate_features_t *f, void *arg)
+{
+  (void)arg;
+
+  if (f == NULL)
+    {
+      return;
+    }
+
+  g_gate_voice_ac  = f->ac_peak;
+  g_gate_voice_zcr = f->zcr;
+  g_gate_voice_hint = true;
+}
+
+/**
+ * @brief  播放/忙判据（门控线程里调，必须极快）
+ *
+ * 板子自己喇叭出声时返回 true → 门控整窗不判。半双工下播放期间录音本来就停，
+ * 这里兜的是"停之前已经灌进环形缓冲的那几帧"（历史误报：自己的 TTS 被当成异常声）。
+ */
+
+static bool gate_busy_pred(void *arg)
+{
+  (void)arg;
+  return audio_is_playing(&g_audio_ctx);
+}
+
+/**
+ * @brief  人声提示的心跳（只在主循环里跑，每 100ms 一次）
+ */
+
+static void gate_voice_tick(sm_context_t *ctx)
+{
+  if (!g_gate_voice_hint)
+    {
+      return;
+    }
+
+  g_gate_voice_hint = false;
+
+  /* 正忙就丢弃：和 kws_wake_tick / listen_supervise_tick 的判据一致
+   * （喇叭在响 / 送 ASR / 追问中都不打断，而且这时候 VAD 正在收同一段音频） */
+
+  if (audio_is_playing(&g_audio_ctx) ||
+      g_ask_phase != ASK_PHASE_IDLE ||
+      sm_get_state(ctx) == SM_STATE_AI_TALKING)
+    {
+      printf("[门控] 判到人声，但当前正忙（AITalking/播报/追问），丢弃\n");
+      return;
+    }
+
+  if (g_speech_capturing)
+    {
+      return;    /* VAD 已经在收这段话了，不用再喊一次 */
+    }
+
+  printf("[门控] 判到人声 (ac=%.2f zcr=%.2f) → 交给云端语音链路\n",
+         (double)g_gate_voice_ac, (double)g_gate_voice_zcr);
+
+  /* 复用现有入口：和 VAD「检测到有人开始说话」逐字相同的下一步 */
+
+  speech_capture_begin(ctx);
+}
+
 /**
  * @brief  初始化音频并启动VAD监听
  */
@@ -1000,6 +1116,8 @@ static volatile bool     g_mic_hold_forced;
 
 static pthread_t         g_yield_worker;
 static sem_t             g_yield_worker_sem;
+static struct wdog_s     g_yield_worker_wdog;   /* 让路线程那片等待的私有心跳 */
+static volatile bool     g_yield_worker_wake_to;/* 这次醒是心跳到点叫的（不是有人 post）*/
 static volatile bool     g_yield_worker_up;
 static bool              g_yield_worker_created;
 static volatile uint32_t g_yield_worker_beat_ms;
@@ -1784,6 +1902,25 @@ static void mic_hold_deadline_check(void)
 }
 
 /**
+ * @brief  让路线程那片等待的心跳到点了
+ *
+ * 与 sf32lb52_audio.c 的 rx/tx_wait_wdog、sf32lb52_alarm.c 的 wake_wdog 一致：
+ * 跑在 systick 中断里，只做两件**与 TCB 无关**的事 —— 立 wake_to 旗（告诉让路线程
+ * 这次是到点了）＋ **无条件** post 一次信号量。★ 必须无条件：这记心跳就是"到点叫醒
+ * 自己去读一次请求电平"的那一下，一旦加上条件，等待就没有上界了。
+ * **不打日志**（中断里碰串口会抢控制台锁把整机挂住）。
+ */
+
+static void yield_worker_wait_timeout(wdparm_t arg)
+{
+  (void)arg;
+
+  g_yield_worker_wake_to = true;
+
+  (void)nxsem_post(&g_yield_worker_sem);
+}
+
+/**
  * @brief  等一次让路线程的唤醒（最多 YIELD_WORKER_WAIT_MS 毫秒）
  *
  * 为什么是"带超时的等"而不是死等 sem_wait()：信号量只是**快路径** —— 
@@ -1791,26 +1928,37 @@ static void mic_hold_deadline_check(void)
  * 及时受理绝不靠它**：主循环被 ASR/TTS 占住时没人来 post，靠的就是这个超时把
  * 本线程叫醒、自己去读一次请求电平。所以这个超时值就是方案对外的时延上限。
  *
- * 时钟被校时（SNTP）跳坏不会让请求丢掉：sem_post 一进来 sem_timedwait 立刻返回
- * （它有"已挂着的信号量先拿"这条语义），绝对时间只影响空转时下一次醒来的时刻 ——
- * 最坏是早醒/晚醒一会儿，不会漏请求。
+ * 为什么不再用内核的 sem_timedwait（2026-09-19 定案）：那条路是内核定时等待的超时
+ * 与别人的 sem_post 抢同一份 TCB 字段（rtcb->waitdog / rtcb->waitobj），本板临界区
+ * 是 BASEPRI 型（dump 里 BASEPRI=0x80）挡不住优先级 0 的异常，真机上抓到的断言正是：
+ *     ASSERT sem_waitirq.c:137  task robot_ui
+ *     nxsem_wait_irq <- nxsem_timeout <- wd_timer <- timer_callback <- systick_interrupt
+ * 本函数等待的 g_yield_worker_sem，正是由**主循环那条线程**（mic_hold_tick /
+ * mic_hold_watchdog_tick）post 的 —— 形状与已修好的音频 read/write、报警出声那三处
+ * 完全一样，所以这里也换成同一套私有心跳：心跳从不读也不写 TCB，那条断言路径在这条
+ * 等待上不会被走到；而心跳是本文件私有的一记普通看门狗，别人 post 取消不了它，
+ * 所以 YIELD_WORKER_WAIT_MS 是真的上界。
+ *
+ * 代价与老实现等价：SNTP 跳时钟不会再影响这次的等待（心跳走的是 tick，本来就与
+ * 绝对时间无关），而 sem_post 一进来照样立刻返回（"已挂着的信号量先拿"这条语义不变）。
+ * 返回值本来就是 void、调用方也不看，所以只保留"最多等这么久"这一条语义。
  */
 
 static void yield_worker_wait(void)
 {
-  struct timespec ts;
-  int ret;
+  g_yield_worker_wake_to = false;
 
-  clock_gettime(CLOCK_REALTIME, &ts);
-  ts.tv_nsec += (long)YIELD_WORKER_WAIT_MS * 1000000L;
-  ts.tv_sec  += ts.tv_nsec / 1000000000L;
-  ts.tv_nsec %= 1000000000L;
+  (void)nxsem_reset(&g_yield_worker_sem, 0);
 
-  do
-    {
-      ret = sem_timedwait(&g_yield_worker_sem, &ts);
-    }
-  while (ret < 0 && errno == EINTR);
+  (void)wd_start(&g_yield_worker_wdog, MSEC2TICK(YIELD_WORKER_WAIT_MS),
+                 yield_worker_wait_timeout, (wdparm_t)0);
+
+  (void)nxsem_wait_uninterruptible(&g_yield_worker_sem);
+
+  /* wd_cancel 对已经到点的心跳只返回 -EINVAL：那正是 wake_to 为真的那一刻。
+   * 多出来的那一次 post 由下一次进本函数开头的 nxsem_reset 收掉。 */
+
+  (void)wd_cancel(&g_yield_worker_wdog);
 }
 
 /**
@@ -2122,6 +2270,34 @@ static void mic_hold_tick(void)
 
 #define LISTEN_SUPERVISE_FORCE_MS  45000
 
+/* 【2026-09-19 新加】"会话活着、但录音线程已经卡在设备调用里"的判据（毫秒）。
+ *
+ * 为什么需要它：真机上"录音跑一阵就永久停摆"的那种形状，**录音标志全健康**
+ *   （rec=1 / ract=1 / died=0 / exit=0），下面那条 audio_record_is_active() 早退
+ *   永远命中，守护一眼都看不到它。唯一看得见它的是录音线程自己写下的那个量：
+ *   diag 里的 wait（= 这一次 audio_in_read() 已经等了多久）一路涨到 117986 ms，
+ *   而驱动那一次等满本来只有 5 秒硬上界（SF32LB52_AUDIO_RX_READ_TIMEOUT_MS）、
+ *   串口 dump 的栈也证实它就卡在 sf32lb52_audio_read() 里的那次等待上
+ *   （`nxsem_clockwait_slow ← sf32lb52_audio_read+0x587`，
+ *   原文见 _flash/gate_status.txt 的 sched_dumpstack [28]）：
+ *   内核那记定时等待的超时被 DMA 中断抢掉之后就**再也不会回来**，
+ *   而且 rxt（等待超时次数）恒 0 —— 驱动里那套按超时触发的分级恢复一次都没跑。
+ *
+ * 取值 8 秒 = 那个硬上界 × 1.6，两边都交代：
+ *   - 正常一帧 20 ms；驱动最坏等满一次 5 秒。8 秒在正常路径上**不可能**出现
+ *     （连"连续 5 次超时"那种粘住形态也不会：那种情况下驱动会正常返回 -110、
+ *     wait 每次都在 5 秒内归零，而 empty/lres 会如实报出来）；
+ *   - 又不能取太接近 5 秒：5 秒到点那一下、加上读回来的收尾和调度抖动，
+ *     要留足余量，免得把"刚好赶在超时边上"的正常帧误判成卡死。
+ *
+ * ★ 判据只用这一个量，**不带任何由别的模块维护的豁免条件**（这是 2026-09-15
+ *   那次教训的直接产物：当时那条"数据流看着像死了"的判据被自己的豁免项
+ *   ——状态机不是 AI_TALKING——永久关掉了，反而造出它本来要防的"永久聋"）。
+ *   合法地"不在读"的形状（让路 / TTS 出声 / 手动停麦）这里天然安全：
+ *   那时会话已经被停掉，audio_record_is_active() 是假，判据根本不成立。 */
+
+#define LISTEN_SUPERVISE_RX_STALL_MS  8000
+
 /* 失败日志节流：前 5 次每次都打（开头几次最需要看见），之后每 10 次一条 */
 
 #define LISTEN_SUPERVISE_LOG_FIRST      5
@@ -2162,11 +2338,20 @@ static uint32_t g_listen_last_try_ms;      /* 上一次真去重开录音的那�
  *   ctx->record_died（异常中断）不等任何时间 —— 只要是"下一拍"就能重开
  *   （只留一道"两次重开至少隔 1.8 秒"的防抖，防止设备一起来就死时高频开关设备）。
  *
- * 判据只有这两条（活着 / 死了），不做任何"数据流看着像死了"的推断：录音线程
+ * 判据原来只有两条（活着 / 死了），不做任何"数据流看着像死了"的推断：录音线程
  * 卡在 read 里、标志却全健康的那种形状，这里是**看不见**的 —— 那正是不该在
- * 应用层拿一堆时间戳去猜的事（2026-09-15 试过，判据本身会把恢复永久挡死），
- * 该由"录音不活跃"这条最朴素的路兜，观测手段留在 diag 的 idle/wait 两栏里。
- */
+ * 应用层拿一堆时间戳去猜的事（2026-09-15 试过，判据本身会把恢复永久挡死）。
+ *
+ * ★ 2026-09-19 补上第三条：**"活着但卡死在设备读里"**（真机上就是这么聋的 ——
+ *   ract=1 / died=0，而 diag 的 wait 涨到 117986 ms、驱动 read 计数一动不动、
+ *   等待超时计数恒 0）。判据只用录音线程自己写下的那一个量（这一次 read 等了
+ *   多久 ≥ LISTEN_SUPERVISE_RX_STALL_MS），**不带任何由别的模块维护的豁免条件**
+ *   —— 2026-09-15 那次之所以"判据把恢复永久挡死"，正是因为它的豁免项
+ *   （状态机不是 AI_TALKING）是个无上界的布尔量。这里的判据没有任何豁免项，
+ *   合法地"不在读"的形状（让路 / 出声 / 手动停麦）天然不满足
+ *   audio_record_is_active()，所以不会被它挡住，也不会误伤。
+ *   命中之后走的是既有的紧急重开（同一套 1.8 秒防抖 + 退避），只多一步"先停
+ *   掉那一次卡住的会话"。 */
 
 static void listen_supervise_tick(sm_context_t *ctx)
 {
@@ -2175,6 +2360,8 @@ static void listen_supervise_tick(sm_context_t *ctx)
   bool     stale;
   bool     urgent;
   bool     locked;
+  bool     stalled;
+  int      rx_wait;
   int ret;
 
   if (!g_running || !g_listen_wanted || g_mic_hold_active || g_mic_device_busy)
@@ -2197,7 +2384,22 @@ static void listen_supervise_tick(sm_context_t *ctx)
       return;
     }
 
-  if (audio_record_is_active(&g_audio_ctx))
+  /* ---- 【2026-09-19 新加】"会话活着、设备读却再也不回来"那种永久聋 -------
+   *
+   * 真机形状（本轮定案）：录音标志全健康，但录音线程卡在 sf32lb52_audio_read()
+   * 里那次等待上再也出不来（内核定时等待的超时被 DMA 中断抢掉，之后这一次等待
+   * 彻底没有上界）。唯一看得见它的量是录音线程自己写下的 record_read_start_ms
+   * 的年龄 —— 就是 diag 里那个 wait。判据和理由（为什么 8 秒、为什么不带任何
+   * 别人维护的豁免项）写在 LISTEN_SUPERVISE_RX_STALL_MS 头顶那一段。
+   *
+   * 会话真被停掉/正在停（record_stop 置位）时 read_start_ms 也会被下面那条
+   * 早退挡掉：audio_record_is_active() 为假，判据不成立。 */
+
+  rx_wait = audio_record_wait_ms(&g_audio_ctx);
+  stalled = audio_record_is_active(&g_audio_ctx) &&
+            rx_wait >= (int)LISTEN_SUPERVISE_RX_STALL_MS;
+
+  if (!stalled && audio_record_is_active(&g_audio_ctx))
     {
       /* 录音还活着（设备已 START 且线程没退出）：把重试状态复位 */
 
@@ -2249,6 +2451,21 @@ static void listen_supervise_tick(sm_context_t *ctx)
       g_audio_ctx.record_died = false;
       printf("[监听守护] 录音线程异常中断（不是我们要停的那种），会话已死，"
              "不等状态机那 10/30 秒超时\n");
+    }
+
+  /* 【2026-09-19 新加】卡在设备读里的会话，对守护来说同样是"会话已死"（它再也
+   * 不会给数据），但**不能**直接复用下面那条"直接开麦"的路：那一次会话还占着
+   * 设备（recording 还是 true），audio_record_start() 见到它会立刻 -EBUSY
+   * （现场日志就是 `AUDIO_IN: 录音设备仍被线程 N 占用` + `启动录音失败: -16`，
+   * 于是退避重试永远失败、麦克风永远回不来）。所以这里只置 died（拿到"不等
+   * 状态机超时"的紧急重开资格），真正停设备那一下放在重开的动作之前。 */
+
+  if (stalled)
+    {
+      printf("[监听守护] 录音线程卡在设备读里 %d ms（驱动一次等满只有 5 秒上界，"
+             "说明那次等待的超时丢了）：判定这一次会话已死，停掉再重开\n",
+             rx_wait);
+      died = true;
     }
 
   /* 正忙：不排重试，也不动退避（退避要按"设备到底能不能起来"算）。
@@ -2358,10 +2575,14 @@ static void listen_supervise_tick(sm_context_t *ctx)
     }
 
   if (g_mic_hold_active || !g_listen_wanted || g_mic_device_busy ||
-      audio_record_is_active(&g_audio_ctx))
+      (audio_record_is_active(&g_audio_ctx) && !stalled))
     {
       /* 等锁期间状态又变了（真让路 / 又开始收尾 / 设备被别人占了），
-       * 这一拍不动设备 —— 理由和函数开头那条早退一样。 */
+       * 这一拍不动设备 —— 理由和函数开头那条早退一样。
+       *
+       * 唯一的例外是 stalled（卡在设备读里的那一次会话）：它当然"活着"
+       * （audio_record_is_active 为真），但我们这一拍就是要把它收掉的，
+       * 所以不拿它当"设备被别人占着"看。 */
 
       if (locked)
         {
@@ -2375,6 +2596,26 @@ static void listen_supervise_tick(sm_context_t *ctx)
    * （1.8s 起翻倍），不会每一拍都来敲一次设备。 */
 
   g_listen_dead_since = 0;
+
+  /* 【2026-09-19 新加】上面判定的"卡在设备读里"：那一次会话还占着设备，
+   * 直接开麦必然 -EBUSY（现场日志的证据），所以先把它停掉。
+   *
+   * 这一次 stop 为什么是确定会返回的：audio_in_stop() 里的 AUDIOIOC_STOP 会走到
+   * hw_stop()，而 hw_stop() **无条件** post 一次 rx_sem 并作废会话代号；那一次
+   * read 自己还有 5 秒硬上界（本轮把它做成私有看门狗了，见驱动的 rx_wait_wdog），
+   * 所以随后的 join 有界 —— 卡住的那条线程一定出得来。
+   * 只调 audio_record_stop()（不是 stop_audio_listening()）：后者会把
+   * g_listen_wanted 收掉，而本函数就是在"要常听"的前提下跑的，收掉它这一拍
+   * 后面所有守卫都会把自己挡回去（也让下次守护重开前要等更久）。 */
+
+  if (stalled)
+    {
+      printf("[监听守护] 先停掉卡住的那一次录音会话（wait=%d ms）\n", rx_wait);
+
+      audio_record_stop(&g_audio_ctx);
+      audio_vad_disable(&g_audio_ctx);
+      g_audio_started = false;
+    }
 
   /* 重开之前清场：上一段会话可能死在"人正说话"中间，g_speech_capturing
    * 还挂着 true、g_speech_buf 里有半截累积语音，不清掉的话下一次进 ASR 的
@@ -2596,7 +2837,145 @@ static void sound_detect_callback(sound_type_t type, float confidence,
 
   printf("[追问] 已排入追问流程 (类型=%s, 置信度=%.2f)\n",
          sound_detect_get_type_name(type), confidence);
+
+  /* 4. 弹「是否报警？」询问框（任务四）：
+   *    回调里**不直接报警**，先请界面问一句。这个入口由 robot_ui 提供
+   *    (ui_post_ask_alarm)，任何线程可调，它自己投到 LVGL 线程；还没落地时
+   *    ai_sound_detect.c 里的弱实现只打一行串口（见 ai_sound_detect.h 末尾）。
+   *    原来的「追问流程」保留：它问的是同一件事的另一半（语音确认），
+   *    两者一个走界面、一个走喇叭，谁先落地都不影响另一条。 */
+
+  {
+    static char gate_reason[64];
+
+    snprintf(gate_reason, sizeof(gate_reason), "异常声音: %s (%.2f)",
+             sound_detect_get_type_name(type), (double)confidence);
+    ui_post_ask_alarm(gate_reason);
+  }
 }
+
+#ifdef CONFIG_HELLO_APP_SOUND_EVENT
+
+/* 本地小模型（sound_event）命中回调的兜底阈值。
+ * 模型自己已经做了 3/4 投票 + 每类阈值 + 同类 8s 不应期（sound_event.c 的
+ * se_postprocess，阈值 0.60/0.70/0.70），这里只加一道很低的保底，
+ * 防的是将来有人把模型阈值调松之后误报直接冒到界面上。 */
+#define SOUND_EVENT_MIN_CONF 0.50f
+
+/**
+ * @brief  本地小模型（摔倒 / 敲击 / 尖叫）命中回调
+ *
+ * ⚠️ 本函数在 ai_sound_detect.c 的**门控线程**里同步执行（门控线程 →
+ * sound_event_feed() → se_postprocess() → 这里），低优先级、还拿着门控那把锁。
+ * 所以这里只做「过滤 + 防抖 + 投递」，**绝不碰 LVGL 控件**：要问用户一句
+ * 一律走 ui_post_ask_alarm()，它自己投到 LVGL 线程（见 robot_ui/main.c）。
+ *
+ * 和 sound_detect_callback() 同一套口径：过滤 → 防抖 → 排入既有追问流程
+ * （g_ask_phase），最后用 ui_post_ask_alarm() 弹「是否报警？」询问框。
+ * 这里**不报警**：用户二次确认之后才真报警。
+ */
+
+static void sound_event_cb(int cls, float conf, void *arg)
+{
+  static uint32_t last_ms[SOUND_EVENT_SCREAM + 1];
+  sound_type_t type;
+  const char *what;
+  char reason[64];
+  uint32_t now;
+
+  (void)arg;
+
+  /* other 一律不上报；越界的类号也丢掉 */
+
+  if (cls <= SOUND_EVENT_OTHER || cls > SOUND_EVENT_SCREAM)
+    {
+      return;
+    }
+
+  if (conf < SOUND_EVENT_MIN_CONF)
+    {
+      printf("[门控] 本地小模型 %s 置信度 %.2f 低于保底 %.2f，丢弃\n",
+             sound_event_class_name(cls), (double)conf,
+             (double)SOUND_EVENT_MIN_CONF);
+      return;
+    }
+
+  /* 别把喇叭自己放出来的声音当异常：放音期间麦克风已经停了（见
+   * audio_play_start），这里兜住"停之前已经灌进门控环形缓冲的那几帧"。 */
+
+  if (audio_is_playing(&g_audio_ctx))
+    {
+      printf("[门控] 正在放音，忽略本地小模型这次命中（%s %.2f）\n",
+             sound_event_class_name(cls), (double)conf);
+      return;
+    }
+
+  /* 已经有一轮追问在跑：不叠加，也不排队 */
+
+  if (g_ask_phase != ASK_PHASE_IDLE)
+    {
+      printf("[门控] 追问流程进行中，忽略本地小模型这次命中（%s %.2f）\n",
+             sound_event_class_name(cls), (double)conf);
+      return;
+    }
+
+  /* 防抖：同一类 10 秒内只上报一次。模型那 8s 不应期是按"类"记窗口号的，
+   * 同一个声响本来就会连着出好几个窗，这里再压一道，顺便挡住"同一类里
+   * 换了个声响"（例如连着敲两下）。 */
+
+  now = main_now_ms();
+  if (last_ms[cls] != 0 && now - last_ms[cls] < ASK_DEBOUNCE_MS)
+    {
+      printf("[门控] 同类（%s）距上次上报 %u ms，防抖忽略\n",
+             sound_event_class_name(cls), (unsigned)(now - last_ms[cls]));
+      return;
+    }
+
+  last_ms[cls] = now;
+
+  switch (cls)
+    {
+      case SOUND_EVENT_FALL:
+        what = "疑似跌倒撞击";
+        type = SOUND_TYPE_FALL;
+        break;
+
+      case SOUND_EVENT_KNOCK:
+        what = "疑似敲击求救";
+        type = SOUND_TYPE_KNOCK;
+        break;
+
+      default:
+        what = "疑似异常喊叫";
+        type = SOUND_TYPE_SCREAM;
+        break;
+    }
+
+  snprintf(reason, sizeof(reason), "%s %d%%", what,
+           (int)(conf * 100.0f + 0.5f));
+
+  printf("[门控] 本地小模型命中: %s（%s, 置信度 %.2f）\n",
+         what, sound_event_class_name(cls), (double)conf);
+
+  /* 复用既有的「异常声 → 追问流程」：和 sound_detect_callback() 一样只置标志，
+   * 相位由 main_loop_task 的 ask_flow_tick() 推（那边是唯一的相位推进者）。
+   * g_last_abnormal_ms 一起置，让检测器那条老路和这条共用同一个防抖基准。 */
+
+  g_last_abnormal_ms = now;
+  g_ask_pending_type = (int)type;
+  g_ask_pending_conf = conf;
+  g_ask_round = 0;
+  g_ask_answer_ready = false;
+  g_ask_play_done = false;
+  g_ask_answer[0] = '\0';
+  g_ask_phase = ASK_PHASE_PENDING;
+
+  /* 「是否报警？」询问框：任何线程可调，内部自己投到 LVGL 线程 */
+
+  ui_post_ask_alarm(reason);
+}
+
+#endif /* CONFIG_HELLO_APP_SOUND_EVENT */
 
 /**
  * @brief  初始化并启动声音检测
@@ -2642,6 +3021,43 @@ static int start_sound_detection(sm_context_t *ctx)
 
   printf("[安全] 声音检测已启动\n");
   g_sound_started = true;
+
+  /* 任务四：接通「录音旁路 → 人声/非人声门控」。
+   *
+   * 顺序：先装回调（忙判据 / 人声回调），再启动旁路线程，最后初始化本地小模型。
+   * 门控线程一起来录音线程就会往它的环形缓冲里灌数据（tap 在 ai_audio.c 里），
+   * 所以回调必须先装好，否则前面的窗口判出来没人接。 */
+
+  sound_detect_gate_set_busy_cb(gate_busy_pred, NULL);
+  sound_detect_gate_set_voice_cb(gate_voice_cb, NULL);
+
+  ret = sound_detect_bypass_start();
+  if (ret < 0)
+    {
+      printf("[警告] 旁路门控没起来: %d（人声门控不可用，其他链路照旧）\n", ret);
+    }
+
+  /* 本地小模型（任务三 sound_event）。还没落地时是个返回 -ENOSYS 的弱桩，
+   * 门控那边喂进去的异常窗会记账但不出结果 —— 不拦启动。 */
+
+  if (sound_event_init() != 0)
+    {
+      printf("[门控] 本地小模型未就绪（sound_event_init 未落地），"
+             "非人声异常暂时只进统计\n");
+    }
+  else
+    {
+      printf("[门控] 本地小模型已就绪\n");
+
+#ifdef CONFIG_HELLO_APP_SOUND_EVENT
+      /* 挂上命中回调：没这一步模型判出来了也没人接（结果直接丢）。
+       * 门控线程此刻已经在灌数据了，所以紧跟着 init 装，别再往后放。 */
+
+      sound_event_set_callback(sound_event_cb, NULL);
+      printf("[门控] 本地小模型命中回调已挂上（摔倒/敲击/尖叫 → 追问+询问框）\n");
+#endif
+    }
+
   return OK;
 }
 
@@ -2656,10 +3072,79 @@ static void stop_sound_detection(void)
       return;
     }
 
+  /* 先停旁路（它只是拿一份拷贝，和录音链路无关）：必须在声音检测器之前，
+   * 它会调 sound_event_feed，那个入口属于检测器那一侧。 */
+
+  sound_detect_bypass_stop();
+
   sound_detect_stop(&g_sound_ctx);
   sound_detect_deinit(&g_sound_ctx);
   g_sound_started = false;
   printf("[安全] 声音检测已停止\n");
+}
+
+/**
+ * @brief  任务四门控调试入口（`ai_companion --sounddetect ...`）
+ *
+ * 为什么不做成 `hw_test sounddetect ...`：hw_test 是**另一个 app**
+ * （app/hw_test/main.c 的 main 里认自己的子命令），改它就越界了
+ * （别的 agent 也在那附近干活）。所以挂在 ai_companion 自己的命令行上，
+ * 子命令语义与任务书一致：status / on / off / sensitivity <n>。
+ */
+
+static void sound_detect_debug_cmd(const char *sub, float sens)
+{
+  if (sub == NULL)
+    {
+      return;
+    }
+
+  if (strcmp(sub, "off") == 0)
+    {
+      sound_detect_gate_set_enabled(false);
+      return;
+    }
+
+  if (strcmp(sub, "on") == 0)
+    {
+      sound_detect_gate_set_enabled(true);
+      return;
+    }
+
+  if (strcmp(sub, "sensitivity") == 0)
+    {
+      sound_detect_gate_set_sensitivity(sens > 0.0f ? sens : 1.0f);
+      return;
+    }
+
+  if (strcmp(sub, "status") != 0)
+    {
+      printf("[门控] 未知子命令 '%s'（status / on / off / sensitivity <n>）\n",
+             sub);
+      return;
+    }
+
+  {
+    const sound_gate_stats_t *st = sound_detect_gate_get_stats();
+
+    if (st == NULL)
+      {
+        return;
+      }
+
+    printf("[门控] 状态: %s, 灵敏度=%.2f, 旁路线程=%s\n",
+           sound_detect_gate_enabled() ? "on" : "off",
+           (double)sound_detect_gate_sensitivity(),
+           st->windows + st->mute_windows > 0 ? "在跑" : "还没收到窗");
+    printf("[门控] 统计: 判过 %u 窗 / 人声 %u / 播放跳过 %u / 异常喂模型 %u\n",
+           (unsigned)st->windows, (unsigned)st->voice_windows,
+           (unsigned)st->mute_windows, (unsigned)st->anomaly_windows);
+    printf("[门控] 最近一窗: rms=%.4f zcr=%.2f ac=%.2f 浊音帧=%.2f "
+           "active=%d voice=%d\n",
+           (double)st->last.rms, (double)st->last.zcr,
+           (double)st->last.ac_peak, (double)st->last.voiced_ratio,
+           st->last.active, st->last.voice);
+  }
 }
 
 /****************************************************************************
@@ -2843,6 +3328,14 @@ static void ask_flow_finish(sm_context_t *ctx)
       sm_handle_event(ctx, SM_EVENT_AI_RESPONSE);
     }
 
+  /* 对称的另一半：这一路收尾了（判定完 / 两轮都没听清 / 已经报警），屏幕上那页
+   * 「是否报警？」就不该继续挂着 —— 挂着的后果是用户十几秒后再去点它，那一下
+   * 会变成**对一件已经被处理过的事**的又一次报警（两条确认路同时活着时最坏的
+   * 那个结果）。robot_ui 那边按「作废」处理：撤页面，既不算确认（不报警）也不算
+   * 否认（不记 60 秒静默期），见 main.c 的 ui_post_ask_standdown()。
+   * 没有 pending 询问时那边是空操作（连日志都不打）。 */
+  ui_post_ask_standdown("语音追问收尾");
+
   printf("[追问] 流程结束\n");
 }
 
@@ -2862,13 +3355,25 @@ static void ask_flow_escalate(sm_context_t *ctx, const char *answer)
 
   if (g_net_started)
     {
-      /* ai_network_send_alarm() 内部就是 report_alarm()：publish 到
-       * zhi_ai/<client_id>/alarm + 手机推送，所以不用再单独调一次 report_alarm()。 */
-      ai_network_send_alarm(&g_net_ctx, "sound_emergency", detail);
+      /* ★ 报警去重闸：屏幕按钮 / MQTT confirm_alarm 那条确认路（robot_ui 的
+       * ask_finish）可能已经把这次异常报警执行完了。一次异常只报一次警 ——
+       * 没领到票就整块放弃（不上报、不请界面弹报警页、不换表情），因为赢家
+       * 那一路已经把页面 + 铃声 + 上报都做过了，再来一遍家人手机上就是两条报警。
+       * 弱符号（robot_ui 没进镜像时）恒为 true，不会把这条路堵死。 */
+      if (!robot_ui_alarm_claim("语音追问"))
+        {
+          printf("[追问] 这次异常已经由另一条确认入口报过警了，本路放弃重复上报\n");
+        }
+      else
+        {
+          /* ai_network_send_alarm() 内部就是 report_alarm()：publish 到
+           * zhi_ai/<client_id>/alarm + 手机推送，所以不用再单独调一次 report_alarm()。 */
+          ai_network_send_alarm(&g_net_ctx, "sound_emergency", detail);
 
-      /* 让界面（robot_ui）弹报警页 */
-      ai_network_send_start_alarm(&g_net_ctx, detail);
-      ai_network_send_face(&g_net_ctx, AI_CMD_FACE_WORRIED);
+          /* 让界面（robot_ui）弹报警页 */
+          ai_network_send_start_alarm(&g_net_ctx, detail);
+          ai_network_send_face(&g_net_ctx, AI_CMD_FACE_WORRIED);
+        }
     }
 
   /* 确认紧急才进报警状态（原来是"一检测到异常声就进"，误报会直接把设备按在
@@ -3035,6 +3540,18 @@ static void ask_flow_tick(sm_context_t *ctx)
    * 录音又拉起来。 */
   if (!g_running)
     {
+      return;
+    }
+
+  /* 最优先：屏幕上那条确认路（或者 MQTT 下行）已经报警了，报警声正在响 ——
+   * 这条语音追问立刻收摊，别再问第二轮（登记处见 ai_companion_yield.c；
+   * robot_ui_show_alarm() 是唯一登记点，所以任何报警来源都覆盖）。
+   * 收摊只做状态收尾：设备让路归 robot_ui 的报警那条链（它已经登记让路），
+   * 界面归 robot_ui（它自己会把询问页撤下）。 */
+  if (ai_companion_ask_abort_take() && g_ask_phase != ASK_PHASE_IDLE)
+    {
+      printf("[追问] 报警已由另一条确认路执行，这条语音追问收摊\n");
+      ask_flow_finish(ctx);
       return;
     }
 
@@ -4207,11 +4724,16 @@ static void *main_loop_task(void *arg)
 
       kws_wake_tick(ctx);
 
+      /* 2.6 门控判到人声（录音旁路那条线）：流程也在这里推，
+       *     走的是和 VAD 同一条云端语音入口（任务四） */
+
+      gate_voice_tick(ctx);
+
       /* 3. 异常声追问流程（限时听 / 重问 / 超时都在这里推进） */
 
       ask_flow_tick(ctx);
 
-      /* 4. 语音状态有变化就告诉界面（我在听 / 正在想 / 正在说 / 空闲） */
+      /* 4. 语音状态有变化就告诉界面（检测到声音／录制中 / 正在想 / 正在说 / 空闲） */
 
       voice_state_tick(ctx);
 
@@ -4285,8 +4807,8 @@ int main(int argc, char *argv[])
   const char *mqtt_client_id = NULL;
   bool sound_self_test = false;
   bool ask_self_test = false;
-
-  g_running = 1;
+  const char *sounddetect_sub = NULL;   /* 任务四：门控调试子命令 */
+  float sounddetect_sens = -1.0f;       /* sensitivity <n> 的可选数值 */
 
   for (int i = 1; i < argc; i++)
     {
@@ -4311,6 +4833,15 @@ int main(int argc, char *argv[])
         {
           ask_self_test = true;
         }
+      else if (strcmp(argv[i], "--sounddetect") == 0 && i + 1 < argc)
+        {
+          sounddetect_sub = argv[++i];
+
+          if (strcmp(sounddetect_sub, "sensitivity") == 0 && i + 1 < argc)
+            {
+              sounddetect_sens = (float)atof(argv[++i]);
+            }
+        }
       else
         {
           printf("未知或不完整的参数: %s\n", argv[i]);
@@ -4318,6 +4849,41 @@ int main(int argc, char *argv[])
           return -EINVAL;
         }
     }
+
+  /* 重复启动保护（理由见 g_app_inited 那段）。
+   * 放在参数解析**之后**：--help 和未知参数在上面已经走完了，这里要拿到的正是
+   * 解析出来的 sounddetect_sub。
+   *
+   * 第二次启动**一个字都不初始化**：不碰音频、网络、MQTT、工具注册、状态机
+   * （它们写的都是共享 static，一碰就把正在跑的那个实例带坏），
+   * 也不注册信号、不动 g_running —— 那个正在跑的实例靠 g_running 收场，
+   * 被这里改成 1 它就退不出去了。
+   *
+   * 门控那几个量（g_gate_enabled / g_gate_sensitivity / g_gate_stats）都是
+   * ai_sound_detect.c 的 file-static，单一大镜像里只有一份，所以这里读到、改到的
+   * 就是**那个正在跑的实例**的实时门控状态 —— 这不是巧合，是这条调试入口能成立的
+   * 前提（status 读到的是它的真数，on/off/sensitivity 改的也是它）。 */
+
+  if (g_app_inited)
+    {
+      printf("[启动] 已经有实例在跑（PID %d），本次只处理调试命令后退出\n",
+             (int)getpid());
+
+      if (sounddetect_sub != NULL)
+        {
+          sound_detect_debug_cmd(sounddetect_sub, sounddetect_sens);
+        }
+      else
+        {
+          printf("[启动] 只有 --sounddetect <子命令> 在第二次启动时有意义"
+                 "（--ask / 自检 / --client-id 都属于第一次启动的那个实例）\n");
+        }
+
+      return 0;
+    }
+
+  g_app_inited = true;
+  g_running = 1;
 
   printf("\n");
   printf("╔══════════════════════════════════════════╗\n");
@@ -4338,6 +4904,7 @@ int main(int argc, char *argv[])
   if (ret < 0)
     {
       printf("[错误] 状态机初始化失败: %d\n", ret);
+      g_app_inited = false;           /* 什么都没跑起来，别占着这个位子 */
       return ret;
     }
 
@@ -4349,6 +4916,7 @@ int main(int argc, char *argv[])
     {
       printf("[错误] 音频模块初始化失败: %d\n", ret);
       sm_deinit(&g_sm_ctx);
+      g_app_inited = false;           /* 什么都没跑起来，别占着这个位子 */
       return ret;
     }
 
@@ -4361,6 +4929,7 @@ int main(int argc, char *argv[])
       printf("[错误] AI对话模块初始化失败: %d\n", ret);
       audio_deinit(&g_audio_ctx);
       sm_deinit(&g_sm_ctx);
+      g_app_inited = false;           /* 什么都没跑起来，别占着这个位子 */
       return ret;
     }
 
@@ -4464,6 +5033,15 @@ int main(int argc, char *argv[])
     {
       printf("[警告] 声音检测初始化失败: %d\n", ret);
       /* 声音检测失败不退出，继续运行 */
+    }
+  else if (sounddetect_sub != NULL)
+    {
+      /* 任务四：`--sounddetect status|on|off|sensitivity <n>` 在这里生效
+       * （门控默认 on，所以 off/sensitivity 必须放在它起来之后）。
+       * 门控线程是异步的，status 打印的是"这一刻"的统计，可能还是 0；
+       * 想看有数的 status 就开机后等一会儿重跑一次（或看正常日志）。 */
+
+      sound_detect_debug_cmd(sounddetect_sub, sounddetect_sens);
     }
 
   /* 5. 初始化主动关怀模块 */
@@ -4594,6 +5172,11 @@ int main(int argc, char *argv[])
       llm_deinit(&g_llm_ctx);
       audio_deinit(&g_audio_ctx);
       sm_deinit(&g_sm_ctx);
+
+      /* 这次启动已经彻底收场，把"已经在跑"标记放掉，
+       * 之后 NSH 里还能重新起一个实例。 */
+
+      g_app_inited = false;
       return -ret;
     }
 
@@ -4701,6 +5284,11 @@ int main(int argc, char *argv[])
   memset(&g_net_ctx, 0, sizeof(g_net_ctx));
 
   printf("[退出] 系统已安全退出\n\n");
+
+  /* 全部收干净了才放掉这个标记：半路放掉就等于"收尾还没完就允许第二个实例
+   * 进来初始化"，那正是这次要堵死的那条路。 */
+
+  g_app_inited = false;
 
   return 0;
 }

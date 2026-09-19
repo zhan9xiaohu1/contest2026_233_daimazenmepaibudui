@@ -34,6 +34,13 @@ if(CONFIG_LVX_USE_CONTEST2026_233_HELLO_APP)
     ai_companion_diag.c
   )
 
+  if(CONFIG_HELLO_APP_SOUND_EVENT)
+    # 本地声音事件识别（摔倒/敲击/尖叫）：mel 前端 + DSCNN-lite + 3/4 投票，
+    # 纯 C 零依赖（自写 512 点 FFT，不用 CMSIS-DSP / tflite），权重在
+    # sound_event_model.h 里。谁喂 PCM、命中后干什么，由调用方决定（见 sound_event.h）。
+    list(APPEND HELLO_APP_SRCS sound_event.c)
+  endif()
+
   set(HELLO_APP_COMPILE_FLAGS "")
 
   if(CONFIG_HELLO_APP_LLM_AI_AGENT)

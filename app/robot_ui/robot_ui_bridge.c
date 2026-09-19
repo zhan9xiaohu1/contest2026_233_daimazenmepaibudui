@@ -194,8 +194,8 @@ void robot_ui_bridge_voice_state(int state)
    * on_ai_command_received 的 voice_state 分支）：面板不弹出来，老人根本
    * 不知道要去哪里看"它听清了什么、回了什么"。
    *
-   * ⚠️ **「在听」绝对不能弹**：hello_app 是**开机自启**的，它一启动就进入
-   * "我在听"并推一条 LISTENING —— 那样开机第一眼看到的就是语音面板，而不是
+   * ⚠️ **「在听」绝对不能弹**：hello_app 是**开机自启**的，它一启动就报一条
+   * LISTENING —— 那样开机第一眼看到的就是语音面板，而不是
    * 主菜单（用户实测反馈："为什么一开机就是语音聊天页面？我希望看到主菜单"）。
    * 现在的策略：只在"确实有语音活动"时才弹 ——
    *   - 用户说的话到了（`robot_ui_bridge_voice_user_said()` → 界面侧那处 autoshow）

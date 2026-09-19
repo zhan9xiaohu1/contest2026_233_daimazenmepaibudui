@@ -189,11 +189,12 @@ extern int sifli_uart_reinit_rx_dma(int idx);
  *   请求线死了"的形态）、**中断里不做任何恢复**。
  *
  * 另两处刻意的偏离，理由各自写在实现处：
- *   - 等待用 nxsem_clockwait_uninterruptible(..., CLOCK_MONOTONIC) 而不是
- *     nxsem_timedwait：后者就是 nxsem_clockwait 传 CLOCK_REALTIME
- *     （nuttx/include/nuttx/semaphore.h:1121），而本板 app 会
- *     clock_settime(CLOCK_REALTIME)（app/robot_ui/time_sync.c:139），实钟被
- *     拨动会让 5 秒的"确定上界"失效。
+ *   - 等待（5 秒上界）用**本驱动私有**的看门狗当心跳，不用内核的
+ *     nxsem_clockwait_uninterruptible / nxsem_tickwait（见 struct 里
+ *     rx_wait_wdog 那一段与 sf32lb52_audio_rx_wait_slice）：内核那记定时等待的
+ *     超时与 ISR 的 post 抢同一份 TCB 字段，本板临界区是 BASEPRI 型、DMA 通道
+ *     中断优先级 0 挡不住它 —— 2026-09-19 真机上既抓到过 sem_waitirq.c:137 那条
+ *     断言，也抓到过"超时被抢掉、这一次 read 再也没有上界"的永久卡死。
  *   - 收尾用 sf32lb52_audio_rx_dma_stop_frame()（只 abort 通道）而不是
  *     HAL_AUDPRC_DMAStop()：后者顺带 ADCPATH_DISABLE，也就是"每帧掰断 ADC
  *     数据通路"那条老毛病。 */
@@ -434,6 +435,37 @@ struct sf32lb52_audio_s
   struct wdog_s           wr_wait_wdog; /* write() 那一次的等满心跳 */
   bool                    wr_wait_to;   /* 这次等待是心跳到点唤醒的 */
 
+  /* read() 那次等待（5 秒上界）的"到点了"——**和 write 那一记同一套做法**，
+   * 也是本驱动私有的看门狗（sf32lb52_audio_rx_wait_slice）。
+   *
+   * 为什么必须换掉内核那记 `nxsem_clockwait_uninterruptible`（2026-09-19 真机定案）：
+   *   上板实测（串口 dump 全文在 _flash/gate_status.txt）抓到的断言就是下面这条：
+   *       ASSERT sem_waitirq.c:137 task robot_ui
+   *       nxsem_wait_irq ← nxsem_timeout ← wd_timer ← timer_callback ← systick_interrupt
+   *   即"内核定时等待的超时回调进来时，那条等待的 waitobj 已经被别人的 post
+   *   清成 NULL 了"。根因与 write 那条一模一样、也是文件顶部那段讲的同一个机制：
+   *   rtcb->waitdog 与 ISR 里的 nxsem_post 抢同一份 TCB 字段，而本板的临界区是
+   *   BASEPRI 型（dump 里 BASEPRI=0x80 = 只挡优先级 ≥ 8 的异常），DMA 通道中断
+   *   被厂商 HAL 设成优先级 0（`NVIC_SetPriority(irq_type, hdma->Init.IrqPrio)`，
+   *   而本驱动的 DMA 句柄是 kmm_zalloc 出来的、IrqPrio 全场没人赋值）。
+   *   更贵的一步是**不崩的那种结局**：超时回调被抢掉（或看门狗被 ISR 的 post
+   *   取消）之后，那一次等待就没有上界了 —— 真机上表现为**一次 read 在
+   *   sf32lb52_audio_read 里等了 11 万毫秒还不返回**：diag 里 wait 一路涨、
+   *   rxr（read 进入次数）一动不动、而 rxt（等待超时次数）恒 0，
+   *   录音标志却全健康（rec=1 / ract=1 / died=0）。用户看到的
+   *   "录音跑一阵就永久停摆"就是这一条，且因为 rxt=0，下面那套按超时触发的
+   *   分级恢复（rx_recover / L1..）一次都没机会跑。
+   *
+   * 私有看门狗为什么能根治：心跳回调只做两件事（立 rx_wait_to 旗 + **无条件**
+   * post 一次 rx_sem），不读也不写任何 TCB 字段 —— 内核那条 sem_waitirq 断言
+   * 路径在这条等待上根本不会被走到；而心跳是从 priv 里起的一记普通看门狗，
+   * ISR 的 post 取消不了它，所以"5 秒上界"是真的上界（app 侧
+   * audio_reap_record_thread 敢做"一定会返回的 join"就靠它）。
+   * 多出来的那一次 post 由下一次 read 开头的 nxsem_reset(&rx_sem, 0) 收掉。 */
+
+  struct wdog_s           rx_wait_wdog; /* read() 那一次的等满心跳 */
+  bool                    rx_wait_to;   /* 这次等待是心跳到点唤醒的 */
+
   /* DMA 传输错误（TE）打断了正在等待的 read()。
    *
    * 为什么要单独立这一面旗：TE 发生时 HAL 在中断里就把通道
@@ -655,9 +687,11 @@ static int  sf32lb52_audio_rx_recover(FAR struct sf32lb52_audio_s *priv,
 
 int sf32lb52_audio_rx_fix(int level);
 
-/* write() 在这个定义之前，先声明一笔。 */
+/* write() / read() 在这个定义之前，先声明一笔。 */
 
 static int  sf32lb52_audio_tx_wait_slice(FAR struct sf32lb52_audio_s *priv,
+                                         uint32_t wait_ms);
+static int  sf32lb52_audio_rx_wait_slice(FAR struct sf32lb52_audio_s *priv,
                                          uint32_t wait_ms);
 
 /****************************************************************************
@@ -1878,7 +1912,19 @@ static int sf32lb52_audio_hw_start(FAR struct sf32lb52_audio_s *priv,
   __HAL_AUDPRC_ENABLE(aprc);
 
   /* 首次播放时挂上 codec 自带 DMA 句柄（SDK 52X 的播放路径，小智固件实测有声），
-   * 并让 HAL 重新初始化（它会用音频参数配置句柄并动态分配 DMA 通道） */
+   * 并让 HAL 重新初始化（它会用音频参数配置句柄并动态分配 DMA 通道）。
+   *
+   * ★ 2026-09-19：这一段的失败分支原来是**静默继续**的 —— 两个 kmm_zalloc 的
+   * 结果没人看、HAL_AUDCODEC_Init 的返回值（cret）也没人看。而 HAL_AUDCODEC_Init
+   * 只会"跳过" NULL 句柄、照样返回 HAL_OK：于是现场是"录音正常、播放永远没声"
+   * 这种最难查的形状（HAL_AUDCODEC_Transmit_DMA 判到 NULL 就 HAL_ERROR，没人报）。
+   * 堆被 cJSON / TTS / MQTT 队列吃紧之后（报警那一路正是这种时刻）这个分支真会走到。
+   * 现在如实失败并把错误码交回上层：
+   *   - 播放（playback=1）：直接返回错误，这一次播报不响，但设备状态一点没动；
+   *   - 录音（playback=0）：录音走的是 AUDPRC RX0，不经过 codec 的 DMA，句柄缺了
+   *     不影响本次 START，只记一行错误继续（不让"分配失败"顺手把常听也停掉）。
+   * 失败时把句柄放回并清成 NULL：下一次 START 会重新分配重试（不清的话这一段的
+   * 判据 `hdma[CH0] == NULL` 永远不成立，坏状态就钉死了）。 */
 
   if (priv->codec.hdma[HAL_AUDCODEC_DAC_CH0] == NULL)
     {
@@ -1904,7 +1950,64 @@ static int sf32lb52_audio_hw_start(FAR struct sf32lb52_audio_s *priv,
           priv->codec.hdma[HAL_AUDCODEC_DAC_CH1]->Parent       = &priv->codec;
         }
 
-      cret = HAL_AUDCODEC_Init(&priv->codec);
+      if (priv->codec.hdma[HAL_AUDCODEC_DAC_CH0] == NULL ||
+          priv->codec.hdma[HAL_AUDCODEC_DAC_CH1] == NULL)
+        {
+          syslog(LOG_ERR,
+                 "AUDIO: codec DMA 句柄分配失败（ch0=%p ch1=%p）：%s\n",
+                 (FAR void *)priv->codec.hdma[HAL_AUDCODEC_DAC_CH0],
+                 (FAR void *)priv->codec.hdma[HAL_AUDCODEC_DAC_CH1],
+                 playback ? "本次播放不启动（返回 -ENOMEM）"
+                          : "录音通路不经过它，本次 START 继续");
+
+          if (priv->codec.hdma[HAL_AUDCODEC_DAC_CH0] != NULL)
+            {
+              kmm_free(priv->codec.hdma[HAL_AUDCODEC_DAC_CH0]);
+            }
+
+          if (priv->codec.hdma[HAL_AUDCODEC_DAC_CH1] != NULL)
+            {
+              kmm_free(priv->codec.hdma[HAL_AUDCODEC_DAC_CH1]);
+            }
+
+          priv->codec.hdma[HAL_AUDCODEC_DAC_CH0] = NULL;
+          priv->codec.hdma[HAL_AUDCODEC_DAC_CH1] = NULL;
+
+          if (playback)
+            {
+              return -ENOMEM;
+            }
+        }
+      else
+        {
+          cret = HAL_AUDCODEC_Init(&priv->codec);
+
+          if (cret != HAL_OK)
+            {
+              /* 走到这里说明 codec 句柄没被真正初始化：DAC/ADC 两侧的寄存器配置
+               * 都不可信（它内部会走 HAL_DMA_Init → DMA_AllocChannel，那边有几处
+               * HAL_ASSERT(0) 的 while(1)，真出问题宁可在这里失败）。放回句柄、
+               * 如实报错，交给上层（录音端会按退避重试，播放端这次不响）。 */
+
+              syslog(LOG_ERR,
+                     "AUDIO: HAL_AUDCODEC_Init 失败（%d），本次 START 不启动\n",
+                     (int)cret);
+
+              if (priv->codec.hdma[HAL_AUDCODEC_DAC_CH0] != NULL)
+                {
+                  kmm_free(priv->codec.hdma[HAL_AUDCODEC_DAC_CH0]);
+                }
+
+              if (priv->codec.hdma[HAL_AUDCODEC_DAC_CH1] != NULL)
+                {
+                  kmm_free(priv->codec.hdma[HAL_AUDCODEC_DAC_CH1]);
+                }
+
+              priv->codec.hdma[HAL_AUDCODEC_DAC_CH0] = NULL;
+              priv->codec.hdma[HAL_AUDCODEC_DAC_CH1] = NULL;
+              return -EIO;
+            }
+        }
     }
 
   /* codec：ADC 模拟通路（录音用） */
@@ -2120,9 +2223,33 @@ static int sf32lb52_audio_hw_stop(FAR struct sf32lb52_audio_s *priv)
    * 返回时它自己会 DMAStop，但"写失败提前 break""上层直接 close""stop 时
    * 正阻塞在 write 里"这几条路上没人停它 —— 最后写进去的那 100 ms 就会
    * 无限重播，现场听感就是"昂昂昂昂"卡住不停。
-   * 只动寄存器，和上面两行 AUDPRC DMAStop 一个量级，不碰模拟通路。 */
+   * 只动寄存器，和上面两行 AUDPRC DMAStop 一个量级，不碰模拟通路。
+   *
+   * ★ 2026-09-19 修正：这一句原来是**无条件**调的，和上面两条 AUDPRC 的
+   * DMAStop 不一样（那两条都加了"State != READY"守卫）。而
+   * HAL_AUDCODEC_DMAStop() 内部就是 HAL_DMA_Abort()，它**不看 State**，
+   * 无条件关通道 / 清该通道全部标志 / 把通道还回通道池
+   * （bf0_hal_dma.c:898-929）。对一条**已经收好尾**（State 已是 READY）的句柄
+   * 再 abort 一次，写的是那个**物理通道**的寄存器 —— 而本构建开了动态通道
+   * 分配，那个通道很可能已经被别的 DMAC1 用户重新分配走了：同一个 DMAC1 上还
+   * 挂着 UART1/UART2 的 RX DMA（DMA1_Channel6/7，见 sifli_uart.c 那两段说明）。
+   * 那一下等于把别人的在途传输静默打断、顺势清掉它的完成标志 —— 后果就是
+   * "串口 RX 永久聋"或"某个通道的标志再也没人清"这一类只有上板才看得见的形态。
+   * 录音会话（playback=0）每停一次都会走到这里，而这条路上 codec 的 DAC 通道
+   * 从来没被武装过 —— 也就是**每次停录音都在赌别人的物理通道**。
+   * DAC_CH0_CFG 里那一位 DMA_EN 无论如何都要清（它才是"数据不再往 DAC 里送"
+   * 的那一位，见 sf32lb52_audio_tx_freeze 里同一位的用法），所以分两条路写。 */
 
-  HAL_AUDCODEC_DMAStop(&priv->codec, HAL_AUDCODEC_DAC_CH0);
+  if (priv->codec.hdma[HAL_AUDCODEC_DAC_CH0] != NULL &&
+      priv->codec.hdma[HAL_AUDCODEC_DAC_CH0]->State != HAL_DMA_STATE_READY)
+    {
+      HAL_AUDCODEC_DMAStop(&priv->codec, HAL_AUDCODEC_DAC_CH0);
+    }
+  else
+    {
+      priv->codec.Instance->DAC_CH0_CFG &= ~AUDCODEC_DAC_CH0_CFG_DMA_EN;
+    }
+
   priv->codec.State[HAL_AUDCODEC_DAC_CH0] = HAL_AUDCODEC_STATE_READY;
 
   /* 清掉 HAL 的通道状态，否则下一次 Transmit/Receive DMA 会返回 HAL_BUSY */
@@ -2318,7 +2445,13 @@ static int sf32lb52_audio_hw_shutdown(FAR struct sf32lb52_audio_s *priv)
    * （"昂昂昂昂"卡住不停）。close() 是最后一个 fd 被关时的收尾路径，
    * 上一段播放如果没能自己停掉，这里就是唯一的机会。
    * 顺带把"停的时候还在传"这个异常打出来 —— 正常收尾时 DAC 状态早该是
-   * READY，还带 BUSY_TX 就说明上一次传输没走完，下一次 write 会因此起不来。 */
+   * READY，还带 BUSY_TX 就说明上一次传输没走完，下一次 write 会因此起不来。
+   *
+   * ★ 2026-09-19 修正：这里也必须和别处同一条守卫（理由逐字同 hw_stop 里那段
+   * 说明）—— HAL_AUDCODEC_DMAStop() → HAL_DMA_Abort() 不看 State，对一条已经
+   * 收好尾的句柄再 abort 一次，动的是那个物理通道的寄存器，而它可能已经归
+   * 别的 DMAC1 用户（UART1/2 的 RX DMA）所有。本函数还在"持上层锁 + 关中断"
+   * 的上下文里跑，一旦动错通道，连日志都未必出得来。 */
 
   if ((priv->codec.State[HAL_AUDCODEC_DAC_CH0] & HAL_AUDCODEC_STATE_BUSY_TX) != 0)
     {
@@ -2327,7 +2460,16 @@ static int sf32lb52_audio_hw_shutdown(FAR struct sf32lb52_audio_s *priv)
              priv->codec.State[HAL_AUDCODEC_DAC_CH0]);
     }
 
-  HAL_AUDCODEC_DMAStop(&priv->codec, HAL_AUDCODEC_DAC_CH0);
+  if (priv->codec.hdma[HAL_AUDCODEC_DAC_CH0] != NULL &&
+      priv->codec.hdma[HAL_AUDCODEC_DAC_CH0]->State != HAL_DMA_STATE_READY)
+    {
+      HAL_AUDCODEC_DMAStop(&priv->codec, HAL_AUDCODEC_DAC_CH0);
+    }
+  else
+    {
+      priv->codec.Instance->DAC_CH0_CFG &= ~AUDCODEC_DAC_CH0_CFG_DMA_EN;
+    }
+
   priv->codec.State[HAL_AUDCODEC_DAC_CH0] = HAL_AUDCODEC_STATE_READY;
 
   priv->aprc.State[HAL_AUDPRC_TX_CH0] = HAL_AUDPRC_STATE_READY;
@@ -3251,6 +3393,71 @@ static int sf32lb52_audio_tx_wait_slice(FAR struct sf32lb52_audio_s *priv,
 }
 
 /****************************************************************************
+ * Name: sf32lb52_audio_rx_wait_timeout
+ *
+ * Description:
+ *   read() 那一次等待（5 秒上界）的心跳到点了。
+ *
+ *   与 TX 那记心跳逐条对应，跑在 systick 中断里、只做两件**与 TCB 无关**的事：
+ *   立 rx_wait_to 旗（告诉 read"这次是到点了"）＋ **无条件** post 一次 rx_sem。
+ *   ★ 必须无条件：这记心跳就是"到点叫醒去看看这一帧到底有没有数据"的那一下，
+ *   一旦加上 `if (rx_busy) 才 post` 这类条件，只要标志不为真就叫不醒，
+ *   超时机制被废掉 —— rx 那边的老实现（APPLICATION 侧的监听守护也吃过一次）
+ *   实测就是这么炸的（diag 里 wait 涨到 311282 ms）。
+ *   **不打日志**（中断里碰串口会抢控制台锁把整机挂住）。
+ *
+ *   与内核 nxsem_timeout 的根本区别：从不读 task_state，也从不读/写 waitobj，
+ *   只投递一个信号量计数 —— 所以 sem_waitirq.c:137 那条断言在 read 这条等待上
+ *   永远不会被触发（理由见 struct 里 rx_wait_wdog 那一段）。
+ ****************************************************************************/
+
+static void sf32lb52_audio_rx_wait_timeout(wdparm_t arg)
+{
+  FAR struct sf32lb52_audio_s *priv = (FAR struct sf32lb52_audio_s *)arg;
+
+  priv->rx_wait_to = true;
+
+  nxsem_post(&priv->rx_sem);
+}
+
+/****************************************************************************
+ * Name: sf32lb52_audio_rx_wait_slice
+ *
+ * Description:
+ *   read() 等完这一次采集：武装私有心跳 → 阻塞等 rx_sem → 取消心跳。
+ *
+ *   返回值语义**与原来那句 nxsem_clockwait_uninterruptible 完全一致**：
+ *     OK         = 这一次里有人 post 到了东西（DMA 完成 / TE 错误回调 /
+ *                  hw_stop / hw_shutdown）；
+ *     -ETIMEDOUT = 谁也没 post，是本驱动自己的心跳叫醒的。
+ *   所以 read() 后面那条 `if (ret < 0 || rx_err)` 的出口一个字都不用改。
+ *
+ *   用 nxsem_wait_uninterruptible 而不是 nxsem_wait：语义与老实现那句
+ *   clockwait 的 "uninterruptible" 一样（信号打断不提前返回），这一次等待
+ *   仍由我们自己的心跳收口。
+ ****************************************************************************/
+
+static int sf32lb52_audio_rx_wait_slice(FAR struct sf32lb52_audio_s *priv,
+                                        uint32_t wait_ms)
+{
+  int ret;
+
+  priv->rx_wait_to = false;
+
+  (void)wd_start(&priv->rx_wait_wdog, MSEC2TICK(wait_ms),
+                 sf32lb52_audio_rx_wait_timeout, (wdparm_t)priv);
+
+  ret = nxsem_wait_uninterruptible(&priv->rx_sem);
+
+  /* wd_cancel 对已经到点的看门狗只是返回 -EINVAL；多出来的那一次 post 由
+   * 下一次 read 开头的 nxsem_reset(&priv->rx_sem, 0) 收掉，不会串到下一帧。 */
+
+  (void)wd_cancel(&priv->rx_wait_wdog);
+
+  return (ret == OK && priv->rx_wait_to) ? -ETIMEDOUT : ret;
+}
+
+/****************************************************************************
  * Name: sf32lb52_audio_read
  *
  * Description:
@@ -3271,7 +3478,6 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
 
   FAR DMA_HandleTypeDef *hdma_rx;
   HAL_StatusTypeDef res;
-  struct timespec ts;
   uint32_t gen;
   uint32_t irq_before;
   uint32_t half_before;
@@ -3460,30 +3666,18 @@ static ssize_t sf32lb52_audio_read(FAR struct audio_lowerhalf_s *dev,
    *   立刻唤醒的，不靠这 5 秒熬满；5 秒只是"谁都没来"时的上界，也是 ai_audio.c
    *   那条"read 有确定上界"的说法能成立的全部依据。
    *
-   *   ⚠️ 等待用 nxsem_clockwait_uninterruptible(..., CLOCK_MONOTONIC)：它和
-   *   nxsem_timedwait 是同一条路径（后者就是 nxsem_clockwait 传 CLOCK_REALTIME，
-   *   见 nuttx/include/nuttx/semaphore.h:1121），加 _uninterruptible 保持老实现
-   *   那句 tickwait_uninterruptible 的语义（信号打断时不自旋退出，仍由这一次
-   *   等待收口）。时钟换成单调钟是因为本板 app 会 clock_settime(CLOCK_REALTIME)
-   *   （app/robot_ui/time_sync.c:139）—— 实钟被往前拨一下，这次等待会立刻
-   *   "超时"；被往回拨一下，5 秒的上界就不再是上界。单调钟没有这个问题。
-   *
-   *   ⚠️ 不用 nxsem_tickwait：它的 rtcb->waitdog + nxsem_timeout 与 ISR 里的
-   *   nxsem_post 抢同一个 waitobj，上板断言挂死过（提交 e60a5ee）。这里每次 read
-   *   只武装/取消一次内核看门狗、ISR 只 post 一次，是同一条路径上的暴露面缩小；
-   *   若将来还见到 sem_waitirq 那条断言，下一步就是不再用内核的定时等待
-   *   （改成自己起一记只看旗、不碰 waitobj 的看门狗，写法见 write 那条路）。 */
+   *   ⚠️ 这个上界由**本驱动私有的看门狗**产生（sf32lb52_audio_rx_wait_slice），
+   *   不再用内核的 nxsem_clockwait_uninterruptible。2026-09-19 真机定案：
+   *   内核那记定时等待的超时与 ISR 的 post 抢同一份 TCB 字段（本板临界区是
+   *   BASEPRI 型、DMA 通道中断优先级 0，挡不住），真机上抓到的断言正是
+   *   `sem_waitirq.c:137 ← nxsem_wait_irq ← nxsem_timeout ← wd_timer ←
+   *   timer_callback ← systick_interrupt`；而不崩的那一种结局更贵 ——
+   *   超时被抢掉之后这一次等待**再也没有上界**：现场 diag 里 wait 涨到 11 万
+   *   毫秒、rxr 一动不动、rxt 恒 0（所以按超时触发的分级恢复一次都没跑），
+   *   录音标志却全健康 —— 用户看到的"录音跑一阵就永久停摆"就是它。
+   *   私有心跳的写法与理由见 struct 里 rx_wait_wdog 那一段和 write 那条路。 */
 
-  (void)clock_gettime(CLOCK_MONOTONIC, &ts);
-  ts.tv_sec += (SF32LB52_AUDIO_RX_READ_TIMEOUT_MS / 1000);
-  ts.tv_nsec += (long)(SF32LB52_AUDIO_RX_READ_TIMEOUT_MS % 1000) * 1000000L;
-  if (ts.tv_nsec >= 1000000000L)
-    {
-      ts.tv_nsec -= 1000000000L;
-      ts.tv_sec++;
-    }
-
-  ret = nxsem_clockwait_uninterruptible(&priv->rx_sem, CLOCK_MONOTONIC, &ts);
+  ret = sf32lb52_audio_rx_wait_slice(priv, SF32LB52_AUDIO_RX_READ_TIMEOUT_MS);
 
   /* 风险 A：**只动属于自己这一代的账**。
    * 一个上一代的残影在这里把 rx_busy 清成 false，会让新一代那条 read 从此收不到

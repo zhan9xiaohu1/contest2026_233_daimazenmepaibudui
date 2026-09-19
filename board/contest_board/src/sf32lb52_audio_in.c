@@ -20,8 +20,11 @@
  * 残留会话自愈（重要）：
  *   单一大镜像意味着 g_audio_in_fd 是所有 app 共享的一份全局。某个 app 录音
  *   中途挂掉/退出时没人替它清这份状态，后面的 app 就会一直拿到 -16（EBUSY）。
- *   所以除了 fd 还记下"开它的线程 id"，audio_in_start() 在 EBUSY 时会先确认
- *   持有者线程是否还存在，消失了的就当残留丢掉再重开一次。
+ *   所以除了 fd 还记下"开它的线程 id + 它所在的任务组"，audio_in_start() 在 EBUSY
+ *   时会先确认持有者线程是否还存在；线程没了还要再看那个任务组 —— 只有"是本组
+ *   自己的残局"或"整个 app 都没了"才算残留，丢掉再重开一次。"线程死了但那个 app
+ *   还活着"不算（那是对面自己把会话留在原地，抢过来会让同一台半双工设备上出现
+ *   两个 read 客户端），详见 audio_in_start() 里那段注释。
  *   另一层在驱动里：AUDIOIOC_START 返回的 -EBUSY 现在只在"反方向那条通路的持有者
  *   线程确实还活着"时才出现（持有者已消失的残留由驱动自己收干净），板级遇到
  *   -EBUSY 只做一次有界重试、绝不去停别人的通路 —— 完整策略见
@@ -99,8 +102,10 @@ static pid_t g_audio_in_owner = (pid_t)-1;
  *
  * 注意判据不能停在"组号不同就拒绝"：task_create() 出来的子任务（hw_test 的读任务
  * 就是）会复制父任务的 fd 表，它的同号 fd 指向同一个 file 对象，对音频设备完全
- * 有效。所以组号只用来走快路 + 打日志，真正决定"能不能动这个 fd"的是下面那个
- * 身份探测（audio_in_fd_is_audio_device）。 */
+ * 有效。所以"能不能动这个 fd"真正靠的是下面那个身份探测
+ * （audio_in_fd_is_audio_device）。组号另外还有一个用途：判定"残留会话"时要看
+ * 持有者那个组是否还在 —— 线程没了、组还在、又不是本组，说明对面 app 活着，
+ * 不抢（见 audio_in_start() 里那段）。 */
 
 static pid_t g_audio_in_owner_group = (pid_t)-1;
 
@@ -204,12 +209,22 @@ int audio_in_start(int sample_rate, int channels, int bits)
 
   /* 已经有会话：先分辨是哪一种"忙"，不能一律 -EBUSY。
    *
-   * 分三种：
+   * 分四种：
    *   1) 持有者就是当前线程 —— 同一线程里真的在录，如实返回 -EBUSY；
    *   2) 持有者线程还在（nxsched_get_tcb() 拿得到 TCB）—— 别人真在录，
    *      返回 -EBUSY，不打断；
-   *   3) 持有者线程已经不存在 —— 死掉的 app 留下的残留（单一大镜像里
-   *      这份全局没人替它清），清掉残留后照常重开一次。
+   *   3) 持有者线程已经不在了，**但持有者所在的任务组还活着、而且不是本组** ——
+   *      那不是"死掉的 app 留下的残局"，是那个 app 自己把会话留在了原地
+   *      （它的录音线程退场时走了"只退出、不 stop 不 close"那条收尾，见
+   *      ai_audio.c 的 stale 分支）。这时候抢过来就是同一个半双工设备上开
+   *      **两个 read 客户端**：驱动里 priv 是单实例，rx_sem / rx_busy / DMA 武装
+   *      都只有一份，"一次 read 一次武装一次 post"的配对就此散掉，真机上落在
+   *      sem_waitirq.c:137 那条断言上。所以一律拒绝，返回 -EBUSY
+   *      （下面第 4 种里的"本组"例外就是冲着这种情况去的：同一个 app 自己回收
+   *      自己的残局仍然允许，那是这份记录存在的原意）；
+   *   4) 持有者线程不存在，且（是本组的残局，或持有者整个任务组都没了）——
+   *      死掉的 app 留下的残留（单一大镜像里这份全局没人替它清），
+   *      清掉残留后照常重开一次。
    */
 
   self = nxsched_gettid();
@@ -237,6 +252,36 @@ int audio_in_start(int sample_rate, int channels, int bits)
                  "AUDIO_IN: 录音设备仍被线程 %d 占用（-EBUSY）\n",
                  (int)g_audio_in_owner);
           return -EBUSY;
+        }
+
+      /* 持有线程没了。**先别急着判残留**：查一下它那个任务组还在不在 ——
+       * 线程没了、组还在、又不是本组，说明是对面那个 app 还活着，只是它的录音
+       * 线程把会话留在了原地。这时把设备交出去，就是两个 read 客户端同开一台
+       * 半双工设备：驱动那边 priv 是单实例，rx_sem / rx_busy / RX 的 DMA 武装
+       * 都只有一份，"一次 read 一次武装一次 post"的配对就此散掉，真机上落在
+       * sem_waitirq.c:137 那条断言上（驱动自己记过这是这套等待方式的已知风险）。
+       * 组号相等（本组自己的残局）不拦，留着自愈。
+       *
+       * 为什么"组还在"就够当判据：NuttX 里组组长一退，整组线程都会被带走，
+       * 所以"组的 TCB 查得到"等价于"那个 app 确实还在跑"。 */
+
+      if (g_audio_in_owner_group != getpid())
+        {
+          FAR struct tcb_s *owner_group_tcb =
+            nxsched_get_tcb(g_audio_in_owner_group);
+
+          if (owner_group_tcb != NULL)
+            {
+              nxsched_put_tcb(owner_group_tcb);
+              nxmutex_unlock(&g_audio_in_lock);
+              syslog(LOG_WARNING,
+                     "AUDIO_IN: 持有线程 %d 已消失，但它的任务组 %d 还活着且不是"
+                     "本组（group %d）—— 这是那个 app 自己把会话留在了原地，"
+                     "不是死掉 app 的残留；拒绝抢占（-EBUSY）\n",
+                     (int)g_audio_in_owner, (int)g_audio_in_owner_group,
+                     (int)getpid());
+              return -EBUSY;
+            }
         }
 
       syslog(LOG_WARNING,

@@ -2245,11 +2245,11 @@ static void voice_round_done_async(void *arg)
 static const char *voice_state_text(touch_voice_state_t state)
 {
     switch (state) {
-        case TOUCH_VOICE_STATE_LISTENING: return "我在听…";
+        case TOUCH_VOICE_STATE_LISTENING: return "检测到声音";
         case TOUCH_VOICE_STATE_THINKING:  return "正在想…";
         case TOUCH_VOICE_STATE_SPEAKING:  return "正在说话…";
         case TOUCH_VOICE_STATE_IDLE:
-        default:                          return "直接说话就行，我在听";
+        default:                          return "录制中";
     }
 }
 
@@ -2271,7 +2271,7 @@ static void voice_state_async(void *arg)
 {
     touch_voice_state_t state = (touch_voice_state_t)(uintptr_t)arg;
 
-    /* 面板没开着：什么都不做（下次打开时自然是"直接说话就行，我在听"） */
+    /* 面板没开着：什么都不做（下次打开时自然是"录制中"） */
     if (voice_panel == NULL || voice_status_lbl == NULL) {
         return;
     }

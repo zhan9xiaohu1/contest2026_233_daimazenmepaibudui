@@ -33,6 +33,18 @@ extern "C" {
 
 #define AI_TOOL_SET_LIGHT        "set_light"
 
+/* 紧急报告工具：把「呼救→云端→报警」这条路的后半截接上。
+ *
+ * 模型判断出"老人正在求救/可能受伤"时调用它。板子**不直接报警**，而是先弹
+ * 「是否报警？」询问框让用户点头（见下面「二次确认」一节），确认之后才由界面
+ * 那一侧走真正的报警（/alarm 上报 + 手机推送 + 报警页）。
+ *
+ * ⚠️ 这个名字是模型调用时的唯一凭据：清单 JSON（ai_tools_provider.c 的
+ * AI_TOOLS_REPORT_EMERGENCY_JSON）和执行回调的分支都认它，改名等于把这条链
+ * 从模型手里摘掉。 */
+
+#define AI_TOOL_REPORT_EMERGENCY "report_emergency"
+
 /* device_id 缺省值。**必须和 ai_companion_main.c 里的 LIGHT_DEVICE_ID 是
  * 同一个值**：队友的灯模拟器只认这一台，模型没提哪个灯时我们替它补上。
  * 那个宏在 ai_companion_main.c 里是文件私有的，这里只能各写一份，改一处
@@ -83,6 +95,35 @@ int ai_tools_provider_init(void);
  */
 
 void ai_tools_provider_set_network_ctx(ai_network_context_t *ctx);
+
+/****************************************************************************
+ * 二次确认：紧急报告工具依赖的那一个外部符号
+ *
+ *   模型调 report_emergency 之后**不会直接报警** —— 板子先请用户确认。确认的
+ *   入口就是界面（robot_ui）那一侧的一个动作：
+ *
+ *       void ui_post_ask_alarm(const char *reason);
+ *
+ *   它弹「是否报警？」询问框（reason 是询问框上那句话），任何任务线程可调
+ *   （内部只做投递，不碰 LVGL，和 ui_post_* 那一组同一个做法）。用户点了
+ *   「确认」之后，真正报警那一步由界面那一侧负责：/alarm 上报 + 手机推送 +
+ *   报警页（都走现成部件，不在我们这一层）。
+ *
+ *   ⚠️ 这个符号由**另一个模块（app/robot_ui）落地**，现在已经落地了：
+ *      声明在 app/robot_ui/robot_ui.h（`void ui_post_ask_alarm(const char *reason);`），
+ *      实现在 app/robot_ui/main.c。这一侧：
+ *     - 不 include robot_ui.h：那个头文件要 <lvgl.h>，而 hello_app 的编译命令
+ *       里没有（也不该有）LVGL 的头文件路径，理由和 robot_ui_bridge.h /
+ *       fall_alarm.h 那两个"自给自足头文件"完全一样；
+ *     - 在 ai_tools_provider.c 里自己声明一份原型（签名和对面一字不差），
+ *       并且加 __attribute__((weak))：一句话——**对面的符号先合、我们的代码
+ *       先合，两种顺序都不能把整机镜像链断**。对面没在时函数地址是 NULL，
+ *       这里判空后如实回一句「询问框没弹出来」给模型，而不是假装弹过；对面
+ *       在时（就是现在）自动绑到那个强符号上（host 测试里验过这条绑定）。
+ *
+ *   这一层不做"用户确认了没有"的判断：那是界面那条链的状态，模型那边只能
+ *   拿到"已经请用户确认"这一句，见 ai_tools_provider.c 里回给模型的文本。
+ ****************************************************************************/
 
 /****************************************************************************
  * 运行时机：这两个函数该在哪调（具体接线在 ai_companion_main.c 的 main() 里）

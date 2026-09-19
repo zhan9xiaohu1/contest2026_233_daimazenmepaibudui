@@ -143,3 +143,37 @@ bool ai_companion_voice_submit_take(void)
   g_voice_submit_req = false;
   return req;
 }
+
+/* ---------------- 这条语音追问立刻收摊请求 ----------------
+ *
+ * 谁登记：robot_ui（LVGL 线程，报警真的走起来的那一刻）。
+ * 谁认领：hello_app 的主循环（ai_companion_main.c 的 ask_flow_tick()）。
+ * 语义是**一次性**的（和上面的 submit 一样：置一次、认领一次就清），因为它
+ * 是对这一次异常别再问了这一个动作，不是一个持续的方向。
+ *
+ * 为什么要它（现场形状）：屏幕上的「是否报警？」询问页和 hello_app 的语音追问
+ * 是同一件事的两条确认路，两边都以为自己是唯一那个在问的人。用户在屏幕上
+ * 点了「是的，报警」、报警真的响起来之后，语音追问那一套还在按自己的节奏问
+ * 第二轮（大字「检测到声音」+ 聊天气泡），而且它下一轮还会再问 —— 屏幕上于是
+ * 同时挂着两套确认，报警声和追问的 TTS 还抢同一台半双工音频设备。报警一旦
+ * 执行，另一条确认路就该停下：这就是这条请求存在的全部理由。
+ *
+ * 这里照旧**不碰任何设备、不碰任何界面**（只置一个标志位），真正的收摊在
+ * ai_companion_main.c 的 ask_flow_tick() 里：相位只有一个写者那条纪律不变，
+ * 别人只登记，主循环认领。
+ */
+
+static volatile bool g_ask_abort_req;
+
+void ai_companion_ask_abort(void)
+{
+  g_ask_abort_req = true;
+}
+
+bool ai_companion_ask_abort_take(void)
+{
+  bool req = g_ask_abort_req;
+
+  g_ask_abort_req = false;
+  return req;
+}

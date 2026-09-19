@@ -300,4 +300,21 @@ void ai_companion_voice_submit_request(void);
  */
 bool ai_companion_voice_submit_take(void);
 
+/****************************************************************************
+ * 这条语音追问立刻收摊：报警一旦真的走起来，另一条确认路就该停下（非阻塞）
+ *
+ * 登记方：robot_ui（robot_ui_show_alarm() 的入口处，任何报警来源都覆盖）。
+ * 认领方：ai_companion_main.c 的 ask_flow_tick()（主循环，每 100ms 一拍）。
+ *
+ * 和上面三个请求一样的纪律：只置标志，一个设备都不碰、一页界面都不碰；
+ * 真正的收摊由 hello_app 自己的线程做（相位只有一个写者）。
+ * 一次性语义：认领即清，一次报警只会让这一次追问收摊，不会波及下一次。
+ */
+void ai_companion_ask_abort(void);
+
+/**
+ * @brief  认领一次追问收摊请求（读走就清）。只给 ask_flow_tick() 用。
+ */
+bool ai_companion_ask_abort_take(void);
+
 #endif /* __AI_COMPANION_YIELD_H */

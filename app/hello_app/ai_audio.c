@@ -27,6 +27,15 @@
 
 int audio_in_abandon(void);
 
+/* 任务四：把每一帧 PCM **旁路**一份给声音门控（实现和门限在
+ * ai_sound_detect.c，头文件声明见 ai_sound_detect.h）。
+ * 这里只声明、不 include 那个头，和上面 audio_in_abandon() 同一考虑：
+ * 本文件不绑死对方的落地时间，两处签名一致即可。
+ * 契约：**非阻塞**，只往有界环形缓冲 memcpy，队列满丢最旧的窗；
+ * 绝不能在录音线程里等门控线程 —— 等就是丢麦克风数据。 */
+
+void sound_detect_pcm_tap(const int16_t *pcm, size_t nsamples);
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -671,6 +680,13 @@ static void *audio_record_thread(void *arg)
 
           ctx->record_empty_reads = 0;
           ctx->record_last_result = 0;
+
+          /* 任务四：把这一帧原样旁路给声音门控（人声/非人声）。
+           * 放在 VAD 和 data_callback **之前**：门控要的是最原始的麦克风数据，
+           * 而且这是录音线程里离 read() 最近的一处。它不阻塞、不做判断，
+           * 只挪一块内存进有界队列；判断全在门控线程里做。 */
+
+          sound_detect_pcm_tap(ctx->record_buf, samples_read);
 
           /* VAD检测 */
 

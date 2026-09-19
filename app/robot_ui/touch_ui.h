@@ -121,7 +121,7 @@ void touch_ui_set_voice_cancel_cb(voice_cancel_cb_t cb, void *user_data);
  *      送去识别（不等 VAD 那 3 秒静音超时），**不会**回调 voice_chat_start_cb_t
  *      —— 那条路是去 audio_record_start() 的，半双工设备上和 ai_companion 抢麦。
  *      关闭在右上角那个「×」上（voice_close_event_handler，本来就有的）；
- *   3) 状态行默认「直接说话就行，我在听」；
+ *   3) 状态行默认「录制中」；
  *   4) 对话区是**双方对话历史**：用户的发言（"你说：…"，小一号浅蓝）和智爱的
  *      回复（"智爱：…"，白色）一行行往下排，只保留最近几轮，能往上划回看
  *      —— 用户原话：「又看不到回复又看不到自己说了什么」。
@@ -147,8 +147,8 @@ void touch_ui_set_voice_mirror_submit_cb(voice_mirror_submit_cb_t cb,
 
 /* 镜像面板状态行的四种状态：听=蓝、想=橙、说=绿、空闲=灰（颜色比字更早看出在干什么） */
 typedef enum {
-    TOUCH_VOICE_STATE_IDLE = 0,     /* 「直接说话就行，我在听」灰 */
-    TOUCH_VOICE_STATE_LISTENING,    /* 「我在听…」蓝 */
+    TOUCH_VOICE_STATE_IDLE = 0,     /* 「录制中」灰 */
+    TOUCH_VOICE_STATE_LISTENING,    /* 「检测到声音」蓝 */
     TOUCH_VOICE_STATE_THINKING,     /* 「正在想…」橙 */
     TOUCH_VOICE_STATE_SPEAKING      /* 「正在说话…」绿 */
 } touch_voice_state_t;

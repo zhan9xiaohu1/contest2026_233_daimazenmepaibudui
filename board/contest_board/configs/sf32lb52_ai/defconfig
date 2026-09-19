@@ -260,6 +260,10 @@ CONFIG_AI_AGENT_TLS_CONN_POOL_SIZE=2
 # ==== 智爱陪伴自定义应用 ====
 CONFIG_LVX_USE_CONTEST2026_233_ZHI_AI=y
 CONFIG_LVX_USE_CONTEST2026_233_HELLO_APP=y
+# Local sound-event recognition: mel front-end + DSCNN-lite in sound_event.c.
+# Gate: CONFIG_HELLO_APP_SOUND_EVENT in app/hello_app/Kconfig, default y.
+# Keep in sync here so a fresh configure keeps it enabled.
+CONFIG_HELLO_APP_SOUND_EVENT=y
 # hello_app stack. The original 16384 was too small because ai_companion_main
 # reserved a 32KB frame in its prologue:
 #     sub.w sp, sp, #32000

@@ -8,10 +8,20 @@
 #include "network_comm.h"     /* report_alarm()：报警要上报 MQTT + 手机推送 */
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>           /* malloc/free：询问页按钮的回答要先投一拍再处理 */
 #include <time.h>             /* time() / localtime_r()：状态栏时钟用 */
 #include <stdbool.h>
+#include <stdint.h>           /* intptr_t：按钮 user_data 里塞"确认/不用" */
 #include <unistd.h>           /* usleep()：等 hello_app 交出麦克风时的轮询/续租间隔 */
 #include <pthread.h>          /* 报警出声线程（报警声不能做在 LVGL 线程里，见下面那节） */
+
+/* 跨线程投递口（ui_async.c）：询问页按钮的回答也走它 —— 理由见下面询问页那一节
+ * （在对象自己的事件回调里删自己，LVGL 的事件链表正在遍历的节点就没了）。 */
+#include "ui_async.h"
+
+/* 字库字形清洗（robot_ui_bridge.c 包装的 main.c sanitize_for_display）：
+ * 询问页显示的原因串是外面传进来的任意文本，显示前要洗一遍。 */
+#include "robot_ui_bridge.h"
 
 /* 让 hello_app 交出麦克风（ai_companion_audio_yield(true)）/ 收回
  * （ai_companion_mic_reclaim()），用法和理由与 app/robot_ui/main.c 里提醒那条路
@@ -74,6 +84,13 @@ static lv_anim_t anim_face = {0};      // 表情动画
 
 /* 报警闪烁：低频定时器，创建后先暂停，报警时 resume（见 robot_ui_show_alarm） */
 static lv_timer_t *alarm_blink_timer = NULL;
+
+/* 询问页（「检测到异常声响，要报警吗？」）的那两个量。
+ * 定义放在这里、而不是跟下面那一节的其它量放在一起：robot_ui_show_alarm() 要
+ * 在报警页上来时把询问页让位（它比这一节早 200 行），得先看见这两个名字。
+ * 询问页本身的实现和说明在文件后半「询问是否报警页」那一节。 */
+static lv_obj_t *ask_panel = NULL;                       /* 顶层询问页（NULL = 没开） */
+static char      ask_panel_reason[128];                  /* 这一条问的是什么 */
 
 /* 当前状态 */
 static robot_face_t current_face = ROBOT_FACE_HAPPY;
@@ -638,7 +655,7 @@ void robot_ui_set_ai_reply(const char *text)
  *   在听 LISTENING  「在听…」 蓝
  *   在想 THINKING   「在想…」 橙   识别 / 等大模型这一段
  *   在说 SPEAKING   「在说…」 绿
- * 文案比语音镜像面板（touch_ui.c 的 voice_state_text：「我在听…」「正在想…」
+ * 文案比语音镜像面板（touch_ui.c 的 voice_state_text：「检测到声音」「正在想…」
  * 「正在说话…」）**更短**：面板里那行是大字、有整行的地方，主界面这一行是夹在
  * 对话框里的小字，短一点才不会撑宽。颜色两边是同一套（见文件上面那几个
  * UI_STATUS_COLOR_*），老人换个屏幕不用重新学。
@@ -1102,6 +1119,28 @@ static void alarm_yield_end(void)
 /* ==================== 显示报警 ==================== */
 void robot_ui_show_alarm(const char *content)
 {
+    /* ⓪' 报警一旦真的走起来，**另一条确认路**（hello_app 的语音追问：大字
+     *     「检测到声音」那一套）就该停下：它是同一件事的另一半，两边都在问的时候
+     *     报警声和它的 TTS 会抢同一台半双工音频设备，追问问完还会再问第二轮，
+     *     屏幕上就是两套确认在打架。
+     *     这里只登记一次收摊请求（非阻塞、不碰设备、不碰界面），真正的收尾在
+     *     hello_app 主循环的 ask_flow_tick() 里（见 ai_companion_yield.c）。
+     *     放在这里是因为本函数是所有报警来源唯一的汇合点（报警按钮 / MQTT 的
+     *     start_alarm / 声音检测回调 / ui_post_alarm），改一处就全覆盖。 */
+    ai_companion_ask_abort();
+
+    /* ⓪ 报警页要盖在最上面（全屏报警 + 响铃，用户必须看得见）。
+     *
+     * 询问页是建在**顶层**（lv_layer_top）的模态覆盖层，比任何屏幕都高：
+     * 这时候还留着它，就会把正在响铃的报警页挡在下面 —— 那是不能接受的。
+     * 所以让它位：页面撤下，并按"作废"回调给 main.c（-1：既不算确认，也不能
+     * 当成"用户否认"，否则同一原因 60 秒内问不出来）。
+     * 这里不需要先判断：robot_ui_ask_alarm_answer() 对"没有询问页"是空操作。 */
+    if (ask_panel != NULL) {
+        printf("[Ask] 报警页要上来，询问页让位（原因=%s）\n", ask_panel_reason);
+        robot_ui_ask_alarm_answer(-1);
+    }
+
     /* ① 先把红色报警页面切出来（**必须第一步**）。
      *
      * 这一步原来排在报警声和上报后面，实测踩了坑：上报走网络（MQTT + TLS 推送），
@@ -1186,6 +1225,271 @@ void robot_ui_close_alarm(void)
     /* 恢复正常状态 */
     robot_ui_set_face(ROBOT_FACE_HAPPY);
     robot_ui_set_status(ROBOT_STATUS_IDLE);
+}
+
+/* ==================== 「询问是否报警」页（异常声响二次确认） ==================== */
+/*
+ * 用户拍板：**先询问，等用户二次确定后再报警**（不要一检测到就直接报警）。
+ *
+ * 这一页只是三条确认路里的**第一条** —— 板子的屏幕现在可能是坏的/被拆下来的，
+ * 所以"有没有人点这一页"绝不能是报警的前提：
+ *   ① 屏幕：本页两个按钮（走 robot_ui_ask_alarm_answer）
+ *   ② 网络：MQTT 下行 {"action":"confirm_alarm","confirm":true|false}（main.c 分发）
+ *   ③ 兜底：20 秒无人应答自动按「不用了」处理（main.c 的超时看门狗）
+ * 三条都收口到 main.c 的 ask_finish()，这一页**不做任何报警动作**，只回答"用户选了
+ * 哪个"（回调 robot_ask_result_cb_t）。这样"报警页 + 响铃 + MQTT + 手机推送"仍然
+ * 只有现有那一个入口（ui_post_alarm / robot_ui_show_alarm），不会多出第二条报警路。
+ *
+ * 建在**顶层**（lv_layer_top()）而不是某个 scr_xxx：报警页、提醒、语音面板都会
+ * lv_scr_load 切屏；挂在层上就永远压在"当前那一屏"之上，撤下时也不用管下面现在是
+ * 哪一屏（删掉它就露出下面的内容，不需要再切回去）。
+ *
+ * 样式沿用报警页（满屏红底 + 白字 + 大圆角按钮）：一眼能看出"这是个要你回答的
+ * 安全提示"，不是普通弹窗。
+ *
+ * ⚠️ 只能在 LVGL 线程里调（它建/删控件）；别的线程一律走 main.c 的
+ * ui_post_ask_alarm()（内部 ui_async_call 投递）。
+ *
+ * ⚠️ 为什么按钮回调里不直接调 robot_ui_ask_alarm_answer()，而要再投一次
+ * lv_async_call：那个函数会 lv_obj_del() 掉**正在处理这个事件的按钮**所在的
+ * 整棵对象树（本页是模态覆盖层，整页一起撤）。在对象自己的事件回调里删自己，
+ * LVGL 事件链表正在遍历的节点就没了 —— 本工程对"跨线程碰 LVGL"这么小心，
+ * 没理由在这里赌一把；投一拍再撤，页面下一帧消失，用户看不出来。
+ */
+
+#define ASK_ALARM_REASON_MAX  128
+
+/* ask_panel / ask_panel_reason 两个量定义在文件开头（robot_ui_show_alarm 要用） */
+static robot_ask_result_cb_t ask_result_cb = NULL;       /* 回答往哪送（main.c 登记） */
+static void     *ask_result_arg = NULL;
+
+bool robot_ui_ask_alarm_active(void)
+{
+    return (ask_panel != NULL);
+}
+
+void robot_ui_set_ask_result_cb(robot_ask_result_cb_t cb, void *arg)
+{
+    ask_result_cb  = cb;
+    ask_result_arg = arg;
+}
+
+/* 回答的名字（日志里要能看出走的是哪条路，"作废"和"否认"是两回事） */
+static const char *ask_answer_name(int confirmed)
+{
+    if (confirmed == 1) {
+        return "是的，报警";
+    }
+    if (confirmed == 0) {
+        return "不用了";
+    }
+    return "作废（报警页让位）";
+}
+
+/* 撤下询问页（幂等；不回调 —— 回调只有"回答"那一条路，见 robot_ui_ask_alarm_answer） */
+void robot_ui_close_ask_alarm(void)
+{
+    if (ask_panel == NULL) {
+        return;
+    }
+
+    lv_obj_del(ask_panel);
+    ask_panel = NULL;
+    ask_panel_reason[0] = '\0';
+
+    printf("[Ask] 询问页已撤下\n");
+}
+
+/* 屏幕按钮的回答：**不直接**处理，先投一拍再处理
+ * （理由见本节头上那段"为什么按钮回调里不直接调 robot_ui_ask_alarm_answer"）。
+ * user_data 就是"确认(1)还是不用(0)"。 */
+typedef struct {
+    int confirmed;
+} ask_btn_msg_t;
+
+static void ask_btn_apply(void *arg)
+{
+    ask_btn_msg_t *m = (ask_btn_msg_t *)arg;
+    int confirmed = m->confirmed;
+
+    free(m);
+
+    robot_ui_ask_alarm_answer(confirmed);
+}
+
+static void ask_btn_handler(lv_event_t *e)
+{
+    ask_btn_msg_t *m;
+
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+        return;
+    }
+
+    m = malloc(sizeof(ask_btn_msg_t));
+    if (m == NULL) {
+        printf("[Ask] 内存不够，这次的按钮回答丢了（MQTT / 超时那两条路仍然有效）\n");
+        return;
+    }
+
+    m->confirmed = (int)(intptr_t)lv_event_get_user_data(e);
+
+    touch_ui_play_sound("click");
+    printf("[Ask] 屏幕按钮：%s\n", m->confirmed ? "是的，报警" : "不用了");
+
+    if (ui_async_call(ask_btn_apply, m) != LV_RESULT_OK) {
+        free(m);
+        printf("[Ask] 回答投递失败（内存紧），这一页只能靠 MQTT / 超时收尾\n");
+    }
+}
+
+int robot_ui_ask_alarm_answer(int confirmed)
+{
+    char reason[ASK_ALARM_REASON_MAX];
+    robot_ask_result_cb_t cb;
+    void *cb_arg;
+
+    if (ask_panel == NULL) {
+        /* 已经回答过 / 已经超时 / 本来就没弹起来：都不能变成第二次报警 */
+        printf("[Ask] 现在没有询问页，这次的回答（%s）忽略\n",
+               ask_answer_name(confirmed));
+        return -1;
+    }
+
+    /* 先把这一条整个摘下来，再回调：回调里可能**紧接着又发起**一次新的询问
+     * （ask_finish 之后下一秒又检测到一个异常），那时候 ask_panel 必须是空的。 */
+    strncpy(reason, ask_panel_reason, sizeof(reason) - 1);
+    reason[sizeof(reason) - 1] = '\0';
+    cb     = ask_result_cb;
+    cb_arg = ask_result_arg;
+
+    robot_ui_close_ask_alarm();
+
+    if (cb == NULL) {
+        printf("[Ask] 没有登记回答回调，这一页只撤下、不做动作\n");
+        return -1;
+    }
+
+    cb(confirmed, reason, cb_arg);
+    return 0;
+}
+
+void robot_ui_show_ask_alarm(const char *reason)
+{
+    char clean[ASK_ALARM_REASON_MAX];
+    char hint[96];
+    lv_obj_t *title;
+    lv_obj_t *detail;
+    lv_obj_t *hint_lbl;
+    lv_obj_t *row;
+    lv_obj_t *btn_yes;
+    lv_obj_t *btn_no;
+    lv_obj_t *lbl;
+
+    if (reason == NULL || reason[0] == '\0') {
+        reason = "异常声响";
+    }
+
+    if (ask_panel != NULL) {
+        /* 同一时间只允许一个 pending 询问（main.c 那边也有同样一道闸门，
+         * 这里再拦一次是防"直接调本函数"的调用点） */
+        printf("[Ask] 页面上已经有一条询问（原因=%s），本次 %s 不重建\n",
+               ask_panel_reason, reason);
+        return;
+    }
+
+    /* reason 是外面传进来的任意文本（中文备注、ASR 片段、可能夹 emoji）：显示前
+     * 按字库清洗一遍，免得到屏幕上是一排方块 —— 和对话区用的是**同一份**规则
+     * （robot_ui_bridge_sanitize_text 包的就是 main.c 的 sanitize_for_display）。 */
+    if (robot_ui_bridge_sanitize_text(reason, clean, sizeof(clean)) == 0) {
+        snprintf(clean, sizeof(clean), "%s", "异常声响");
+    }
+
+    snprintf(ask_panel_reason, sizeof(ask_panel_reason), "%s", clean);
+
+    ask_panel = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(ask_panel, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(ask_panel, lv_color_hex(0xF44336), 0);
+    lv_obj_set_style_bg_opa(ask_panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(ask_panel, 0, 0);
+    lv_obj_set_style_radius(ask_panel, 0, 0);
+    lv_obj_set_style_pad_all(ask_panel, 16, 0);
+    lv_obj_remove_flag(ask_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(ask_panel, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(ask_panel, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(ask_panel, 14, 0);
+
+    /* 大字标题 */
+    title = lv_label_create(ask_panel);
+    lv_label_set_text(title, "检测到异常声响");
+    lv_obj_set_style_text_font(title, &lv_font_ui_24, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+
+    /* 小字原因（清洗过的那份） */
+    detail = lv_label_create(ask_panel);
+    lv_label_set_text(detail, ask_panel_reason);
+    lv_obj_set_style_text_font(detail, &lv_font_ui_20, 0);
+    lv_obj_set_style_text_color(detail, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_align(detail, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(detail, LV_PCT(90));
+    lv_label_set_long_mode(detail, LV_LABEL_LONG_WRAP);
+
+    /* 时限说明：把 20 秒明写在屏幕上（数的来源是 robot_ui.h 的宏，改一处就够），
+     * 顺带告诉现场"手机上也能确认"——屏幕可能已经坏了，这句话得让评审看见。 */
+    snprintf(hint, sizeof(hint), "%u 秒内请回答，否则按「不用了」处理\n手机上也可以确认",
+             (unsigned)(ROBOT_ASK_ALARM_TIMEOUT_MS / 1000));
+    hint_lbl = lv_label_create(ask_panel);
+    lv_label_set_text(hint_lbl, hint);
+    lv_obj_set_style_text_font(hint_lbl, &lv_font_ui_16, 0);
+    lv_obj_set_style_text_color(hint_lbl, lv_color_hex(0xFFEBEE), 0);
+    lv_obj_set_style_text_align(hint_lbl, LV_TEXT_ALIGN_CENTER, 0);
+
+    /* 两个大按钮：左右并排，横着一排 150×64（老人好点；圆角屏左右各内缩 28，
+     * 和主屏那排按钮同一个理由） */
+    row = lv_obj_create(ask_panel);
+    lv_obj_set_size(row, LV_PCT(100), 84);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_set_style_pad_left(row, 28, 0);
+    lv_obj_set_style_pad_right(row, 28, 0);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_EVENLY,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    /* 「是的，报警」：白底红字（唯一会真的报警的那一个，做得最醒目） */
+    btn_yes = lv_btn_create(row);
+    lv_obj_set_size(btn_yes, 150, 64);
+    lv_obj_set_style_bg_color(btn_yes, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_opa(btn_yes, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(btn_yes, 32, 0);
+    lv_obj_add_event_cb(btn_yes, ask_btn_handler, LV_EVENT_CLICKED, (void *)(intptr_t)1);
+    lbl = lv_label_create(btn_yes);
+    lv_label_set_text(lbl, "是的，报警");
+    lv_obj_set_style_text_font(lbl, &lv_font_ui_24, 0);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(0xF44336), 0);
+    lv_obj_center(lbl);
+
+    /* 「不用了」：半透明白底白字（视觉上比上面那个"轻"，避免误点） */
+    btn_no = lv_btn_create(row);
+    lv_obj_set_size(btn_no, 150, 64);
+    lv_obj_set_style_bg_color(btn_no, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_opa(btn_no, LV_OPA_30, 0);
+    lv_obj_set_style_border_width(btn_no, 2, 0);
+    lv_obj_set_style_border_color(btn_no, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_radius(btn_no, 32, 0);
+    lv_obj_add_event_cb(btn_no, ask_btn_handler, LV_EVENT_CLICKED, (void *)(intptr_t)0);
+    lbl = lv_label_create(btn_no);
+    lv_label_set_text(lbl, "不用了");
+    lv_obj_set_style_text_font(lbl, &lv_font_ui_24, 0);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(lbl);
+
+    printf("[Ask] 询问页已弹出：原因=%s（%u 秒无人应答按「不用了」处理；"
+           "MQTT 也可回答）\n",
+           ask_panel_reason, (unsigned)(ROBOT_ASK_ALARM_TIMEOUT_MS / 1000));
 }
 
 /* ==================== 切换界面 ==================== */
