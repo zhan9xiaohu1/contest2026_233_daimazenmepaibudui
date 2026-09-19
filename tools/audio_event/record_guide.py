@@ -687,7 +687,12 @@ def main(argv=None):
 
     args = build_parser().parse_args(argv)
     classes = parse_classes(args)
-    os.makedirs(args.out, exist_ok=True)
+    try:
+        os.makedirs(args.out, exist_ok=True)
+    except Exception as e:
+        say('[错误] 建不了输出目录 %s：%s' % (args.out, e))
+        say('       --out 要用 Windows 路径（D:/... 或 D:\\...），别用 /d/... 这种。')
+        return 2
 
     say('=' * 66)
     say('  声音事件自录向导   ——   录 -> 取回 -> 16k 单声道 wav')
@@ -699,10 +704,15 @@ def main(argv=None):
         show_progress(args.out)
         return 0
 
-    if args.dry_run:
-        board = DryBoard()
-    else:
-        board = Board(args.port, args.baud)
+    try:
+        board = DryBoard() if args.dry_run else Board(args.port, args.baud)
+    except Exception as e:
+        say('[错误] 打不开串口 %s：%s' % (args.port, e))
+        say('       COM 口被占用时先关掉 serial_term.py / lcd_mirror.py --serial COM4 /'
+            ' cmd_cap.py 这些工具；')
+        say('       板子没插上就换一个口：--port COMx；只想看进度加 --list，'
+            '不连板子自测加 --dry-run。')
+        return 2
 
     saved = 0
     try:
